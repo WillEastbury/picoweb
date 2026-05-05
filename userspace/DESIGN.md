@@ -32,7 +32,9 @@
 > slice → response_fn → TLS-seal → TX in one call.
 >
 > **What is sketched but not wired:** AF_PACKET I/O (compiles on
-> Linux, no E2E test), DPDK loop pattern (commented sketch only).
+> Linux, no E2E test), DPDK pump (real `rte_*` calls under
+> `-DWITH_DPDK=1`; stub mode returns -1 otherwise so the binary
+> always links).
 > The BearSSL-style explicit TLS engine state machine is in tree but
 > still uses the spike-mode `install_app_keys` shortcut; full
 > handshake hookup is the next step.
@@ -105,9 +107,12 @@ In the spike we deliver:
 4. An **AF_PACKET** packet-I/O skeleton — runs in WSL, doesn't need
    DPDK, gives us a way to wire the stack to a real link in dev.
    **Status:** compiles on Linux, no E2E test.
-5. A **DPDK** sketch that documents the rte_eal_init / port setup /
-   rx/tx burst pattern. Doesn't run in WSL (no PMD-bindable NICs);
-   present as code for later. **Status:** comment-only, never built.
+5. A **DPDK** backend (`io/dpdk.{c,h}`) that compiles in two modes:
+   stub-by-default (init returns -1, prints a clear "rebuild with
+   -DWITH_DPDK=1" message — keeps the userspace tree linkable on
+   WSL/CI), and full `rte_eal_init` / mempool / `rte_eth_rx_burst`
+   pump under `-DWITH_DPDK=1`. Tested in stub mode (lock-in: -1
+   from init/pump, no-op shutdown) by `test_dpdk_stub`.
 
 What is **explicitly NOT** in this branch:
 
@@ -143,7 +148,9 @@ userspace/
     ip.{c,h}                 IPv4 header build/parse + checksum
   io/
     af_packet.{c,h}          dev-only RX/TX over a real NIC
-    dpdk_sketch.c            commented sketch, won't build without RTE
+    dpdk.c                   real DPDK pump under -DWITH_DPDK=1;
+                             stub returning -1 otherwise. Always
+                             links into the spike test build.
   tests/
     test_crypto.c            crypto + TLS + TCP RFC vectors (38 tests)
     Makefile                 stand-alone test runner

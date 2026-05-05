@@ -10,6 +10,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
+#include <fcntl.h>
 
 #include "../crypto/sha256.h"
 #include "../crypto/sha512.h"
@@ -4192,6 +4194,43 @@ static void test_engine_pool(void) {
     else { printf("  FAIL: release(NULL) corrupted in_use\n"); g_fail++; }
 }
 
+/* ---------- DPDK stub backend ---------- */
+
+#include "../io/dpdk.h"
+
+static void test_dpdk_stub(void) {
+    printf("== DPDK backend stub (WITH_DPDK undefined) ==\n");
+
+    /* In stub mode (no -DWITH_DPDK=1), pw_dpdk_init MUST return -1
+     * with a clear error message, and pump/shutdown MUST be safe
+     * no-ops. This locks in the invariant that a binary built
+     * without DPDK can still link the userspace tree and reject
+     * --dpdk at runtime instead of crashing. */
+    pw_dpdk_cfg_t cfg = { .port_id = 0, .on_segment = NULL, .user = NULL };
+    pw_dpdk_ctx_t ctx;
+    /* Suppress the helpful-error stderr to keep test output clean. */
+    fflush(stderr);
+    int saved_err = dup(2);
+    int devnull   = open("/dev/null", O_WRONLY);
+    if (devnull >= 0) { dup2(devnull, 2); close(devnull); }
+
+    int rc = pw_dpdk_init(0, NULL, &cfg, &ctx);
+
+    fflush(stderr);
+    if (saved_err >= 0) { dup2(saved_err, 2); close(saved_err); }
+
+    if (rc == -1) { printf("  PASS: stub init returns -1\n"); g_pass++; }
+    else          { printf("  FAIL: stub init rc=%d\n", rc); g_fail++; }
+
+    int prc = pw_dpdk_pump(&ctx);
+    if (prc == -1) { printf("  PASS: stub pump returns -1\n"); g_pass++; }
+    else           { printf("  FAIL: stub pump rc=%d\n", prc); g_fail++; }
+
+    /* Must not segfault. */
+    pw_dpdk_shutdown(&ctx);
+    printf("  PASS: stub shutdown is a no-op\n"); g_pass++;
+}
+
 int main(void) {
     /* Pick the best SHA-256 + ChaCha20 impls available; tests below
      * run through the public entry points so they exercise whichever
@@ -4242,6 +4281,7 @@ int main(void) {
     test_engine_tolerates_dummy_ccs_split();
     test_engine_fatal_wipes_tx_and_keys();
     test_engine_pool();
+    test_dpdk_stub();
 
     printf("\n=== RESULTS: PASS=%d FAIL=%d ===\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
