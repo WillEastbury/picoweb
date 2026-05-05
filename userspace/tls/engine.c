@@ -358,6 +358,8 @@ static void wipe_handshake_secrets(pw_tls_engine_t* eng) {
     secure_zero(eng->master_secret,        sizeof(eng->master_secret));
     secure_zero(eng->cs_app_traffic_secret, sizeof(eng->cs_app_traffic_secret));
     secure_zero(eng->ss_app_traffic_secret, sizeof(eng->ss_app_traffic_secret));
+    secure_zero(eng->resumption_master_secret, sizeof(eng->resumption_master_secret));
+    eng->has_rms = 0;
 }
 
 /* Wipe ALL key material — secrets + installed record-layer keys/IVs
@@ -753,11 +755,26 @@ static int try_recv_client_finished(pw_tls_engine_t* eng) {
     }
     secure_zero(th_through_sf, sizeof(th_through_sf));
 
-    /* Feed the client Finished into the transcript. We don't need it
-     * for this spike's secret derivations (we do not implement
-     * resumption_master_secret), but it keeps the transcript honest
-     * for any post-handshake messages. */
+    /* Feed the client Finished into the transcript. We need the
+     * transcript-through-cFin both for the RFC 8446 §7.1
+     * resumption_master_secret derivation and for any post-handshake
+     * messages that hash into the same context. */
     tls13_transcript_update(&eng->transcript, pt, pt_len);
+
+    /* Derive resumption_master_secret = Derive-Secret(master_secret,
+     * "res master", H(CH..cFin)). Persist on the engine for the
+     * NewSessionTicket builder; master_secret is wiped immediately
+     * afterwards. */
+    {
+        uint8_t th_through_cf[32];
+        tls13_transcript_snapshot(&eng->transcript, th_through_cf);
+        if (tls13_compute_resumption_master_secret(
+                eng->master_secret, th_through_cf,
+                eng->resumption_master_secret) == 0) {
+            eng->has_rms = 1;
+        }
+        secure_zero(th_through_cf, sizeof(th_through_cf));
+    }
 
     /* Switch read+write to application-traffic keys. */
     {
@@ -776,11 +793,13 @@ static int try_recv_client_finished(pw_tls_engine_t* eng) {
         secure_zero(iv, sizeof(iv));
     }
 
-    /* Wipe handshake-only secrets. (Application traffic secrets stay
-     * in case we ever implement KeyUpdate; that's a refinement.) */
+    /* Wipe handshake-only secrets. master_secret has already been
+     * consumed by the RMS derivation above. (Application traffic
+     * secrets stay in case we ever implement KeyUpdate.) */
     secure_zero(eng->handshake_secret,    sizeof(eng->handshake_secret));
     secure_zero(eng->cs_handshake_secret, sizeof(eng->cs_handshake_secret));
     secure_zero(eng->ss_handshake_secret, sizeof(eng->ss_handshake_secret));
+    secure_zero(eng->master_secret,       sizeof(eng->master_secret));
 
     eng->state    = PW_TLS_ST_APP;
     /* hs_phase remains AFTER_SF_AWAIT_CF — but it's no longer

@@ -4098,6 +4098,28 @@ static void test_engine_handshake_roundtrip(void) {
                       (unsigned long long)eng->write.seq); g_fail++; }
     }
 
+    /* ---- Resumption master secret (RFC 8446 §7.1) check.
+     * Recompute externally from `master` + transcript-through-cFin
+     * (rebuild the cFin message deterministically from cs_hs+T4) and
+     * compare to engine state. ---- */
+    {
+        uint8_t cfin_vd2[32]; tls13_compute_finished(cs_hs, T4, cfin_vd2);
+        uint8_t cfin_msg2[4 + 32];
+        int cfin_len2 = tls13_build_finished(cfin_msg2, sizeof(cfin_msg2), cfin_vd2);
+        tls13_transcript_update(&cli_ts, cfin_msg2, (size_t)cfin_len2);
+        uint8_t T_cf[32];
+        tls13_transcript_snapshot(&cli_ts, T_cf);
+        uint8_t expected_rms[32];
+        if (tls13_compute_resumption_master_secret(master, T_cf, expected_rms) != 0)
+             { printf("  FAIL: compute expected RMS\n"); g_fail++; }
+        else if (eng->has_rms == 1
+                 && memcmp(eng->resumption_master_secret, expected_rms, 32) == 0)
+             { printf("  PASS: engine.resumption_master_secret matches\n"); g_pass++; }
+        else { printf("  FAIL: RMS mismatch or has_rms=%d\n", eng->has_rms); g_fail++; }
+        memset(expected_rms, 0, sizeof(expected_rms));
+        memset(T_cf,         0, sizeof(T_cf));
+    }
+
     /* ---- App data roundtrip: encrypt "hello" with cs_app, push,
      * step, drain APP_IN. ---- */
     {

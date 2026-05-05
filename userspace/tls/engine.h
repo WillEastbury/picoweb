@@ -166,6 +166,13 @@ typedef struct pw_tls_engine {
     uint8_t           cs_app_traffic_secret[32];
     uint8_t           ss_app_traffic_secret[32];
 
+    /* RFC 8446 §7.1 resumption_master_secret. Derived from master_secret
+     * and transcript through the client Finished. Used as the IKM for
+     * future PSKs (NewSessionTicket / resumption). Computed in the
+     * handshake-completion path; persists into APP state. */
+    uint8_t           resumption_master_secret[32];
+    int               has_rms;
+
     /* Diagnostics. */
     uint64_t records_in;
     uint64_t records_out;

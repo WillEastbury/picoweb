@@ -240,6 +240,22 @@ int tls13_compute_application_secrets(const uint8_t handshake_secret[32],
                                       uint8_t client_ap_traffic_secret[32],
                                       uint8_t server_ap_traffic_secret[32]);
 
+/* RFC 8446 §7.1 resumption_master_secret derivation:
+ *
+ *   resumption_master_secret =
+ *     Derive-Secret(master_secret, "res master",
+ *                   H(ClientHello..client_Finished))
+ *
+ * `transcript_hash_through_client_finished` is the SHA-256 of the
+ * full handshake-message stream INCLUDING the client Finished.
+ * Output `resumption_master_secret` is 32 bytes. Returns 0 on success.
+ * The caller is responsible for wiping `master_secret` once no longer
+ * needed (typically immediately after this call). */
+int tls13_compute_resumption_master_secret(
+    const uint8_t master_secret[32],
+    const uint8_t transcript_hash_through_client_finished[32],
+    uint8_t       resumption_master_secret[32]);
+
 /* ---------------- Handshake transcript hash ---------------- */
 /*
  * Convenience wrapper around the SHA-256 streaming context for the

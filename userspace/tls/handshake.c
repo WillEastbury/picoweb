@@ -603,3 +603,14 @@ int tls13_compute_application_secrets(const uint8_t handshake_secret[32],
     secure_zero(derived, sizeof(derived));
     return 0;
 }
+
+int tls13_compute_resumption_master_secret(
+    const uint8_t master_secret[32],
+    const uint8_t transcript_hash_through_client_finished[32],
+    uint8_t       resumption_master_secret[32]) {
+    /* Derive-Secret(master_secret, "res master", H(CH..cFin)) */
+    if (tls13_hkdf_expand_label(master_secret, "res master",
+                                transcript_hash_through_client_finished, 32,
+                                resumption_master_secret, 32) != 0) return -1;
+    return 0;
+}
