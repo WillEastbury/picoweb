@@ -178,6 +178,37 @@ static int parse_extensions(const uint8_t* ext_data, size_t ext_len,
             }
             break;
         }
+        case 0x000d:                  /* signature_algorithms (RFC 8446 §4.2.3) */
+        case 0x0032: {                /* signature_algorithms_cert (RFC 8446 §4.2.3a) */
+            /*
+             * Wire form (both extensions share the layout):
+             *   u16 list_len
+             *   u16 algos[list_len/2]
+             *
+             * For ed25519-only servers we want to know that 0x0807
+             * appears in signature_algorithms (covers both signing
+             * and cert selection unless the client also sent
+             * signature_algorithms_cert, in which case we require
+             * 0x0807 in BOTH). For Commit A we model this as: any
+             * sighting of 0x0807 in either list flips offers_ed25519
+             * on. The stricter "must appear in both lists when both
+             * present" rule is layered in the engine itself, where
+             * we have config context.
+             */
+            uint16_t list_len;
+            if (rd_u16(&eb, &er, &list_len) != 0) return -1;
+            if (list_len & 1u) return -1;            /* must be even */
+            if (er < list_len) return -1;
+            const uint8_t* lp = eb;
+            size_t         lr = list_len;
+            while (lr >= 2) {
+                uint16_t alg;
+                if (rd_u16(&lp, &lr, &alg) != 0) return -1;
+                if (alg == TLS13_SIG_SCHEME_ED25519) out->offers_ed25519 = 1;
+            }
+            if (lr != 0) return -1;                  /* exact consumption */
+            break;
+        }
         default:
             /* Ignore unrecognised extensions (forward compat). */
             break;
@@ -212,10 +243,15 @@ int tls13_parse_client_hello(const uint8_t* msg, size_t msg_len,
     /* random[32] */
     if (rd_copy(&p, &rem, out->random, 32) != 0)     return -1;
 
-    /* legacy_session_id<0..32> */
+    /* legacy_session_id<0..32> — capture it (RFC 8446 §4.1.2 caps at 32);
+     * server MUST echo it in ServerHello in compat mode (§D.4). */
     uint8_t sid_len;
     if (rd_u8(&p, &rem, &sid_len) != 0)              return -1;
-    if (sid_len > 32 || rd_skip(&p, &rem, sid_len) != 0) return -1;
+    if (sid_len > 32)                                return -1;
+    if (rem < sid_len)                               return -1;
+    if (sid_len > 0) memcpy(out->legacy_session_id, p, sid_len);
+    out->legacy_session_id_len = sid_len;
+    if (rd_skip(&p, &rem, sid_len) != 0)             return -1;
 
     /* cipher_suites<2..2^16-2> */
     uint16_t cs_len;
@@ -232,10 +268,19 @@ int tls13_parse_client_hello(const uint8_t* msg, size_t msg_len,
     }
     if (rd_skip(&p, &rem, cs_len) != 0)              return -1;
 
-    /* legacy_compression_methods<1..2^8-1> — must contain 0x00 */
+    /* legacy_compression_methods<1..2^8-1> — RFC 8446 §4.1.2 requires
+     * a single null compression method (0x00). */
     uint8_t cm_len;
     if (rd_u8(&p, &rem, &cm_len) != 0)               return -1;
-    if (cm_len < 1 || rd_skip(&p, &rem, cm_len) != 0) return -1;
+    if (cm_len < 1 || rem < cm_len)                  return -1;
+    {
+        int has_null = 0;
+        for (uint8_t i = 0; i < cm_len; i++) {
+            if (p[i] == 0x00) { has_null = 1; break; }
+        }
+        if (!has_null) return -1;
+    }
+    if (rd_skip(&p, &rem, cm_len) != 0)              return -1;
 
     /* extensions<8..2^16-1> */
     uint16_t ext_total;
@@ -249,8 +294,12 @@ int tls13_parse_client_hello(const uint8_t* msg, size_t msg_len,
 
 int tls13_build_server_hello(uint8_t* out, size_t out_cap,
                              const uint8_t server_random[TLS13_RANDOM_LEN],
-                             const uint8_t our_pubkey[32]) {
+                             const uint8_t our_pubkey[32],
+                             const uint8_t* session_id,
+                             uint8_t session_id_len) {
     if (!out || !server_random || !our_pubkey) return -1;
+    if (session_id_len > 32) return -1;
+    if (session_id_len > 0 && !session_id) return -1;
 
     uint8_t* p = out;
     size_t   rem = out_cap;
@@ -266,9 +315,12 @@ int tls13_build_server_hello(uint8_t* out, size_t out_cap,
     if (wr_u16(&p, &rem, 0x0303) != 0)        return -1;
     /* random[32] */
     if (wr_bytes(&p, &rem, server_random, 32) != 0) return -1;
-    /* legacy_session_id_echo<0..32>. We don't echo a real session id;
-     * write a 0 length (clients that sent one will see this and accept it). */
-    if (wr_u8(&p, &rem, 0) != 0)              return -1;
+    /* legacy_session_id_echo<0..32>: echo the client's session_id
+     * verbatim (compat mode — TLS 1.2 clients / browsers expect this). */
+    if (wr_u8(&p, &rem, session_id_len) != 0) return -1;
+    if (session_id_len > 0) {
+        if (wr_bytes(&p, &rem, session_id, session_id_len) != 0) return -1;
+    }
     /* cipher_suite */
     if (wr_u16(&p, &rem, TLS13_CHACHA20_POLY1305_SHA256) != 0) return -1;
     /* legacy_compression_method */
@@ -316,7 +368,7 @@ int tls13_build_encrypted_extensions(uint8_t* out, size_t out_cap) {
 
 int tls13_build_certificate(uint8_t* out, size_t out_cap,
                             const uint8_t* chain_der,
-                            const uint32_t* cert_lens,
+                            const size_t* cert_lens,
                             unsigned n_certs) {
     if (!out || (n_certs > 0 && (!chain_der || !cert_lens))) return -1;
 
@@ -327,7 +379,8 @@ int tls13_build_certificate(uint8_t* out, size_t out_cap,
      */
     uint64_t cl_total = 0;
     for (unsigned i = 0; i < n_certs; i++) {
-        cl_total += 3u + cert_lens[i] + 2u;
+        if (cert_lens[i] > 0xFFFFFFu) return -1;        /* per-cert u24 */
+        cl_total += 3u + (uint64_t)cert_lens[i] + 2u;
     }
     if (cl_total > 0xFFFFFFu) return -1;
 
@@ -353,7 +406,7 @@ int tls13_build_certificate(uint8_t* out, size_t out_cap,
 
     size_t off = 0;
     for (unsigned i = 0; i < n_certs; i++) {
-        uint32_t cl = cert_lens[i];
+        size_t cl = cert_lens[i];
         *p++ = (uint8_t)(cl >> 16);
         *p++ = (uint8_t)(cl >> 8);
         *p++ = (uint8_t)cl;

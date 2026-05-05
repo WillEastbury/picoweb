@@ -57,6 +57,20 @@ typedef struct {
     int      offers_x25519;
     uint8_t  ecdhe_pubkey[32];
 
+    /* Whether the client advertised ed25519 (0x0807) in
+     * signature_algorithms (and, if present, in
+     * signature_algorithms_cert). RFC 8446 §4.2.3 / §4.2.3a.
+     * If signature_algorithms_cert is absent (the common case),
+     * signature_algorithms is used for both signing and cert
+     * selection — that is the test we apply here. */
+    int      offers_ed25519;
+
+    /* legacy_session_id<0..32>. RFC 8446 §4.1.2. The server MUST
+     * echo this back in ServerHello (compat-mode interop with TLS
+     * 1.2 clients / browsers). */
+    uint8_t  legacy_session_id[32];
+    uint8_t  legacy_session_id_len;
+
     /* Server name (lowercased, ASCII; empty if no SNI). */
     char     sni[TLS13_MAX_SNI_LEN + 1];
     size_t   sni_len;
@@ -82,11 +96,17 @@ int tls13_parse_client_hello(const uint8_t* msg, size_t msg_len,
  * Inputs:
  *   server_random[32]    — fresh server random
  *   our_pubkey[32]       — our X25519 ephemeral pubkey to echo back
+ *   session_id           — bytes from the client's legacy_session_id
+ *                          (echoed verbatim per RFC 8446 §4.1.3 / §D.4).
+ *                          May be NULL iff session_id_len == 0.
+ *   session_id_len       — length 0..32 of session_id
  *
  * Returns the number of bytes written, or -1 on overflow. */
 int tls13_build_server_hello(uint8_t* out, size_t out_cap,
                              const uint8_t server_random[TLS13_RANDOM_LEN],
-                             const uint8_t our_pubkey[32]);
+                             const uint8_t our_pubkey[32],
+                             const uint8_t* session_id,
+                             uint8_t session_id_len);
 
 /* Build an EncryptedExtensions handshake message (RFC 8446 §4.3.1).
  *
@@ -112,7 +132,7 @@ int tls13_build_encrypted_extensions(uint8_t* out, size_t out_cap);
  * lengths. Includes the handshake header (0x0b + 24-bit len). */
 int tls13_build_certificate(uint8_t* out, size_t out_cap,
                             const uint8_t* chain_der,
-                            const uint32_t* cert_lens,
+                            const size_t* cert_lens,
                             unsigned n_certs);
 
 /* Build a Finished handshake message (RFC 8446 §4.4.4).

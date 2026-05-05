@@ -39,6 +39,7 @@
 #include <stdint.h>
 
 #include "../iov.h"
+#include "handshake.h"
 #include "record.h"
 
 /* Per-direction buffer cap. Sized for one full TLS record on the
@@ -53,6 +54,13 @@ typedef enum {
     PW_TLS_ST_FAILED    = 3,   /* fatal protocol error - engine inert      */
 } pw_tls_state_t;
 
+/* Sub-state inside HANDSHAKE — tracks where we are in the handshake
+ * flight. Only meaningful while state == PW_TLS_ST_HANDSHAKE. */
+typedef enum {
+    PW_TLS_HS_WAIT_CH        = 0,  /* server: waiting for ClientHello       */
+    PW_TLS_HS_AFTER_SH_KEYS  = 1,  /* server: SH sent, hs traffic keys in   */
+} pw_tls_hs_phase_t;
+
 /* Bitmask returned by pw_tls_want(). The caller checks these to know
  * which I/O turns are productive. */
 #define PW_TLS_WANT_RX     (1u << 0)   /* engine has room for more cipher  */
@@ -60,8 +68,14 @@ typedef enum {
 #define PW_TLS_APP_IN_RDY  (1u << 2)   /* plaintext available to drain     */
 #define PW_TLS_APP_OUT_OK  (1u << 3)   /* engine can accept plaintext      */
 
+/* RNG callback. Fills exactly `n` bytes into `dst` and returns 0; any
+ * non-zero return is treated as a fatal RNG failure (engine -> FAILED).
+ * `user` is the opaque cookie passed to pw_tls_engine_configure_server. */
+typedef int (*pw_tls_rng_fn)(void* user, uint8_t* dst, size_t n);
+
 typedef struct pw_tls_engine {
-    pw_tls_state_t state;
+    pw_tls_state_t    state;
+    pw_tls_hs_phase_t hs_phase;
 
     /* Inbound ciphertext (post-TCP, pre-AEAD). */
     uint8_t  rx_buf[PW_TLS_BUF_CAP];
@@ -87,6 +101,30 @@ typedef struct pw_tls_engine {
     int      keys_installed;
     int      we_are_server;
 
+    /* ------------------------------------------------------------------
+     * Server-side handshake config (set by pw_tls_engine_configure_server).
+     * The engine borrows cert_chain_der / cert_lens — caller MUST keep
+     * them alive for the engine's lifetime. seed_ed25519 is COPIED.
+     * ------------------------------------------------------------------ */
+    int               configured;
+    pw_tls_rng_fn     rng_fn;
+    void*             rng_user;
+    uint8_t           seed_ed25519[32];
+    const uint8_t*    cert_chain_der;
+    const size_t*     cert_lens;
+    unsigned          n_certs;
+
+    /* ------------------------------------------------------------------
+     * Live handshake context (populated as the handshake progresses).
+     * ------------------------------------------------------------------ */
+    tls13_transcript_t transcript;
+    uint8_t           server_random[32];
+    uint8_t           eph_priv[32];
+    uint8_t           eph_pub[32];
+    uint8_t           handshake_secret[32];
+    uint8_t           cs_handshake_secret[32];   /* client -> server */
+    uint8_t           ss_handshake_secret[32];   /* server -> client */
+
     /* Diagnostics. */
     uint64_t records_in;
     uint64_t records_out;
@@ -96,7 +134,34 @@ typedef struct pw_tls_engine {
 
 void pw_tls_engine_init(pw_tls_engine_t* eng);
 
-/* Spike-mode shortcut: install pre-derived app traffic keys directly.
+/* Configure the engine as a TLS 1.3 server. Once configured, pw_tls_step
+ * will drive a real handshake when ClientHello bytes arrive in RX.
+ *
+ * Inputs:
+ *   rng_fn / rng_user     — entropy source (returns 0 on success)
+ *   seed_ed25519[32]      — raw Ed25519 seed (use cert_extract_ed25519_seed)
+ *                           COPIED into the engine.
+ *   cert_chain_der        — concatenated DER X.509 chain (server cert
+ *                           first). BORROWED — caller MUST keep alive
+ *                           for the engine's lifetime.
+ *   cert_lens[n_certs]    — per-cert byte lengths in chain order.
+ *                           BORROWED.
+ *   n_certs               — number of certs in chain (>= 1).
+ *
+ * Returns 0 on success, -1 on bad args. */
+int pw_tls_engine_configure_server(pw_tls_engine_t* eng,
+                                   pw_tls_rng_fn rng_fn,
+                                   void* rng_user,
+                                   const uint8_t seed_ed25519[32],
+                                   const uint8_t* cert_chain_der,
+                                   const size_t* cert_lens,
+                                   unsigned n_certs);
+
+/* Spike-mode shortcut: install pre-derived app traffic keys directly,
+ * BYPASSING the handshake. Lets a test exercise the APP-state engine
+ * paths without doing a real handshake. Once the full handshake driver
+ * is in place this becomes test-only.
+ *
  * Ordering of (key, iv) follows TLS 1.3: client->server keys decrypt
  * what the client sends; server->client keys encrypt what we send to
  * the client (when we_are_server=1). Returns 0. */
@@ -114,8 +179,9 @@ void pw_tls_close(pw_tls_engine_t* eng);
 
 /* ---------- state introspection ---------- */
 
-pw_tls_state_t pw_tls_state(const pw_tls_engine_t* eng);
-unsigned       pw_tls_want(const pw_tls_engine_t* eng);
+pw_tls_state_t    pw_tls_state(const pw_tls_engine_t* eng);
+pw_tls_hs_phase_t pw_tls_hs_phase(const pw_tls_engine_t* eng);
+unsigned          pw_tls_want(const pw_tls_engine_t* eng);
 
 /* ---------- RX port (caller writes ciphertext into engine) ---------- */
 

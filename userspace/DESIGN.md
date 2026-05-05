@@ -503,6 +503,15 @@ int      pw_tls_app_out_push(pw_tls_engine_t*, const pw_iov_t*, unsigned n);
 /* Drive forward as far as current bytes allow. */
 int   pw_tls_step(pw_tls_engine_t*);
 void  pw_tls_close(pw_tls_engine_t*);
+
+/* server-only: configure with a real RNG, ed25519 seed, cert chain.
+ * Once configured, pw_tls_step drives a real CH -> SH -> install
+ * handshake-traffic keys flow on its own. */
+int   pw_tls_engine_configure_server(pw_tls_engine_t*, pw_tls_rng_fn,
+                                     void* rng_user, const uint8_t seed[32],
+                                     const uint8_t* chain_der,
+                                     const size_t* cert_lens, unsigned n);
+pw_tls_hs_phase_t pw_tls_hs_phase(const pw_tls_engine_t*);
 ```
 
 The engine is the same architecture as `pw_conn`, just with the
@@ -510,9 +519,39 @@ loop inverted: caller drives `step` whenever bytes move.
 
 `pw_tls_engine_install_app_keys` is a **spike-mode shortcut** that
 jumps directly to APP state with caller-supplied symmetric keys.
-This exists because Ed25519 isn't landed yet, so a real handshake
-can't actually complete. Once Ed25519 is in, the engine drives the
-handshake itself and `install_app_keys` becomes a test-only helper.
+It bypasses the handshake. With the server-side handshake driver
+landed, this helper is now strictly for tests that want to exercise
+APP-state behaviour without doing a full handshake.
+
+`pw_tls_engine_configure_server` opts into the **real handshake
+driver**. After this call, feeding a TLS 1.3 ClientHello into RX
+and calling `pw_tls_step` will:
+1. Parse the CH (and validate offers TLS 1.3, ChaCha20-Poly1305,
+   X25519, Ed25519).
+2. Generate `server_random` and the ECDHE ephemeral keypair via
+   the caller's RNG (clamped per RFC 7748 §5).
+3. Compute `X25519(eph_priv, ch.client_pub)` AND constant-time
+   check it isn't all-zero (RFC 8446 §7.4.2 / RFC 7748 §6.1
+   low-order-point defence). On all-zero, abort with state→FAILED
+   **before** writing anything to TX — proven by the
+   `no SH leaked on low-order share` test.
+4. Build a ServerHello that echoes the client's
+   `legacy_session_id` verbatim (browser compat-mode interop) and
+   includes our X25519 pubkey.
+5. Update the running transcript with CH and SH (handshake-msg
+   bytes only — no record headers in the transcript).
+6. Derive the handshake secrets via
+   `tls13_compute_handshake_secrets(shared, transcript_hash, …)`.
+7. Install client→server / server→client handshake-traffic keys
+   into `eng->read` / `eng->write` and reset both `seq` to 0.
+8. Wipe `eph_priv` and `shared`.
+9. Emit the SH as a plaintext TLS record into TX.
+
+State stays `HANDSHAKE`; an internal `hs_phase` advances from
+`WAIT_CH` → `AFTER_SH_KEYS`. Commit B will emit the encrypted
+EE / Cert / CV / Finished flight from `AFTER_SH_KEYS`, receive the
+client Finished, derive application traffic secrets, and finally
+transition to APP.
 
 **Want bits** are the only thing the I/O loop needs to look at:
 - `WANT_RX`: room in the RX buffer; safe to `recv()`.
@@ -651,12 +690,16 @@ future verify path for mTLS) can construct it directly.
 
 This is the running TODO for what's blocking real-traffic readiness.
 
-- **Drive engine through full handshake**. With Ed25519 +
-  `tls13_build_certificate_verify` + `cert_extract_ed25519_seed` in
-  place, the engine has every primitive needed: it just needs to be
-  taught to walk CH parse → SH/EE/Cert/CV/Finished emission → derive
-  app keys → state→APP and delete the spike-mode `install_app_keys`
-  shortcut.
+- **Drive engine through full handshake**. CH parse → SH +
+  install handshake-traffic keys (server side) is in
+  (`pw_tls_engine_configure_server` + the new server-side handshake
+  driver in `engine.c`). What's left:
+  - Emit encrypted EE / Cert / CV / Finished flight from
+    `AFTER_SH_KEYS`.
+  - Tolerate inbound dummy CCS records (RFC 8446 §D.4 compat-mode).
+  - Receive client Finished, verify, derive application traffic
+    secrets, transition state→APP, delete the spike-mode
+    `install_app_keys` shortcut.
 - **Receive-window-driven backpressure** on the TCP layer
   (rubber-duck'd: "no ACK = backpressure" was wrong; the right answer
   is to advertise zero `rcv_wnd` and support persist).

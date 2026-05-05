@@ -1341,6 +1341,13 @@ static void test_tls13_handshake(void) {
         w8 (&p, 2);
         w16(&p, TLS13_SUPPORTED_VERSION);
     }
+    /* signature_algorithms: ed25519 (0x0807) */
+    {
+        w16(&p, 0x000d);
+        w16(&p, 2 + 2);                 /* list_len(2) + 1 alg(2) */
+        w16(&p, 2);
+        w16(&p, TLS13_SIG_SCHEME_ED25519);
+    }
 
     uint16_t ext_len = (uint16_t)(p - ext_start);
     ext_len_at[0] = ext_len >> 8; ext_len_at[1] = (uint8_t)ext_len;
@@ -1356,10 +1363,10 @@ static void test_tls13_handshake(void) {
     if (rc == 0) { printf("  PASS: ClientHello parsed\n"); g_pass++; }
     else         { printf("  FAIL: ClientHello parse rc=%d\n", rc); g_fail++; return; }
 
-    if (ch.offers_chacha_poly && ch.offers_tls13 && ch.offers_x25519)
-         { printf("  PASS: client offered chacha/tls13/x25519\n"); g_pass++; }
-    else { printf("  FAIL: missing offers c=%d v=%d g=%d\n",
-                  ch.offers_chacha_poly, ch.offers_tls13, ch.offers_x25519); g_fail++; }
+    if (ch.offers_chacha_poly && ch.offers_tls13 && ch.offers_x25519 && ch.offers_ed25519)
+         { printf("  PASS: client offered chacha/tls13/x25519/ed25519\n"); g_pass++; }
+    else { printf("  FAIL: missing offers c=%d v=%d g=%d e=%d\n",
+                  ch.offers_chacha_poly, ch.offers_tls13, ch.offers_x25519, ch.offers_ed25519); g_fail++; }
 
     if (ch.sni_len == 11 && memcmp(ch.sni, "example.com", 11) == 0)
          { printf("  PASS: SNI lowercased to 'example.com'\n"); g_pass++; }
@@ -1379,7 +1386,8 @@ static void test_tls13_handshake(void) {
 
     uint8_t sh_buf[256];
     int sh_len = tls13_build_server_hello(sh_buf, sizeof(sh_buf),
-                                          server_random, server_pub);
+                                          server_random, server_pub,
+                                          NULL, 0);
     if (sh_len > 0) { printf("  PASS: ServerHello built (%d bytes)\n", sh_len); g_pass++; }
     else            { printf("  FAIL: ServerHello build rc=%d\n", sh_len); g_fail++; return; }
 
@@ -1858,7 +1866,7 @@ static void test_tls13_build_messages(void) {
      */
     {
         const uint8_t cert[4] = { 0x30, 0x02, 0x05, 0x00 };  /* fake DER */
-        const uint32_t lens[1] = { 4 };
+        const size_t lens[1] = { 4 };
         uint8_t buf[64];
         int n = tls13_build_certificate(buf, sizeof(buf), cert, lens, 1);
         const uint8_t expect[] = {
@@ -1881,7 +1889,7 @@ static void test_tls13_build_messages(void) {
 
         /* Two-cert chain. */
         const uint8_t chain[6] = { 0x30, 0x00, 0x30, 0x02, 0x05, 0x00 };
-        const uint32_t lens2[2] = { 2, 4 };
+        const size_t lens2[2] = { 2, 4 };
         n = tls13_build_certificate(buf, sizeof(buf), chain, lens2, 2);
         size_t expect_len = 4 + 1 + 3 + (3 + 2 + 2) + (3 + 4 + 2);
         if (n == (int)expect_len && buf[0] == 0x0b && buf[4] == 0x00)
@@ -2943,6 +2951,399 @@ static void test_engine_via_dispatch(void) {
     g_active_tls_echo = NULL;
 }
 
+/* ============================================================ *
+ * Engine handshake driver tests (server-side)
+ *
+ * These exercise pw_tls_engine_configure_server + the new CH -> SH
+ * + install-handshake-traffic-keys path inside pw_tls_step.
+ * ============================================================ */
+
+/* Deterministic counter-based RNG so traffic keys are reproducible
+ * (lets us derive expected values independently and compare). */
+typedef struct {
+    uint8_t next;
+} test_rng_state_t;
+
+static int test_rng(void* user, uint8_t* dst, size_t n) {
+    test_rng_state_t* s = (test_rng_state_t*)user;
+    for (size_t i = 0; i < n; i++) dst[i] = s->next++;
+    return 0;
+}
+
+/* Build a synthetic ClientHello as a TLSPlaintext record into out[..].
+ * Returns total record length. The body is a single ClientHello msg.
+ *
+ *   sni      — pointer to ASCII hostname (NULL or empty -> no SNI ext)
+ *   client_pub[32] — X25519 pubkey to put in the key_share
+ *   session_id, sid_len — what to put in legacy_session_id
+ *   include_ed25519 — if 0, signature_algorithms lists 0x0403
+ *                     (ecdsa_secp256r1_sha256) only, simulating a
+ *                     client that does not advertise ed25519.
+ *   include_chacha — if 0, cipher_suites lists 0x1301 only
+ *                    (TLS_AES_128_GCM_SHA256), no chacha. */
+static size_t build_test_ch_record(uint8_t* out, size_t out_cap,
+                                   const uint8_t client_pub[32],
+                                   const uint8_t* session_id,
+                                   uint8_t sid_len,
+                                   const char* sni,
+                                   int include_ed25519,
+                                   int include_chacha) {
+    if (out_cap < 256) return 0;
+    /* Reserve 5 bytes for the record header at the start. */
+    uint8_t* rec_hdr = out;
+    uint8_t* p = out + TLS13_RECORD_HEADER_LEN;
+    /* Handshake header */
+    w8(&p, 0x01);
+    uint8_t* hs_len_at = p; w24(&p, 0);
+    uint8_t* hs_body = p;
+
+    w16(&p, 0x0303);                              /* legacy_version */
+    for (int i = 0; i < 32; i++) w8(&p, (uint8_t)i);
+    /* legacy_session_id */
+    w8(&p, sid_len);
+    if (sid_len) wb(&p, session_id, sid_len);
+    /* cipher_suites */
+    if (include_chacha) {
+        w16(&p, 2);
+        w16(&p, TLS13_CHACHA20_POLY1305_SHA256);
+    } else {
+        w16(&p, 2);
+        w16(&p, 0x1301);                          /* TLS_AES_128_GCM_SHA256 */
+    }
+    /* compression_methods */
+    w8(&p, 1); w8(&p, 0);
+    /* extensions */
+    uint8_t* ext_len_at = p; w16(&p, 0);
+    uint8_t* ext_start = p;
+    /* SNI */
+    if (sni && *sni) {
+        uint16_t host_len = (uint16_t)strlen(sni);
+        w16(&p, 0x0000);
+        w16(&p, 2 + 1 + 2 + host_len);
+        w16(&p, 1 + 2 + host_len);
+        w8 (&p, 0);
+        w16(&p, host_len);
+        wb (&p, sni, host_len);
+    }
+    /* supported_groups: x25519 */
+    w16(&p, 0x000a); w16(&p, 4);
+    w16(&p, 2); w16(&p, TLS13_NAMED_GROUP_X25519);
+    /* key_share: x25519 + client_pub */
+    w16(&p, 0x0033); w16(&p, 2 + 4 + 32);
+    w16(&p, 4 + 32);
+    w16(&p, TLS13_NAMED_GROUP_X25519);
+    w16(&p, 32); wb(&p, client_pub, 32);
+    /* supported_versions: TLS 1.3 */
+    w16(&p, 0x002b); w16(&p, 1 + 2);
+    w8(&p, 2); w16(&p, TLS13_SUPPORTED_VERSION);
+    /* signature_algorithms */
+    w16(&p, 0x000d);
+    w16(&p, 2 + 2);
+    w16(&p, 2);
+    w16(&p, include_ed25519 ? TLS13_SIG_SCHEME_ED25519 : 0x0403);
+
+    uint16_t ext_len = (uint16_t)(p - ext_start);
+    ext_len_at[0] = ext_len >> 8; ext_len_at[1] = (uint8_t)ext_len;
+    uint32_t hs_len = (uint32_t)(p - hs_body);
+    hs_len_at[0] = (uint8_t)(hs_len >> 16);
+    hs_len_at[1] = (uint8_t)(hs_len >> 8);
+    hs_len_at[2] = (uint8_t)hs_len;
+
+    /* Backfill TLSPlaintext record header. Body length = bytes
+     * from end-of-record-header to p. */
+    size_t body_len = (size_t)(p - (out + TLS13_RECORD_HEADER_LEN));
+    rec_hdr[0] = TLS_CT_HANDSHAKE;
+    rec_hdr[1] = 0x03; rec_hdr[2] = 0x03;
+    rec_hdr[3] = (uint8_t)(body_len >> 8);
+    rec_hdr[4] = (uint8_t)body_len;
+
+    return TLS13_RECORD_HEADER_LEN + body_len;
+}
+
+static void test_engine_handshake_server(void) {
+    printf("== TLS engine: server-side CH -> SH + install handshake keys ==\n");
+
+    /* Synthetic config: zero seed (we don't verify a sig in commit A),
+     * a single 4-byte fake DER cert. The handshake driver doesn't
+     * touch these in commit A — they're stashed for commit B. */
+    uint8_t seed[32] = {0};
+    const uint8_t fake_cert[4] = { 0x30, 0x02, 0x05, 0x00 };
+    const size_t  fake_lens[1] = { 4 };
+
+    /* Deterministic RNG: 0,1,2,3,... */
+    test_rng_state_t rng_st = { .next = 0 };
+
+    /* Generate a realistic-looking client X25519 pubkey. */
+    uint8_t client_priv[32];
+    for (int i = 0; i < 32; i++) client_priv[i] = (uint8_t)(0x80 + i);
+    uint8_t client_pub[32];
+    x25519(client_pub, client_priv, X25519_BASE_POINT);
+
+    /* ---------- happy path ---------- */
+    {
+        pw_tls_engine_t* eng = malloc(sizeof(*eng));
+        if (!eng) { printf("  FAIL: alloc\n"); g_fail++; return; }
+        pw_tls_engine_init(eng);
+        if (pw_tls_engine_configure_server(eng, test_rng, &rng_st, seed,
+                                           fake_cert, fake_lens, 1) == 0)
+             { printf("  PASS: configure_server accepted\n"); g_pass++; }
+        else { printf("  FAIL: configure_server\n"); g_fail++; free(eng); return; }
+
+        /* Build a CH with a non-empty session_id (compat-mode browsers
+         * send 32 random bytes here; the server MUST echo). */
+        uint8_t sid[32];
+        for (int i = 0; i < 32; i++) sid[i] = (uint8_t)(0xC0 + i);
+
+        uint8_t ch_rec[2048];
+        size_t  ch_len = build_test_ch_record(ch_rec, sizeof(ch_rec),
+                                              client_pub, sid, 32,
+                                              "example.com", 1, 1);
+        if (ch_len == 0) { printf("  FAIL: build CH\n"); g_fail++; free(eng); return; }
+
+        /* Push CH into engine RX. */
+        size_t cap;
+        uint8_t* rx = pw_tls_rx_buf(eng, &cap);
+        if (cap < ch_len) { printf("  FAIL: rx cap\n"); g_fail++; free(eng); return; }
+        memcpy(rx, ch_rec, ch_len);
+        pw_tls_rx_ack(eng, ch_len);
+
+        int want = pw_tls_step(eng);
+        if (want >= 0) { printf("  PASS: step accepted CH (want=0x%x)\n", want); g_pass++; }
+        else           { printf("  FAIL: step rc=%d\n", want); g_fail++; free(eng); return; }
+
+        if (pw_tls_state(eng) == PW_TLS_ST_HANDSHAKE)
+             { printf("  PASS: state still HANDSHAKE\n"); g_pass++; }
+        else { printf("  FAIL: state=%d\n", pw_tls_state(eng)); g_fail++; }
+
+        if (pw_tls_hs_phase(eng) == PW_TLS_HS_AFTER_SH_KEYS)
+             { printf("  PASS: hs_phase advanced to AFTER_SH_KEYS\n"); g_pass++; }
+        else { printf("  FAIL: hs_phase=%d\n", pw_tls_hs_phase(eng)); g_fail++; }
+
+        if (eng->keys_installed)
+             { printf("  PASS: handshake-traffic keys installed\n"); g_pass++; }
+        else { printf("  FAIL: keys_installed=0\n"); g_fail++; }
+
+        /* TX must contain a plaintext SH record. */
+        size_t tx_len;
+        const uint8_t* tx = pw_tls_tx_buf(eng, &tx_len);
+        int sh_ok = (tx_len >= TLS13_RECORD_HEADER_LEN + 4)
+                 && tx[0] == TLS_CT_HANDSHAKE
+                 && tx[1] == 0x03 && tx[2] == 0x03
+                 && tx[TLS13_RECORD_HEADER_LEN] == 0x02; /* server_hello */
+        if (sh_ok) { printf("  PASS: TX has plaintext SH record\n"); g_pass++; }
+        else       { printf("  FAIL: TX[0..]=%02x %02x %02x ... [hdr_msg]=%02x\n",
+                            tx[0],tx[1],tx[2],
+                            tx_len > TLS13_RECORD_HEADER_LEN ?
+                                tx[TLS13_RECORD_HEADER_LEN] : 0); g_fail++; }
+
+        /* SH must echo the CH session_id verbatim. The session_id sits
+         * at offset (record_hdr 5) + (hs_hdr 4) + legacy_version 2 +
+         * random 32 = 43; one byte len then the bytes. */
+        if (tx_len >= 43 + 1 + 32) {
+            int echo_ok = (tx[43] == 32) && memcmp(tx + 44, sid, 32) == 0;
+            if (echo_ok) { printf("  PASS: SH echoes legacy_session_id\n"); g_pass++; }
+            else         { printf("  FAIL: SH session_id len=%u\n", tx[43]); g_fail++; }
+        } else {
+            printf("  FAIL: SH too short for session_id check\n"); g_fail++;
+        }
+
+        /* Independently re-derive the read+write keys and verify they
+         * match what the engine installed. Re-run the same RNG sequence
+         * against a parallel computation. */
+        {
+            test_rng_state_t rng2 = { .next = 0 };
+            uint8_t srv_random[32], srv_priv[32];
+            test_rng(&rng2, srv_random, 32);
+            test_rng(&rng2, srv_priv,   32);
+            srv_priv[0]  &= 248;
+            srv_priv[31] &= 127;
+            srv_priv[31] |= 64;
+            uint8_t srv_pub[32];
+            x25519(srv_pub, srv_priv, X25519_BASE_POINT);
+
+            uint8_t ref_sh[256];
+            int ref_sh_len = tls13_build_server_hello(ref_sh, sizeof(ref_sh),
+                                                     srv_random, srv_pub,
+                                                     sid, 32);
+            uint8_t shared_ref[32];
+            x25519(shared_ref, srv_priv, client_pub);
+
+            tls13_transcript_t t;
+            tls13_transcript_init(&t);
+            /* CH msg portion is the inner handshake msg, which is the
+             * record body without the 5-byte record header. */
+            tls13_transcript_update(&t,
+                                    ch_rec + TLS13_RECORD_HEADER_LEN,
+                                    ch_len - TLS13_RECORD_HEADER_LEN);
+            tls13_transcript_update(&t, ref_sh, (size_t)ref_sh_len);
+            uint8_t th[32];
+            tls13_transcript_snapshot(&t, th);
+
+            uint8_t hs_secret[32], cs_hs[32], ss_hs[32];
+            tls13_compute_handshake_secrets(shared_ref, th,
+                                            hs_secret, cs_hs, ss_hs);
+            uint8_t kref[32], ivref[12];
+            tls13_derive_traffic_keys(cs_hs, kref, ivref);
+            int read_ok  = memcmp(eng->read.key, kref, 32) == 0
+                        && memcmp(eng->read.static_iv, ivref, 12) == 0
+                        && eng->read.seq == 0;
+            tls13_derive_traffic_keys(ss_hs, kref, ivref);
+            int write_ok = memcmp(eng->write.key, kref, 32) == 0
+                        && memcmp(eng->write.static_iv, ivref, 12) == 0
+                        && eng->write.seq == 0;
+            if (read_ok)  { printf("  PASS: engine.read keys match independent derive\n"); g_pass++; }
+            else          { printf("  FAIL: engine.read keys mismatch\n"); g_fail++; }
+            if (write_ok) { printf("  PASS: engine.write keys match independent derive\n"); g_pass++; }
+            else          { printf("  FAIL: engine.write keys mismatch\n"); g_fail++; }
+
+            /* The SH bytes the engine emitted should also match our
+             * reference SH byte-for-byte (deterministic RNG -> same
+             * server_random and same server_pub). */
+            if (tx_len == TLS13_RECORD_HEADER_LEN + (size_t)ref_sh_len
+                && memcmp(tx + TLS13_RECORD_HEADER_LEN, ref_sh, (size_t)ref_sh_len) == 0)
+                 { printf("  PASS: emitted SH matches reference byte-for-byte\n"); g_pass++; }
+            else { printf("  FAIL: SH bytes differ from reference\n"); g_fail++; }
+        }
+
+        /* eph_priv must have been wiped after key install. */
+        {
+            uint8_t acc = 0;
+            for (size_t i = 0; i < 32; i++) acc |= eng->eph_priv[i];
+            if (acc == 0) { printf("  PASS: eph_priv wiped after install\n"); g_pass++; }
+            else          { printf("  FAIL: eph_priv not wiped\n"); g_fail++; }
+        }
+
+        free(eng);
+    }
+
+    /* ---------- negative: no ed25519 in sig_algs ---------- */
+    {
+        pw_tls_engine_t* eng = malloc(sizeof(*eng));
+        pw_tls_engine_init(eng);
+        rng_st.next = 0;
+        pw_tls_engine_configure_server(eng, test_rng, &rng_st, seed,
+                                       fake_cert, fake_lens, 1);
+
+        uint8_t ch_rec[2048];
+        size_t  ch_len = build_test_ch_record(ch_rec, sizeof(ch_rec),
+                                              client_pub, NULL, 0,
+                                              "example.com", 0, 1);
+        size_t cap; uint8_t* rx = pw_tls_rx_buf(eng, &cap);
+        memcpy(rx, ch_rec, ch_len); pw_tls_rx_ack(eng, ch_len);
+
+        int rc = pw_tls_step(eng);
+        if (rc < 0 && pw_tls_state(eng) == PW_TLS_ST_FAILED)
+             { printf("  PASS: CH without ed25519 -> FAILED\n"); g_pass++; }
+        else { printf("  FAIL: rc=%d state=%d\n", rc, pw_tls_state(eng)); g_fail++; }
+
+        /* TX MUST be empty — nothing should leak before the rejection. */
+        size_t tx_len; (void)pw_tls_tx_buf(eng, &tx_len);
+        if (tx_len == 0) { printf("  PASS: no SH leaked on rejection\n"); g_pass++; }
+        else             { printf("  FAIL: tx_len=%zu after reject\n", tx_len); g_fail++; }
+
+        free(eng);
+    }
+
+    /* ---------- negative: no chacha in cipher_suites ---------- */
+    {
+        pw_tls_engine_t* eng = malloc(sizeof(*eng));
+        pw_tls_engine_init(eng);
+        rng_st.next = 0;
+        pw_tls_engine_configure_server(eng, test_rng, &rng_st, seed,
+                                       fake_cert, fake_lens, 1);
+
+        uint8_t ch_rec[2048];
+        size_t  ch_len = build_test_ch_record(ch_rec, sizeof(ch_rec),
+                                              client_pub, NULL, 0,
+                                              "example.com", 1, 0);
+        size_t cap; uint8_t* rx = pw_tls_rx_buf(eng, &cap);
+        memcpy(rx, ch_rec, ch_len); pw_tls_rx_ack(eng, ch_len);
+
+        int rc = pw_tls_step(eng);
+        if (rc < 0 && pw_tls_state(eng) == PW_TLS_ST_FAILED)
+             { printf("  PASS: CH without chacha -> FAILED\n"); g_pass++; }
+        else { printf("  FAIL: rc=%d state=%d\n", rc, pw_tls_state(eng)); g_fail++; }
+        free(eng);
+    }
+
+    /* ---------- negative: low-order share -> all-zero shared ---------- */
+    {
+        pw_tls_engine_t* eng = malloc(sizeof(*eng));
+        pw_tls_engine_init(eng);
+        rng_st.next = 0;
+        pw_tls_engine_configure_server(eng, test_rng, &rng_st, seed,
+                                       fake_cert, fake_lens, 1);
+
+        uint8_t low_order[32] = {0}; /* point at infinity, X25519 -> 0 */
+        uint8_t ch_rec[2048];
+        size_t  ch_len = build_test_ch_record(ch_rec, sizeof(ch_rec),
+                                              low_order, NULL, 0,
+                                              "example.com", 1, 1);
+        size_t cap; uint8_t* rx = pw_tls_rx_buf(eng, &cap);
+        memcpy(rx, ch_rec, ch_len); pw_tls_rx_ack(eng, ch_len);
+
+        int rc = pw_tls_step(eng);
+        if (rc < 0 && pw_tls_state(eng) == PW_TLS_ST_FAILED)
+             { printf("  PASS: low-order share -> FAILED\n"); g_pass++; }
+        else { printf("  FAIL: rc=%d state=%d\n", rc, pw_tls_state(eng)); g_fail++; }
+
+        /* CRITICAL: TX MUST be empty. The whole point of the SH-after-
+         * shared-check ordering is to avoid leaking ServerHello bytes
+         * on a hostile low-order pubkey. */
+        size_t tx_len; (void)pw_tls_tx_buf(eng, &tx_len);
+        if (tx_len == 0) { printf("  PASS: no SH leaked on low-order share\n"); g_pass++; }
+        else             { printf("  FAIL: tx_len=%zu after low-order reject\n", tx_len); g_fail++; }
+
+        free(eng);
+    }
+
+    /* ---------- partial: truncated CH -> step returns 0, no transition --- */
+    {
+        pw_tls_engine_t* eng = malloc(sizeof(*eng));
+        pw_tls_engine_init(eng);
+        rng_st.next = 0;
+        pw_tls_engine_configure_server(eng, test_rng, &rng_st, seed,
+                                       fake_cert, fake_lens, 1);
+
+        uint8_t ch_rec[2048];
+        size_t  ch_len = build_test_ch_record(ch_rec, sizeof(ch_rec),
+                                              client_pub, NULL, 0,
+                                              "example.com", 1, 1);
+        /* Drop the last byte. */
+        size_t cap; uint8_t* rx = pw_tls_rx_buf(eng, &cap);
+        memcpy(rx, ch_rec, ch_len - 1); pw_tls_rx_ack(eng, ch_len - 1);
+
+        int want = pw_tls_step(eng);
+        int ok = (want >= 0)
+              && pw_tls_state(eng) == PW_TLS_ST_HANDSHAKE
+              && pw_tls_hs_phase(eng) == PW_TLS_HS_WAIT_CH;
+        if (ok) { printf("  PASS: truncated CH waits for more bytes\n"); g_pass++; }
+        else    { printf("  FAIL: want=%d state=%d phase=%d\n",
+                         want, pw_tls_state(eng), pw_tls_hs_phase(eng)); g_fail++; }
+        free(eng);
+    }
+
+    /* ---------- not configured: step is a no-op in HANDSHAKE ----------- */
+    {
+        pw_tls_engine_t* eng = malloc(sizeof(*eng));
+        pw_tls_engine_init(eng);
+        /* Do NOT call configure_server. */
+        uint8_t ch_rec[2048];
+        size_t  ch_len = build_test_ch_record(ch_rec, sizeof(ch_rec),
+                                              client_pub, NULL, 0,
+                                              "example.com", 1, 1);
+        size_t cap; uint8_t* rx = pw_tls_rx_buf(eng, &cap);
+        memcpy(rx, ch_rec, ch_len); pw_tls_rx_ack(eng, ch_len);
+
+        int want = pw_tls_step(eng);
+        if (want >= 0 && pw_tls_state(eng) == PW_TLS_ST_HANDSHAKE
+                      && pw_tls_hs_phase(eng) == PW_TLS_HS_WAIT_CH)
+             { printf("  PASS: unconfigured engine no-ops in HANDSHAKE\n"); g_pass++; }
+        else { printf("  FAIL: want=%d state=%d\n", want, pw_tls_state(eng)); g_fail++; }
+        free(eng);
+    }
+}
+
 int main(void) {
     /* Pick the best SHA-256 + ChaCha20 impls available; tests below
      * run through the public entry points so they exercise whichever
@@ -2987,6 +3388,7 @@ int main(void) {
     test_tcp_dispatch();
     test_tls_engine();
     test_engine_via_dispatch();
+    test_engine_handshake_server();
 
     printf("\n=== RESULTS: PASS=%d FAIL=%d ===\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
