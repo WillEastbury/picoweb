@@ -187,9 +187,12 @@ static int try_open_one(pw_tls_engine_t* eng) {
                                &inner, &pt, &pt_len);
     if (rc < 0) return -1;
 
-    /* Bump the read seq AFTER successful open (the open helper does
-     * NOT bump - convention from record.c). */
-    eng->read.seq++;
+    /* tls13_open_record already advances eng->read.seq on success
+     * (record.c line 109). We MUST NOT bump again here — doing so
+     * would skip seq=1 entirely and the second record would use the
+     * wrong nonce, breaking interop with any RFC-conformant peer.
+     * (Earlier code bumped twice; tests didn't catch it because both
+     * server and client engines bumped symmetrically.) */
     eng->records_in++;
 
     if (inner == TLS_CT_APPLICATION_DATA) {
@@ -241,7 +244,9 @@ static int try_seal_one(pw_tls_engine_t* eng) {
                                      PW_TLS_BUF_CAP - eng->tx_len);
     if (wrote == 0) return -1;
 
-    eng->write.seq++;
+    /* tls13_seal_record already advances eng->write.seq on success
+     * (record.c line 59). Do NOT bump here — same reasoning as the
+     * read side above. */
     eng->tx_len += wrote;
     eng->records_out++;
 

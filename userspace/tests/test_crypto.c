@@ -2691,6 +2691,18 @@ static void test_tls_engine(void) {
              { printf("  PASS: 2nd record decrypts (seq advanced)\n"); g_pass++; }
         else { printf("  FAIL: 2nd record pt_len=%zu\n", pt_len); g_fail++; }
         pw_tls_app_in_ack(svr, pt_len);
+
+        /* RFC 8446 §5.3: per-direction record sequence MUST be the
+         * count of records in that direction (0, 1, 2, ...). After
+         * sending 2 records cli->svr the sender's write seq must be
+         * exactly 2 (next nonce will use seq=2 for the 3rd record).
+         * Catches the double-bump regression where seq would jump
+         * 0 -> 2 -> 4. */
+        if (cli->write.seq == 2 && svr->read.seq == 2)
+             { printf("  PASS: seq counters canonical (cli.write=svr.read=2)\n"); g_pass++; }
+        else { printf("  FAIL: seq cli.w=%llu svr.r=%llu (want 2/2)\n",
+                      (unsigned long long)cli->write.seq,
+                      (unsigned long long)svr->read.seq); g_fail++; }
     }
 
     /* ---------- Tampered tag is detected, state -> FAILED ---------- */
