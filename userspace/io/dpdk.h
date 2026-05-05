@@ -25,9 +25,17 @@ typedef struct pw_dpdk_ctx pw_dpdk_ctx_t;
 typedef int (*pw_dpdk_on_segment_fn)(pw_dpdk_ctx_t* ctx,
                                      const tcp_seg_t* seg);
 
+/* Per-pump tick callback. Called from `pw_dpdk_pump` AFTER the RX
+ * burst is drained but BEFORE the TX flush, so that any retransmits
+ * scheduled by the tick (e.g. tcp_tick on RTO expiry) ride out in the
+ * same TX burst. The owner is expected to read its own monotonic
+ * clock and call tcp_tick(stack, now_ms, ...). May be NULL. */
+typedef void (*pw_dpdk_on_tick_fn)(pw_dpdk_ctx_t* ctx);
+
 typedef struct {
     int                    port_id;        /* rte_eth_dev port index */
     pw_dpdk_on_segment_fn  on_segment;
+    pw_dpdk_on_tick_fn     on_tick;        /* optional */
     void*                  user;
 } pw_dpdk_cfg_t;
 
@@ -35,6 +43,7 @@ struct pw_dpdk_ctx {
     int                   port_id;
     void*                 mempool;          /* struct rte_mempool* in WITH_DPDK build */
     pw_dpdk_on_segment_fn on_segment;
+    pw_dpdk_on_tick_fn    on_tick;
     void*                 user;
     int                   initialised;
     /* Caller-staged TX mbufs to drain in the next pump tick. */

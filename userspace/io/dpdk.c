@@ -158,6 +158,7 @@ int pw_dpdk_init(int argc, char** argv, pw_dpdk_cfg_t* cfg, pw_dpdk_ctx_t* out) 
     rte_eth_promiscuous_enable(out->port_id);
 
     out->on_segment   = cfg->on_segment;
+    out->on_tick      = cfg->on_tick;
     out->user         = cfg->user;
     out->initialised  = 1;
     return 0;
@@ -173,6 +174,11 @@ int pw_dpdk_pump(pw_dpdk_ctx_t* ctx) {
         (void)handle_one_rx_mbuf(ctx, rx[i]);
         rte_pktmbuf_free(rx[i]);
     }
+
+    /* Tick the owner's timer wheel between RX drain and TX flush so
+     * any retransmits / RTO-driven sends scheduled by tcp_tick are
+     * batched into the same TX burst as application sends. */
+    if (ctx->on_tick) ctx->on_tick(ctx);
 
     /* TX side: ctx->on_segment is expected to enqueue prepared
      * mbufs into ctx->tx_pending; we drain them here in one burst. */
