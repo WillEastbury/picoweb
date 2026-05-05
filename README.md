@@ -271,14 +271,20 @@ default until io_uring has been burned in under load.
 What's *not* in the io_uring backend yet (deliberate scope cuts —
 straightforward extensions, just not in the spike):
 
-- `MSG_ZEROCOPY`. Would map onto `IORING_OP_SENDMSG_ZC` and reuse the
-  same threshold knob.
 - Multishot accept / multishot recv. 5.19+ kernels only; the spike
   targets WSL2's 5.15 line.
 - Registered fds and fixed buffers. Next-level perf; design intact.
 - Idle-timer eviction. The epoll backend's per-conn idle-timer is
   not yet ported; under abusive slow-loris-style clients you'll want
   the epoll backend.
+
+`MSG_ZEROCOPY` IS supported via `IORING_OP_SENDMSG_ZC` (Linux 6.0+):
+the worker uses the same `ZC_MIN` threshold as the epoll backend,
+ignores the `IORING_CQE_F_NOTIF` "kernel done" CQE (response bytes
+live forever in the immutable arena), and on older kernels that
+return `-EINVAL`/`-EOPNOTSUPP` for the new opcode it logs once,
+flips the threshold to 0, and resubmits the same payload as a plain
+`SENDMSG` — no requests are dropped during the fallback.
 
 ### `--dpdk` flag
 

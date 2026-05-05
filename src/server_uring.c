@@ -27,10 +27,19 @@
  *     compressed variant.
  *
  * What's NOT in the spike (call out in README):
- *   - MSG_ZEROCOPY (would use IORING_OP_SENDMSG_ZC; trivial extension)
  *   - Multishot accept / recv (works on 5.19+; we use one-shot for
  *     compatibility with the WSL2 5.15 kernel)
  *   - Registered fds / fixed buffers (next-level perf; design intact)
+ *
+ * Zero-copy send (Linux 6.0+):
+ *   When `cfg->zerocopy_threshold` is non-zero, sends whose total
+ *   payload meets the threshold use IORING_OP_SENDMSG_ZC instead of
+ *   IORING_OP_SENDMSG. Response bytes live forever in the immutable
+ *   arena, so the F_NOTIF "kernel done with buffer" CQE is just
+ *   consumed and ignored. On kernels older than 6.0 the first ZC
+ *   send returns -EINVAL/-EOPNOTSUPP; the worker logs once, sets
+ *   the threshold to 0, and resubmits the same payload as a plain
+ *   SENDMSG so the response still goes out.
  */
 
 #include "server.h"
@@ -201,8 +210,28 @@ static void ring_publish(ring_t* r) {
                           memory_order_release);
 }
 
+/* IORING_OP_SENDMSG_ZC was added in Linux 6.0; CQE flag F_NOTIF
+ * (bit 3) signals "kernel done with the buffer" for zero-copy
+ * sends. Provide fallback defines so older headers still compile;
+ * runtime kernels older than 6.0 will simply fail the op with
+ * -EINVAL on the first attempt and the caller leaves zerocopy
+ * disabled. */
+#ifndef IORING_OP_SENDMSG_ZC
+#  define IORING_OP_SENDMSG_ZC 49
+#endif
+#ifndef IORING_CQE_F_NOTIF
+#  define IORING_CQE_F_NOTIF (1U << 3)
+#endif
+#ifndef IORING_CQE_F_MORE
+#  define IORING_CQE_F_MORE  (1U << 1)
+#endif
+
+/* Per-worker MSG_ZEROCOPY threshold. 0 = SENDMSG always; >0 means
+ * use IORING_OP_SENDMSG_ZC for any response payload of at least
+ * this many bytes. Set once before the worker loop runs. */
+static __thread size_t g_uring_zc_threshold = 0;
+
 /* ============================================================== */
-/* user_data packing.                                             */
 /*                                                                */
 /* Bits:  56..63  op tag                                          */
 /*         0..55  conn index in the pool (or 0 for accept)        */
@@ -233,6 +262,7 @@ typedef struct {
     struct iovec  iov[4];
     struct msghdr mh;
     uint8_t       in_flight;     /* OP_* of the current submitted op (0 = none) */
+    uint8_t       last_was_zc;   /* did the most recent send use SENDMSG_ZC?    */
 } uring_state_t;
 
 static uring_state_t* g_uring_state = NULL;
@@ -282,8 +312,15 @@ static bool submit_close(ring_t* r, int fd, size_t conn_idx) {
 
 /* Build the iovec for the current response and submit a sendmsg op.
  * Walks the segment list against c->bytes_sent to compute the partial-
- * send tail — the kernel will keep going from where we left off. */
-static bool submit_sendmsg(ring_t* r, conn_t* c, size_t conn_idx) {
+ * send tail — the kernel will keep going from where we left off.
+ *
+ * If `total_payload` is at least g_uring_zc_threshold (and threshold
+ * is non-zero), the op uses IORING_OP_SENDMSG_ZC. The response
+ * payload bytes are owned by the immutable arena and live forever,
+ * so we don't need to track buffer-release notifications — we just
+ * ignore the extra IORING_CQE_F_NOTIF cqe in the OP_SEND handler. */
+static bool submit_sendmsg(ring_t* r, conn_t* c, size_t conn_idx,
+                           size_t total_payload) {
     const resource_t* res = c->res;
     const chrome_t* ch = (c->send_body && !c->serve_compressed) ? res->chrome : NULL;
     const char* body_ptr = c->serve_compressed ? res->compressed->body : res->body;
@@ -321,13 +358,16 @@ static bool submit_sendmsg(ring_t* r, conn_t* c, size_t conn_idx) {
     struct io_uring_sqe* sqe = ring_get_sqe(r);
     if (!sqe) return false;
     memset(sqe, 0, sizeof(*sqe));
-    sqe->opcode    = IORING_OP_SENDMSG;
+    int use_zc = (g_uring_zc_threshold > 0
+                  && total_payload >= g_uring_zc_threshold);
+    sqe->opcode    = use_zc ? IORING_OP_SENDMSG_ZC : IORING_OP_SENDMSG;
     sqe->fd        = c->fd;
     sqe->addr      = (uint64_t)(uintptr_t)&us->mh;
     sqe->msg_flags = MSG_NOSIGNAL;
     sqe->user_data = pack_ud(OP_SEND, conn_idx);
     ring_publish(r);
-    us->in_flight = OP_SEND;
+    us->in_flight   = OP_SEND;
+    us->last_was_zc = (uint8_t)use_zc;
     return true;
 }
 
@@ -360,6 +400,24 @@ static void conn_init_new(conn_t* c, int fd) {
     c->peer_half_closed = false;
     c->req_start_tsc = 0;
     c->last_active_ms = metal_now_ms();
+}
+
+/* Compute the wire-bytes total for the response c is currently
+ * serving — head + (chrome.hdr + body + chrome.ftr) for uncompressed,
+ * or (head + body) for the precomputed compressed variant. Used both
+ * to detect "send done" and to pick SENDMSG vs SENDMSG_ZC. */
+static inline size_t conn_total_payload(const conn_t* c) {
+    size_t total = c->head_len;
+    if (c->send_body) {
+        const resource_t* rs = c->res;
+        if (c->serve_compressed) {
+            total += rs->compressed->body_len;
+        } else {
+            total += rs->body_len;
+            if (rs->chrome) total += rs->chrome->hdr_len + rs->chrome->ftr_len;
+        }
+    }
+    return total;
 }
 
 /* Apply parser result + dispatch a response. Returns true on success
@@ -414,6 +472,12 @@ void* uring_worker_main(void* arg) {
     if (g_metrics && cfg->worker_index >= 0 && cfg->worker_index < g_n_workers) {
         g_worker_metrics = &g_metrics[cfg->worker_index];
     }
+
+    /* Pick up the MSG_ZEROCOPY threshold for this worker. 0 means
+     * always use plain SENDMSG; >0 means switch to SENDMSG_ZC for
+     * any payload at or above the threshold. Same env knob as the
+     * epoll backend (cfg->zerocopy_threshold). */
+    g_uring_zc_threshold = cfg->zerocopy_threshold;
 
     /* TCP listener — same SO_REUSEPORT pattern as the epoll backend
      * so multiple workers genuinely share load. */
@@ -522,16 +586,50 @@ void* uring_worker_main(void* arg) {
                 }
 
                 if (c->state == ST_WRITING) {
-                    if (submit_sendmsg(&r, c, idx)) to_submit++;
+                    if (submit_sendmsg(&r, c, idx, conn_total_payload(c))) to_submit++;
                 } else {
                     /* Need more bytes. Re-arm recv. */
                     if (submit_recv(&r, c, idx)) to_submit++;
                 }
             } else if (op == OP_SEND) {
                 conn_t* c = &pool.base[idx];
-                g_uring_state[idx].in_flight = 0;
+
+                /* Zero-copy completion sequence is two CQEs:
+                 *   1) the bytes-sent result (with IORING_CQE_F_MORE)
+                 *   2) the F_NOTIF "kernel done with buffer" cqe
+                 * For us, response bytes live forever in the immutable
+                 * arena, so the F_NOTIF carries no useful information.
+                 * Skip it entirely — do not touch in_flight / bytes_sent
+                 * / state. */
+                if (cqe->flags & IORING_CQE_F_NOTIF) {
+                    continue;
+                }
+
+                /* Only clear in_flight when we know no more CQEs are
+                 * coming for this op. With F_MORE set (zero-copy), the
+                 * F_NOTIF is still pending; with it clear (regular
+                 * sendmsg or final ZC result), this is the terminal
+                 * CQE for the send. */
+                if (!(cqe->flags & IORING_CQE_F_MORE)) {
+                    g_uring_state[idx].in_flight = 0;
+                }
 
                 if (res <= 0) {
+                    /* Kernel doesn't support SENDMSG_ZC (5.x kernels)?
+                     * Disable zero-copy globally for this worker and
+                     * resubmit the same payload as a plain SENDMSG so
+                     * the response still goes out. One-time fallback;
+                     * subsequent sends pick the regular opcode in
+                     * submit_sendmsg automatically. */
+                    if ((res == -EINVAL || res == -EOPNOTSUPP)
+                        && g_uring_state[idx].last_was_zc
+                        && g_uring_zc_threshold > 0) {
+                        metal_log("io_uring: SENDMSG_ZC unsupported "
+                                  "(res=%d), falling back to SENDMSG", res);
+                        g_uring_zc_threshold = 0;
+                        if (submit_sendmsg(&r, c, idx, conn_total_payload(c))) to_submit++;
+                        continue;
+                    }
                     if (submit_close(&r, c->fd, idx)) to_submit++;
                     c->fd = -1;
                     pool_free(&pool, c);
@@ -539,21 +637,11 @@ void* uring_worker_main(void* arg) {
                 }
                 c->bytes_sent += (size_t)res;
 
-                /* Compute total payload (head + chrome + body or head + body_pc). */
-                const resource_t* rs = c->res;
-                size_t total = c->head_len;
-                if (c->send_body) {
-                    if (c->serve_compressed) {
-                        total += rs->compressed->body_len;
-                    } else {
-                        total += rs->body_len;
-                        if (rs->chrome) total += rs->chrome->hdr_len + rs->chrome->ftr_len;
-                    }
-                }
+                size_t total = conn_total_payload(c);
 
                 if (c->bytes_sent < total) {
                     /* Partial send -> resubmit. */
-                    if (submit_sendmsg(&r, c, idx)) to_submit++;
+                    if (submit_sendmsg(&r, c, idx, total)) to_submit++;
                     continue;
                 }
 
@@ -576,7 +664,7 @@ void* uring_worker_main(void* arg) {
                 if (c->read_off > 0 &&
                     dispatch_one(c, cfg->jt, cfg->max_requests_per_conn) &&
                     c->state == ST_WRITING) {
-                    if (submit_sendmsg(&r, c, idx)) to_submit++;
+                    if (submit_sendmsg(&r, c, idx, conn_total_payload(c))) to_submit++;
                 } else {
                     if (submit_recv(&r, c, idx)) to_submit++;
                 }
