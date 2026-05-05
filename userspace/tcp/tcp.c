@@ -410,6 +410,7 @@ void tcp_input_at(tcp_stack_t* s, const tcp_seg_t* seg,
             }
         }
         if (seg->payload_len) {
+            uint16_t adv_wnd = tcp_advertised_wnd(c);
             /* Zero-window flow control: if we have advertised a zero
              * window, we MUST NOT consume the bytes. Any segment
              * arriving here is either:
@@ -420,7 +421,17 @@ void tcp_input_at(tcp_stack_t* s, const tcp_seg_t* seg,
              * In either case: drop the data, do NOT advance rcv_nxt,
              * and re-ACK with the current (still 0) window so the
              * peer keeps probing instead of giving up. */
-            if (tcp_advertised_wnd(c) == 0) {
+            if (adv_wnd == 0) {
+                emit_ctrl(c, TCPF_ACK, emit, emit_user);
+                return;
+            }
+            /* Reject any segment that overruns the advertised receive
+             * window. Previously we accepted the full payload and only
+             * clamped rcv_buf_used, which let an aggressive sender
+             * push past what the application could buffer. Drop +
+             * re-ACK with current window so the peer retransmits
+             * after we drain. */
+            if (seg->payload_len > adv_wnd) {
                 emit_ctrl(c, TCPF_ACK, emit, emit_user);
                 return;
             }
@@ -435,10 +446,7 @@ void tcp_input_at(tcp_stack_t* s, const tcp_seg_t* seg,
              * It must call tcp_rcv_consumed() once it has drained
              * them so the window can re-open. */
             if (c->rcv_buf_cap > 0) {
-                uint32_t add = seg->payload_len;
-                if (add > (c->rcv_buf_cap - c->rcv_buf_used))
-                    add = c->rcv_buf_cap - c->rcv_buf_used;
-                c->rcv_buf_used += add;
+                c->rcv_buf_used += seg->payload_len;
             }
             emit_ctrl(c, TCPF_ACK, emit, emit_user);
         }
@@ -664,8 +672,14 @@ int tcp_send_at(tcp_conn_t* c,
     s.payload_len = len;
     emit(&s, emit_user);
     if (now_ms != 0 && len > 0) {
-        rtx_enqueue(c, c->snd_nxt, (uint32_t)len, data,
-                    TCPF_ACK | TCPF_PSH, now_ms);
+        /* The precondition at line ~644 already guarantees rtx_n <
+         * MAX, so this enqueue cannot fail today. Check the return
+         * anyway so a future change to the precondition can't silently
+         * orphan a sent segment with no RTO recovery path. */
+        if (rtx_enqueue(c, c->snd_nxt, (uint32_t)len, data,
+                        TCPF_ACK | TCPF_PSH, now_ms) != 0) {
+            return -1;
+        }
     }
     c->snd_nxt += (uint32_t)len;
     return (int)len;

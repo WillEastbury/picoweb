@@ -75,6 +75,10 @@ int ip_tcp_parse(const uint8_t* frame, size_t len, tcp_seg_t* out) {
     const uint8_t* tcp = frame + ihl;
     size_t tcp_len = total - ihl;
     if (tcp_len < TCP_HEADER_LEN) return -1;
+    /* Belt-and-braces buffer-bounds check: total <= len was already
+     * enforced above, but make the post-condition explicit so future
+     * edits to the header walk can't sneak past it. */
+    if ((size_t)(tcp - frame) + tcp_len > len) return -1;
     size_t doff = ((tcp[12] >> 4) & 0x0f) * 4u;
     if (doff < TCP_HEADER_LEN || doff > tcp_len) return -1;
 
