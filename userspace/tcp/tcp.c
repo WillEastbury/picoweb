@@ -20,6 +20,46 @@ static void cc_on_new_ack(tcp_conn_t* c, uint32_t bytes_acked);
 static void cc_on_dupack(tcp_conn_t* c, tcp_emit_fn emit, void* emit_user);
 static void cc_on_rto(tcp_conn_t* c);
 
+/* RFC 6528 §3 ISN derivation:
+ *   ISN = M + F(local_ip, local_port, remote_ip, remote_port, secret)
+ * where M is a monotonic clock and F is a keyed PRF over the 4-tuple.
+ * We use a SipHash-style mix (rotate + xor + multiply) keyed on the
+ * per-stack iss_secret. If the owner never installed a secret, the
+ * secret is all-zero but the 4-tuple still produces 2^32 distinct ISN
+ * baselines — orders of magnitude better than the legacy fixed value
+ * but NOT a substitute for a real RNG-seeded secret. Owners who care
+ * about RFC 9293 §3.4.1 blind-injection resistance MUST call
+ * tcp_stack_set_iss_secret() at startup with 16 bytes of CSPRNG. */
+static uint32_t iss_derive(const tcp_stack_t* s,
+                           uint32_t local_ip,  uint16_t local_port,
+                           uint32_t remote_ip, uint16_t remote_port,
+                           uint64_t now_ms) {
+    uint64_t k0 = 0, k1 = 0;
+    for (int i = 0; i < 8; i++) {
+        k0 |= (uint64_t)s->iss_secret[i]      << (i * 8);
+        k1 |= (uint64_t)s->iss_secret[i + 8]  << (i * 8);
+    }
+    uint64_t v = ((uint64_t)local_ip << 32) ^ remote_ip;
+    v ^= ((uint64_t)local_port << 16) ^ remote_port;
+    v ^= k0;
+    /* Two rounds of mix (loosely SipHash-like). */
+    v = (v ^ (v >> 33)) * 0xff51afd7ed558ccdull;
+    v ^= k1;
+    v = (v ^ (v >> 33)) * 0xc4ceb9fe1a85ec53ull;
+    v ^= (v >> 33);
+    /* RFC 6528 advances the baseline at the rate of a fast clock.
+     * Mix in a quarter of now_ms so retried 4-tuples within a
+     * couple of seconds still pick up a different ISN. */
+    return (uint32_t)v + (uint32_t)(now_ms << 18);
+}
+
+void tcp_stack_set_iss_secret(tcp_stack_t* s, const uint8_t* secret, size_t len) {
+    if (!s) return;
+    size_t n = len < sizeof(s->iss_secret) ? len : sizeof(s->iss_secret);
+    if (n) memcpy(s->iss_secret, secret, n);
+    if (n < sizeof(s->iss_secret)) memset(s->iss_secret + n, 0, sizeof(s->iss_secret) - n);
+}
+
 static tcp_conn_t* find_conn(tcp_stack_t* s, const tcp_seg_t* seg) {
     for (uint32_t i = 0; i < TCP_TABLE_SIZE; i++) {
         tcp_conn_t* c = &s->conns[i];
@@ -267,7 +307,10 @@ void tcp_input_at(tcp_stack_t* s, const tcp_seg_t* seg,
         c->local_port  = seg->dst_port;
         c->remote_port = seg->src_port;
         c->rcv_nxt     = seg->seq + 1;     /* +1 for SYN */
-        c->snd_nxt     = 0xc0fe0000u;      /* deterministic ISS for spike */
+        c->snd_nxt     = iss_derive(s,
+                                    seg->dst_ip, seg->dst_port,
+                                    seg->src_ip, seg->src_port,
+                                    now_ms);
         c->snd_una     = c->snd_nxt;
         c->rcv_wnd     = 65535;
         /* Congestion control init (RFC 5681 + RFC 6928 IW10). */
@@ -285,8 +328,27 @@ void tcp_input_at(tcp_stack_t* s, const tcp_seg_t* seg,
         return;
     }
 
-    /* RST always tears down. */
+    /* RST tears down — but only if the ACK field falls in the
+     * current send window (RFC 9293 §3.10.7.4 / §3.5.2). Without
+     * this check, an off-path attacker can blind-inject RST by
+     * spraying the rcv_nxt seq space; requiring a valid ACK field
+     * raises the work factor by ~2^32. SYN-RECEIVED tolerates RST
+     * with no ACK because the peer may abort before our SYN-ACK
+     * lands; in that state we just check seq is in window. */
     if (seg->flags & TCPF_RST) {
+        int rst_ok = 0;
+        if (c->state == TCP_SYN_RECEIVED) {
+            rst_ok = (seg->seq == c->rcv_nxt);
+        } else if (seg->flags & TCPF_ACK) {
+            int32_t lo = (int32_t)(seg->ack - c->snd_una);
+            int32_t hi = (int32_t)(seg->ack - c->snd_nxt);
+            rst_ok = (lo >= 0) && (hi <= 0)
+                  && (seg->seq == c->rcv_nxt);
+        }
+        if (!rst_ok) {
+            /* Silently ignore — do NOT echo, that would aid probing. */
+            return;
+        }
         fire_close(c);
         c->state = TCP_CLOSED;
         return;
@@ -319,7 +381,9 @@ void tcp_input_at(tcp_stack_t* s, const tcp_seg_t* seg,
         break;
 
     case TCP_ESTABLISHED:
-        if (seg->seq != c->rcv_nxt) {
+        /* Use signed delta so the comparison is correct across the
+         * 32-bit seq wrap (RFC 1323 §4 / RFC 7323). */
+        if ((int32_t)(seg->seq - c->rcv_nxt) != 0) {
             /* Out of order — re-ACK what we have and drop. */
             emit_ctrl(c, TCPF_ACK, emit, emit_user);
             return;

@@ -145,6 +145,13 @@ typedef struct {
      * If non-NULL, listen_port is ignored and inbound segments are
      * routed by (PW_PROTO_TCP, dst_port) via the dispatch table. */
     const pw_dispatch_t* dispatch;
+
+    /* RFC 6528 ISN secret. Owners SHOULD seed this with 16 bytes
+     * of CSPRNG at startup via tcp_stack_set_iss_secret(). If left
+     * zero the 4-tuple still produces distinct ISNs but they are
+     * predictable to anyone who knows the algorithm — adequate for
+     * spike testing, not for production exposure. */
+    uint8_t iss_secret[16];
 } tcp_stack_t;
 
 /* Application-data callback: called when a fully-acked, in-order
@@ -161,6 +168,12 @@ typedef void (*tcp_emit_fn)(const tcp_seg_t* seg, void* user);
 /* One-shot init: bind the stack to a local IP+port. Legacy single-
  * port mode. Returns 0. */
 int tcp_listen(tcp_stack_t* s, uint32_t local_ip, uint16_t listen_port);
+
+/* Install a 16-byte secret used to derive RFC 6528 ISNs. SHOULD be
+ * called once at startup with bytes from a CSPRNG. Safe to call with
+ * any length 0..16; remaining bytes are zero-filled. Without a
+ * secret, ISNs are still unique per 4-tuple but predictable. */
+void tcp_stack_set_iss_secret(tcp_stack_t* s, const uint8_t* secret, size_t len);
 
 /* Attach a multi-service dispatch table. Replaces the single listen
  * port; inbound segments are routed by (PW_PROTO_TCP, dst_port).
