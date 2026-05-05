@@ -32,6 +32,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "../crypto/sha256.h"
+
 #define TLS13_RANDOM_LEN          32u
 #define TLS13_CHACHA20_POLY1305_SHA256  0x1303u
 #define TLS13_SUPPORTED_VERSION   0x0304u
@@ -86,6 +88,41 @@ int tls13_build_server_hello(uint8_t* out, size_t out_cap,
                              const uint8_t server_random[TLS13_RANDOM_LEN],
                              const uint8_t our_pubkey[32]);
 
+/* Build an EncryptedExtensions handshake message (RFC 8446 §4.3.1).
+ *
+ * Spike: emits an empty extensions list. (No ALPN, no SNI ack — both
+ * legitimate for a minimal HTTP/1.1 server.) Includes the 4-byte
+ * handshake header. Returns bytes written, or -1 on overflow. */
+int tls13_build_encrypted_extensions(uint8_t* out, size_t out_cap);
+
+/* Build a Certificate handshake message (RFC 8446 §4.4.2).
+ *
+ *   struct {
+ *     opaque certificate_request_context<0..255>;       // empty for server
+ *     CertificateEntry certificate_list<0..2^24-1>;
+ *   }
+ *
+ *   struct {
+ *     opaque cert_data<1..2^24-1>;     // DER X.509
+ *     Extension extensions<0..2^16-1>; // empty in spike
+ *   } CertificateEntry;
+ *
+ * `chain_der` points at concatenated DER X.509 certs as produced by
+ * the cert store; `cert_lens[0..n_certs-1]` give the per-cert byte
+ * lengths. Includes the handshake header (0x0b + 24-bit len). */
+int tls13_build_certificate(uint8_t* out, size_t out_cap,
+                            const uint8_t* chain_der,
+                            const uint32_t* cert_lens,
+                            unsigned n_certs);
+
+/* Build a Finished handshake message (RFC 8446 §4.4.4).
+ *
+ * `verify_data` is the 32-byte HMAC computed by tls13_compute_finished
+ * (or by the caller via tls13_verify_finished's expected calc).
+ * Includes handshake header (0x14 + 24-bit length). */
+int tls13_build_finished(uint8_t* out, size_t out_cap,
+                         const uint8_t verify_data[32]);
+
 /* Compute the TLS 1.3 handshake-phase secrets per RFC 8446 §7.1.
  *
  * Inputs:
@@ -105,5 +142,29 @@ int tls13_compute_handshake_secrets(const uint8_t ecdhe_shared[32],
                                     uint8_t handshake_secret[32],
                                     uint8_t client_hs_traffic_secret[32],
                                     uint8_t server_hs_traffic_secret[32]);
+
+/* ---------------- Handshake transcript hash ---------------- */
+/*
+ * Convenience wrapper around the SHA-256 streaming context for the
+ * running TLS 1.3 transcript hash. Each handshake message is fed in
+ * (including its 4-byte handshake header). Snapshot can be taken at
+ * any point without consuming the context.
+ *
+ *   tls13_transcript_t t;
+ *   tls13_transcript_init(&t);
+ *   tls13_transcript_update(&t, ch_bytes, ch_len);
+ *   tls13_transcript_update(&t, sh_bytes, sh_len);
+ *   uint8_t h[32];
+ *   tls13_transcript_snapshot(&t, h);   // hash for handshake secrets
+ *   ... continue updating with EE / Cert / CV / Finished ...
+ */
+typedef struct {
+    sha256_ctx sha;
+} tls13_transcript_t;
+
+void tls13_transcript_init(tls13_transcript_t* t);
+void tls13_transcript_update(tls13_transcript_t* t,
+                             const uint8_t* msg, size_t len);
+void tls13_transcript_snapshot(const tls13_transcript_t* t, uint8_t out[32]);
 
 #endif

@@ -301,6 +301,99 @@ int tls13_build_server_hello(uint8_t* out, size_t out_cap,
     return (int)(p - out);
 }
 
+/* ------------------ EncryptedExtensions / Certificate / Finished ----- */
+
+int tls13_build_encrypted_extensions(uint8_t* out, size_t out_cap) {
+    if (!out) return -1;
+    /* Header (4) + extensions list length (2) = 6 bytes minimum. */
+    if (out_cap < 6) return -1;
+    out[0] = 0x08;                   /* encrypted_extensions */
+    out[1] = 0x00; out[2] = 0x00; out[3] = 0x02;  /* body length = 2 */
+    out[4] = 0x00; out[5] = 0x00;    /* extensions<0..2^16-1> = empty */
+    return 6;
+}
+
+int tls13_build_certificate(uint8_t* out, size_t out_cap,
+                            const uint8_t* chain_der,
+                            const uint32_t* cert_lens,
+                            unsigned n_certs) {
+    if (!out || (n_certs > 0 && (!chain_der || !cert_lens))) return -1;
+
+    /* Compute the body length up front for bounds checks:
+     *   1 (cert_request_context len = 0)
+     *   3 (certificate_list length, u24)
+     *   sum( 3 (cert_data len, u24) + cert_lens[i] + 2 (extensions len = 0) )
+     */
+    uint64_t cl_total = 0;
+    for (unsigned i = 0; i < n_certs; i++) {
+        cl_total += 3u + cert_lens[i] + 2u;
+    }
+    if (cl_total > 0xFFFFFFu) return -1;
+
+    uint64_t body_len = 1u + 3u + cl_total;
+    if (body_len > 0xFFFFFFu) return -1;
+    uint64_t total = 4u + body_len;
+    if (total > out_cap)     return -1;
+
+    uint8_t* p = out;
+    /* Handshake header: 0x0b certificate, 24-bit body length. */
+    *p++ = 0x0b;
+    *p++ = (uint8_t)(body_len >> 16);
+    *p++ = (uint8_t)(body_len >> 8);
+    *p++ = (uint8_t)body_len;
+
+    /* certificate_request_context<0..255> = empty. */
+    *p++ = 0x00;
+
+    /* certificate_list<0..2^24-1>. */
+    *p++ = (uint8_t)(cl_total >> 16);
+    *p++ = (uint8_t)(cl_total >> 8);
+    *p++ = (uint8_t)cl_total;
+
+    size_t off = 0;
+    for (unsigned i = 0; i < n_certs; i++) {
+        uint32_t cl = cert_lens[i];
+        *p++ = (uint8_t)(cl >> 16);
+        *p++ = (uint8_t)(cl >> 8);
+        *p++ = (uint8_t)cl;
+        memcpy(p, chain_der + off, cl);
+        p   += cl;
+        off += cl;
+        /* extensions<0..2^16-1> = empty. */
+        *p++ = 0x00;
+        *p++ = 0x00;
+    }
+
+    return (int)(p - out);
+}
+
+int tls13_build_finished(uint8_t* out, size_t out_cap,
+                         const uint8_t verify_data[32]) {
+    if (!out || !verify_data) return -1;
+    if (out_cap < 4 + 32)     return -1;
+    out[0] = 0x14;                       /* finished */
+    out[1] = 0x00; out[2] = 0x00; out[3] = 0x20;   /* body length = 32 */
+    memcpy(out + 4, verify_data, 32);
+    return 4 + 32;
+}
+
+/* ---------------- Handshake transcript hash ---------------- */
+
+void tls13_transcript_init(tls13_transcript_t* t) {
+    sha256_init(&t->sha);
+}
+
+void tls13_transcript_update(tls13_transcript_t* t,
+                             const uint8_t* msg, size_t len) {
+    sha256_update(&t->sha, msg, len);
+}
+
+void tls13_transcript_snapshot(const tls13_transcript_t* t, uint8_t out[32]) {
+    /* sha256_final mutates the ctx, so snapshot must clone first. */
+    sha256_ctx clone = t->sha;
+    sha256_final(&clone, out);
+}
+
 /* ------------------ Handshake key schedule ------------------ */
 
 int tls13_compute_handshake_secrets(const uint8_t ecdhe_shared[32],

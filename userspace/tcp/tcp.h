@@ -29,6 +29,8 @@
 #include <stdint.h>
 
 #include "ip.h"
+#include "../iov.h"
+#include "../dispatch.h"
 
 #define TCP_TABLE_SIZE 8u
 
@@ -51,16 +53,30 @@ typedef struct {
     uint32_t snd_una;       /* oldest unacked seq */
     uint32_t rcv_nxt;       /* next seq we expect to receive */
     uint16_t rcv_wnd;       /* advertised window */
+
+    /* Dispatch-mode plumbing. NULL when the legacy single-port API
+     * (tcp_listen + tcp_input(on_data,...)) is in use. */
+    const pw_service_t* svc;
+    void*               app_state;   /* returned by svc->on_open       */
+    uint8_t             opened;      /* on_open fired? on_close pending */
 } tcp_conn_t;
 
 typedef struct {
     tcp_conn_t conns[TCP_TABLE_SIZE];
     uint32_t local_ip;
+
+    /* Legacy single-port mode (set by tcp_listen). */
     uint16_t listen_port;
+
+    /* Multi-service dispatch mode (set by tcp_attach_dispatch).
+     * If non-NULL, listen_port is ignored and inbound segments are
+     * routed by (PW_PROTO_TCP, dst_port) via the dispatch table. */
+    const pw_dispatch_t* dispatch;
 } tcp_stack_t;
 
 /* Application-data callback: called when a fully-acked, in-order
- * payload arrives on an ESTABLISHED connection. */
+ * payload arrives on an ESTABLISHED connection. (Legacy single-port
+ * path only — dispatch services use pw_service_t::on_data instead.) */
 typedef void (*tcp_on_data_fn)(tcp_conn_t* c,
                                const uint8_t* data, size_t len,
                                void* user);
@@ -69,10 +85,24 @@ typedef void (*tcp_on_data_fn)(tcp_conn_t* c,
  * (AF_PACKET) can prepend the Ethernet header and tx it. */
 typedef void (*tcp_emit_fn)(const tcp_seg_t* seg, void* user);
 
-/* One-shot init: bind the stack to a local IP+port. Returns 0. */
+/* One-shot init: bind the stack to a local IP+port. Legacy single-
+ * port mode. Returns 0. */
 int tcp_listen(tcp_stack_t* s, uint32_t local_ip, uint16_t listen_port);
 
-/* Drive one inbound TCP segment through the state machine. */
+/* Attach a multi-service dispatch table. Replaces the single listen
+ * port; inbound segments are routed by (PW_PROTO_TCP, dst_port).
+ * The dispatch table MUST outlive the stack and is not modified
+ * after this call. Returns 0. */
+int tcp_attach_dispatch(tcp_stack_t* s, uint32_t local_ip,
+                        const pw_dispatch_t* d);
+
+/* Drive one inbound TCP segment through the state machine.
+ *
+ * In legacy single-port mode (no dispatch attached) the on_data /
+ * on_data_user callback is invoked for in-order app data.
+ *
+ * In dispatch mode the callback parameters are IGNORED: data is
+ * routed via the matched service's on_data. Pass NULLs in that case. */
 void tcp_input(tcp_stack_t* s, const tcp_seg_t* seg,
                tcp_on_data_fn on_data, void* on_data_user,
                tcp_emit_fn emit, void* emit_user);
@@ -81,5 +111,14 @@ void tcp_input(tcp_stack_t* s, const tcp_seg_t* seg,
 int tcp_send(tcp_conn_t* c,
              const uint8_t* data, size_t len,
              tcp_emit_fn emit, void* emit_user);
+
+/* Scatter-gather variant: emits one segment whose payload is the
+ * concatenation of iov[0..n). Total length is computed up front
+ * (the "calculate length before TLS is hit" property the user wants).
+ * If the total exceeds an MSS the caller should pre-segment, but for
+ * the spike we trust callers to keep records under MSS. */
+int tcp_sendv(tcp_conn_t* c,
+              const pw_iov_t* iov, unsigned n,
+              tcp_emit_fn emit, void* emit_user);
 
 #endif

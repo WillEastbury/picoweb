@@ -524,9 +524,15 @@ is to fail fast at well-defined limits rather than bloat code with options.
 
 ## What's deliberately NOT supported
 
-- TLS (terminate at a reverse proxy / load balancer)
+- TLS in the kernel-mode HTTP server (terminate at a reverse proxy, or use
+  the in-tree **userspace TLS 1.3 stack** under `userspace/` — see
+  [`userspace/DESIGN.md`](userspace/DESIGN.md))
 - HTTP/2 or HTTP/3
-- Compression (`gzip`, `brotli`)
+- `gzip` / `brotli` (the in-tree codec is **`picoweb-compress`** —
+  vendored block-LZ77, wire-compatible with [BareMetal.Compress.js](https://github.com/WillEastbury/BareMetalWeb).
+  Adding a second codec would double per-resource compressed copies for
+  no real benefit; modern browsers happily accept the custom token over
+  `Accept-Encoding`)
 - Chunked transfer encoding
 - Request bodies of any kind (`POST` returns `405`)
 - Range requests

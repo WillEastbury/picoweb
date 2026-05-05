@@ -29,6 +29,7 @@ CRYPTO_SRC := \
     ../tls/handshake.c           \
     ../tcp/ip.c                  \
     ../tcp/tcp.c                 \
+    ../dispatch.c                \
     ../conn.c
 
 .PHONY: all clean test

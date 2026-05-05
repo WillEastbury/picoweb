@@ -29,6 +29,7 @@
 #include "../tcp/ip.h"
 #include "../tcp/tcp.h"
 #include "../iov.h"
+#include "../dispatch.h"
 #include "../conn.h"
 
 static int g_pass = 0;
@@ -1571,6 +1572,582 @@ static void test_tls13_finished(void) {
 }
 
 
+/* ---------- TLS 1.3 wire-format builders (EE / Cert / Finished) -------- */
+
+static void test_tls13_build_messages(void) {
+    printf("== TLS 1.3 wire builders (EncryptedExtensions / Certificate / Finished) ==\n");
+
+    /* EncryptedExtensions: header (4) + extensions list u16 (=0). 6 bytes. */
+    {
+        uint8_t buf[16];
+        int n = tls13_build_encrypted_extensions(buf, sizeof(buf));
+        const uint8_t expect[6] = {0x08, 0x00, 0x00, 0x02, 0x00, 0x00};
+        if (n == 6 && memcmp(buf, expect, 6) == 0)
+             { printf("  PASS: EE wire bytes match\n"); g_pass++; }
+        else { printf("  FAIL: EE n=%d bytes mismatch\n", n); g_fail++; }
+
+        /* Truncated buffer must be rejected. */
+        if (tls13_build_encrypted_extensions(buf, 5) == -1)
+             { printf("  PASS: EE rejects undersized buf\n"); g_pass++; }
+        else { printf("  FAIL: EE accepted undersized buf\n"); g_fail++; }
+    }
+
+    /* Certificate: 1 cert with 4-byte body. Wire layout:
+     *   0x0b | u24 body_len
+     *   u8 ctx_len = 0
+     *   u24 cert_list_len = 3 + 4 + 2 = 9
+     *   u24 cert_data_len = 4 | 4 bytes | u16 ext_len = 0
+     */
+    {
+        const uint8_t cert[4] = { 0x30, 0x02, 0x05, 0x00 };  /* fake DER */
+        const uint32_t lens[1] = { 4 };
+        uint8_t buf[64];
+        int n = tls13_build_certificate(buf, sizeof(buf), cert, lens, 1);
+        const uint8_t expect[] = {
+            0x0b, 0x00, 0x00, 13,        /* body_len = 1 + 3 + 9 = 13 */
+            0x00,                        /* ctx_len  = 0              */
+            0x00, 0x00, 9,               /* cert_list_len = 9         */
+            0x00, 0x00, 4,               /* cert_data_len = 4         */
+            0x30, 0x02, 0x05, 0x00,      /* the cert                  */
+            0x00, 0x00                   /* extensions_len = 0        */
+        };
+        if (n == (int)sizeof(expect) && memcmp(buf, expect, sizeof(expect)) == 0)
+             { printf("  PASS: Certificate single-cert wire bytes match\n"); g_pass++; }
+        else { printf("  FAIL: Certificate n=%d expected=%zu\n",
+                      n, sizeof(expect)); g_fail++; }
+
+        /* Truncated buffer rejected. */
+        if (tls13_build_certificate(buf, 5, cert, lens, 1) == -1)
+             { printf("  PASS: Certificate rejects undersized buf\n"); g_pass++; }
+        else { printf("  FAIL: Certificate accepted undersized buf\n"); g_fail++; }
+
+        /* Two-cert chain. */
+        const uint8_t chain[6] = { 0x30, 0x00, 0x30, 0x02, 0x05, 0x00 };
+        const uint32_t lens2[2] = { 2, 4 };
+        n = tls13_build_certificate(buf, sizeof(buf), chain, lens2, 2);
+        size_t expect_len = 4 + 1 + 3 + (3 + 2 + 2) + (3 + 4 + 2);
+        if (n == (int)expect_len && buf[0] == 0x0b && buf[4] == 0x00)
+             { printf("  PASS: Certificate two-cert length=%d\n", n); g_pass++; }
+        else { printf("  FAIL: Certificate two-cert n=%d want=%zu\n",
+                      n, expect_len); g_fail++; }
+    }
+
+    /* Finished: header (4) + 32-byte verify_data = 36 bytes. */
+    {
+        uint8_t vd[32];
+        for (int i = 0; i < 32; i++) vd[i] = (uint8_t)(0x10 + i);
+        uint8_t buf[64];
+        int n = tls13_build_finished(buf, sizeof(buf), vd);
+        if (n == 36 && buf[0] == 0x14 && buf[3] == 0x20 &&
+            memcmp(buf + 4, vd, 32) == 0)
+             { printf("  PASS: Finished wire bytes match\n"); g_pass++; }
+        else { printf("  FAIL: Finished n=%d\n", n); g_fail++; }
+
+        if (tls13_build_finished(buf, 35, vd) == -1)
+             { printf("  PASS: Finished rejects undersized buf\n"); g_pass++; }
+        else { printf("  FAIL: Finished accepted undersized buf\n"); g_fail++; }
+    }
+}
+
+/* ---------- TLS 1.3 running transcript hash ---------- */
+
+static void test_tls13_transcript(void) {
+    printf("== TLS 1.3 transcript hash (running SHA-256) ==\n");
+
+    const uint8_t ch[8] = "ClientHi";   /* not really, but bytes don't care */
+    const uint8_t sh[8] = "ServerHi";
+    const uint8_t ee[6] = { 0x08, 0x00, 0x00, 0x02, 0x00, 0x00 };
+
+    /* Snapshot after CH+SH must equal SHA-256(CH || SH). */
+    tls13_transcript_t t;
+    tls13_transcript_init(&t);
+    tls13_transcript_update(&t, ch, sizeof(ch));
+    tls13_transcript_update(&t, sh, sizeof(sh));
+    uint8_t snap1[32];
+    tls13_transcript_snapshot(&t, snap1);
+
+    uint8_t reference1[32];
+    {
+        sha256_ctx s;
+        sha256_init(&s);
+        sha256_update(&s, ch, sizeof(ch));
+        sha256_update(&s, sh, sizeof(sh));
+        sha256_final(&s, reference1);
+    }
+    if (memcmp(snap1, reference1, 32) == 0)
+         { printf("  PASS: snapshot1 matches SHA-256(CH||SH)\n"); g_pass++; }
+    else { printf("  FAIL: snapshot1 mismatch\n"); g_fail++; }
+
+    /* Snapshot is non-destructive: continue, snapshot again, compare. */
+    tls13_transcript_update(&t, ee, sizeof(ee));
+    uint8_t snap2[32];
+    tls13_transcript_snapshot(&t, snap2);
+
+    uint8_t reference2[32];
+    {
+        sha256_ctx s;
+        sha256_init(&s);
+        sha256_update(&s, ch, sizeof(ch));
+        sha256_update(&s, sh, sizeof(sh));
+        sha256_update(&s, ee, sizeof(ee));
+        sha256_final(&s, reference2);
+    }
+    if (memcmp(snap2, reference2, 32) == 0)
+         { printf("  PASS: snapshot2 matches SHA-256(CH||SH||EE) (non-destructive)\n"); g_pass++; }
+    else { printf("  FAIL: snapshot2 mismatch — was snapshot destructive?\n"); g_fail++; }
+
+    /* Two snapshots in a row return identical bytes. */
+    uint8_t snap2b[32];
+    tls13_transcript_snapshot(&t, snap2b);
+    if (memcmp(snap2, snap2b, 32) == 0)
+         { printf("  PASS: repeat snapshot is idempotent\n"); g_pass++; }
+    else { printf("  FAIL: repeat snapshot drifted\n"); g_fail++; }
+}
+
+/* ====================================================================
+ * Port pre-jump table (dispatch + TCP integration)
+ * ==================================================================== */
+
+/* --- Stub services for the dispatch tests ---------------------------- */
+
+typedef struct {
+    uint8_t in_use;
+    uint8_t reply[64];
+    size_t  reply_len;
+    uint32_t remote_ip;
+    uint16_t remote_port;
+} echo_slot_t;
+
+typedef struct {
+    /* Per-conn pool with 2 slots so we can test exhaustion. */
+    echo_slot_t slots[2];
+    int       opened;     /* counters */
+    int       closed;
+    int       data_calls;
+    /* Behavioural switches set by the test before exercising the svc. */
+    pw_disp_status_t next_status;
+    int       refuse_next_open;     /* if 1, on_open returns NULL once    */
+    uint8_t*  next_reply_bytes;
+    size_t    next_reply_len;
+} echo_svc_t;
+
+static void echo_svc_reset(echo_svc_t* s) {
+    memset(s, 0, sizeof(*s));
+    s->next_status = PW_DISP_NO_OUTPUT;
+}
+
+static void* echo_on_open(void* svc_state, const pw_conn_info_t* info) {
+    echo_svc_t* s = svc_state;
+    if (s->refuse_next_open) { s->refuse_next_open = 0; return NULL; }
+    for (unsigned i = 0; i < sizeof(s->slots)/sizeof(s->slots[0]); i++) {
+        if (!s->slots[i].in_use) {
+            s->slots[i].in_use      = 1;
+            s->slots[i].remote_ip   = info->remote_ip;
+            s->slots[i].remote_port = info->remote_port;
+            s->slots[i].reply_len   = 0;
+            s->opened++;
+            return &s->slots[i];
+        }
+    }
+    return NULL;   /* pool exhausted -> RST */
+}
+
+static pw_disp_status_t echo_on_data(void* per_conn_state,
+                                     const uint8_t* data, size_t len,
+                                     pw_iov_t* iov_out, unsigned iov_max,
+                                     unsigned* iov_n) {
+    (void)data; (void)len; (void)iov_max;
+    /* Find the parent svc via the slot pointer trick: tests stash the
+     * shared svc in a global so the callback can read its switches. */
+    extern echo_svc_t* g_active_echo;
+    echo_svc_t* svc = g_active_echo;
+    svc->data_calls++;
+
+    *iov_n = 0;
+    if (svc->next_status == PW_DISP_OUTPUT ||
+        svc->next_status == PW_DISP_OUTPUT_AND_CLOSE) {
+        if (svc->next_reply_bytes && svc->next_reply_len) {
+            iov_out[0].base = svc->next_reply_bytes;
+            iov_out[0].len  = svc->next_reply_len;
+            *iov_n = 1;
+        }
+    }
+    /* Note per_conn_state is one of the slot structs - prove the
+     * pointer was threaded through correctly. */
+    if ((uintptr_t)per_conn_state < (uintptr_t)svc ||
+        (uintptr_t)per_conn_state >= (uintptr_t)svc + sizeof(*svc)) {
+        /* Bad: per_conn_state is not within svc->slots. */
+        return PW_DISP_ERROR;
+    }
+    return svc->next_status;
+}
+
+static void echo_on_close(void* per_conn_state) {
+    /* Mark the slot free. */
+    echo_slot_t* slot = per_conn_state;
+    slot->in_use = 0;
+    extern echo_svc_t* g_active_echo;
+    if (g_active_echo) g_active_echo->closed++;
+}
+
+echo_svc_t* g_active_echo = NULL;
+
+/* ---------- dispatch_table: register / lookup / dup / cap -------- */
+
+static void test_dispatch_table(void) {
+    printf("== Dispatch table (register / lookup / dup / cap) ==\n");
+
+    pw_dispatch_t d;
+    pw_dispatch_init(&d);
+
+    pw_service_t s1 = {
+        .proto = PW_PROTO_TCP, .port = 443,
+        .svc_state = (void*)0xAA, .on_data = echo_on_data,
+    };
+    pw_service_t s2 = {
+        .proto = PW_PROTO_TCP, .port = 80,
+        .svc_state = (void*)0xBB, .on_data = echo_on_data,
+    };
+    pw_service_t s3_udp = {
+        .proto = PW_PROTO_UDP, .port = 443,            /* same port, different proto */
+        .svc_state = (void*)0xCC, .on_data = echo_on_data,
+    };
+    pw_service_t s_dup = {
+        .proto = PW_PROTO_TCP, .port = 443,            /* duplicate of s1 */
+        .svc_state = (void*)0xDD, .on_data = echo_on_data,
+    };
+    pw_service_t s_no_data = {                          /* missing on_data */
+        .proto = PW_PROTO_TCP, .port = 81, .on_data = NULL,
+    };
+    pw_service_t s_zero_port = {
+        .proto = PW_PROTO_TCP, .port = 0, .on_data = echo_on_data,
+    };
+
+    if (pw_dispatch_register(&d, &s1) == 0)
+         { printf("  PASS: register tcp/443\n"); g_pass++; }
+    else { printf("  FAIL: register tcp/443\n"); g_fail++; }
+
+    if (pw_dispatch_register(&d, &s2) == 0)
+         { printf("  PASS: register tcp/80\n"); g_pass++; }
+    else { printf("  FAIL: register tcp/80\n"); g_fail++; }
+
+    if (pw_dispatch_register(&d, &s3_udp) == 0)
+         { printf("  PASS: register udp/443 (different proto, same port)\n"); g_pass++; }
+    else { printf("  FAIL: register udp/443\n"); g_fail++; }
+
+    if (pw_dispatch_register(&d, &s_dup) == -1)
+         { printf("  PASS: duplicate tcp/443 rejected\n"); g_pass++; }
+    else { printf("  FAIL: duplicate tcp/443 accepted\n"); g_fail++; }
+
+    if (pw_dispatch_register(&d, &s_no_data) == -1)
+         { printf("  PASS: missing on_data rejected\n"); g_pass++; }
+    else { printf("  FAIL: missing on_data accepted\n"); g_fail++; }
+
+    if (pw_dispatch_register(&d, &s_zero_port) == -1)
+         { printf("  PASS: port=0 rejected\n"); g_pass++; }
+    else { printf("  FAIL: port=0 accepted\n"); g_fail++; }
+
+    /* Lookup hits */
+    const pw_service_t* g = pw_dispatch_lookup(&d, PW_PROTO_TCP, 443);
+    if (g && g->svc_state == (void*)0xAA)
+         { printf("  PASS: lookup tcp/443 -> s1\n"); g_pass++; }
+    else { printf("  FAIL: lookup tcp/443\n"); g_fail++; }
+
+    g = pw_dispatch_lookup(&d, PW_PROTO_UDP, 443);
+    if (g && g->svc_state == (void*)0xCC)
+         { printf("  PASS: lookup udp/443 -> s3_udp\n"); g_pass++; }
+    else { printf("  FAIL: lookup udp/443\n"); g_fail++; }
+
+    if (pw_dispatch_lookup(&d, PW_PROTO_TCP, 999) == NULL)
+         { printf("  PASS: lookup miss -> NULL\n"); g_pass++; }
+    else { printf("  FAIL: lookup miss returned non-NULL\n"); g_fail++; }
+
+    /* Cap: fill the table to PW_DISPATCH_MAX. We've used 3 slots so
+     * we add (PW_DISPATCH_MAX - 3) more, then the next must fail. */
+    int added = 0;
+    for (uint16_t p = 1000; p < 1000 + PW_DISPATCH_MAX; p++) {
+        pw_service_t s = {
+            .proto = PW_PROTO_TCP, .port = p,
+            .svc_state = (void*)(uintptr_t)p, .on_data = echo_on_data,
+        };
+        if (pw_dispatch_register(&d, &s) == 0) added++;
+        else break;
+    }
+    if (added == PW_DISPATCH_MAX - 3)
+         { printf("  PASS: filled to cap (%d entries added)\n", added); g_pass++; }
+    else { printf("  FAIL: cap miscount added=%d expected=%d\n",
+                  added, PW_DISPATCH_MAX - 3); g_fail++; }
+
+    pw_service_t over = {
+        .proto = PW_PROTO_TCP, .port = 9999,
+        .svc_state = (void*)1, .on_data = echo_on_data,
+    };
+    if (pw_dispatch_register(&d, &over) == -1)
+         { printf("  PASS: register past cap rejected\n"); g_pass++; }
+    else { printf("  FAIL: register past cap accepted\n"); g_fail++; }
+}
+
+/* ---------- tcp_dispatch: full lifecycle through dispatch path ---- */
+
+static void test_tcp_dispatch(void) {
+    printf("== TCP + dispatch (multi-service, lifecycle, on_open at ESTABLISHED) ==\n");
+
+    /* Two services: tls-ish on 443, http-ish on 80. */
+    echo_svc_t svc443; echo_svc_reset(&svc443);
+    echo_svc_t svc80;  echo_svc_reset(&svc80);
+
+    pw_service_t s443 = {
+        .proto = PW_PROTO_TCP, .port = 443,
+        .svc_state = &svc443,
+        .on_open = echo_on_open, .on_data = echo_on_data, .on_close = echo_on_close,
+    };
+    pw_service_t s80 = {
+        .proto = PW_PROTO_TCP, .port = 80,
+        .svc_state = &svc80,
+        .on_open = echo_on_open, .on_data = echo_on_data, .on_close = echo_on_close,
+    };
+    pw_dispatch_t disp; pw_dispatch_init(&disp);
+    pw_dispatch_register(&disp, &s443);
+    pw_dispatch_register(&disp, &s80);
+
+    tcp_stack_t stack;
+    tcp_attach_dispatch(&stack, 0x0a000002u, &disp);
+
+    emit_log_t log = {0};
+
+    /* (1) SYN to UNKNOWN port -> RST, no service touched. */
+    {
+        tcp_seg_t syn = {0};
+        syn.src_ip=0x0a000001u; syn.dst_ip=0x0a000002u;
+        syn.src_port=5555;     syn.dst_port=999;
+        syn.seq=100; syn.flags=TCPF_SYN; syn.window=65535;
+        log.n = 0;
+        tcp_input(&stack, &syn, NULL, NULL, log_emit, &log);
+        if (log.n == 1 && (log.segs[0].flags & TCPF_RST))
+             { printf("  PASS: unknown port -> RST\n"); g_pass++; }
+        else { printf("  FAIL: unknown port n=%d flags=0x%02x\n",
+                      log.n, log.n?log.segs[0].flags:0); g_fail++; }
+        if (svc443.opened == 0 && svc80.opened == 0)
+             { printf("  PASS: no service on_open fired\n"); g_pass++; }
+        else { printf("  FAIL: phantom on_open\n"); g_fail++; }
+    }
+
+    /* (2) Full handshake on port 443.
+     * Critical assertion: on_open fires at ESTABLISHED, NOT at SYN. */
+    g_active_echo = &svc443;
+    uint32_t srv_iss;
+    {
+        log.n = 0;
+        tcp_seg_t syn = {0};
+        syn.src_ip=0x0a000001u; syn.dst_ip=0x0a000002u;
+        syn.src_port=4242;     syn.dst_port=443;
+        syn.seq=1000; syn.flags=TCPF_SYN; syn.window=65535;
+        tcp_input(&stack, &syn, NULL, NULL, log_emit, &log);
+        if (log.n==1 && (log.segs[0].flags & (TCPF_SYN|TCPF_ACK))==(TCPF_SYN|TCPF_ACK))
+             { printf("  PASS: SYN -> SYN+ACK on 443\n"); g_pass++; }
+        else { printf("  FAIL: 443 SYN+ACK n=%d\n", log.n); g_fail++; }
+        srv_iss = log.segs[0].seq;
+
+        if (svc443.opened == 0)
+             { printf("  PASS: on_open NOT fired at SYN_RECEIVED (SYN-flood-safe)\n"); g_pass++; }
+        else { printf("  FAIL: on_open fired too early (opened=%d)\n", svc443.opened); g_fail++; }
+    }
+    {
+        /* Final ACK -> ESTABLISHED -> on_open fires NOW. */
+        log.n = 0;
+        tcp_seg_t ack = {0};
+        ack.src_ip=0x0a000001u; ack.dst_ip=0x0a000002u;
+        ack.src_port=4242;     ack.dst_port=443;
+        ack.seq=1001; ack.ack=srv_iss+1;
+        ack.flags=TCPF_ACK; ack.window=65535;
+        tcp_input(&stack, &ack, NULL, NULL, log_emit, &log);
+        if (svc443.opened == 1 && svc443.closed == 0)
+             { printf("  PASS: on_open fired at ESTABLISHED (opened=1 closed=0)\n"); g_pass++; }
+        else { printf("  FAIL: open/close = %d/%d\n", svc443.opened, svc443.closed); g_fail++; }
+    }
+
+    /* (3) Send data, service returns OUTPUT - bytes flow back. */
+    {
+        log.n = 0;
+        const char* req = "ping";
+        uint8_t reply[] = "pong";
+        svc443.next_reply_bytes = reply;
+        svc443.next_reply_len   = 4;
+        svc443.next_status      = PW_DISP_OUTPUT;
+
+        tcp_seg_t pkt = {0};
+        pkt.src_ip=0x0a000001u; pkt.dst_ip=0x0a000002u;
+        pkt.src_port=4242;     pkt.dst_port=443;
+        pkt.seq=1001; pkt.ack=srv_iss+1;
+        pkt.flags=TCPF_ACK|TCPF_PSH; pkt.window=65535;
+        pkt.payload=(const uint8_t*)req;
+        pkt.payload_len=4;
+        tcp_input(&stack, &pkt, NULL, NULL, log_emit, &log);
+
+        /* Expect: 1 ACK + 1 data segment carrying "pong" */
+        int saw_data = 0;
+        for (int i = 0; i < log.n; i++) {
+            if (log.segs[i].payload_len == 4 &&
+                memcmp(log.segs[i].payload, "pong", 4) == 0) saw_data = 1;
+        }
+        if (svc443.data_calls == 1 && saw_data)
+             { printf("  PASS: OUTPUT path delivered service reply\n"); g_pass++; }
+        else { printf("  FAIL: OUTPUT calls=%d saw_data=%d log.n=%d\n",
+                      svc443.data_calls, saw_data, log.n); g_fail++; }
+    }
+
+    /* (4) Send data, service returns OUTPUT_AND_CLOSE - bytes + FIN. */
+    {
+        log.n = 0;
+        uint8_t reply[] = "bye";
+        svc443.next_reply_bytes = reply;
+        svc443.next_reply_len   = 3;
+        svc443.next_status      = PW_DISP_OUTPUT_AND_CLOSE;
+
+        tcp_seg_t pkt = {0};
+        pkt.src_ip=0x0a000001u; pkt.dst_ip=0x0a000002u;
+        pkt.src_port=4242;     pkt.dst_port=443;
+        pkt.seq=1005; pkt.ack=srv_iss+1;   /* 1001+4 from prev request */
+        pkt.flags=TCPF_ACK|TCPF_PSH; pkt.window=65535;
+        pkt.payload=(const uint8_t*)"x";
+        pkt.payload_len=1;
+        tcp_input(&stack, &pkt, NULL, NULL, log_emit, &log);
+
+        int saw_fin = 0, saw_data = 0;
+        for (int i = 0; i < log.n; i++) {
+            if (log.segs[i].flags & TCPF_FIN) saw_fin = 1;
+            if (log.segs[i].payload_len == 3 &&
+                memcmp(log.segs[i].payload, "bye", 3) == 0) saw_data = 1;
+        }
+        if (saw_data && saw_fin)
+             { printf("  PASS: OUTPUT_AND_CLOSE -> data + FIN\n"); g_pass++; }
+        else { printf("  FAIL: data=%d fin=%d\n", saw_data, saw_fin); g_fail++; }
+    }
+
+    /* (5) Closing client ACK to LAST_ACK -> on_close fires exactly once. */
+    {
+        log.n = 0;
+        tcp_conn_t* c = NULL;
+        for (unsigned i = 0; i < TCP_TABLE_SIZE; i++) {
+            if (stack.conns[i].state == TCP_LAST_ACK) { c = &stack.conns[i]; break; }
+        }
+        if (!c) {
+            printf("  FAIL: no LAST_ACK conn after OUTPUT_AND_CLOSE\n"); g_fail++;
+        } else {
+            tcp_seg_t fa = {0};
+            fa.src_ip=0x0a000001u; fa.dst_ip=0x0a000002u;
+            fa.src_port=4242;     fa.dst_port=443;
+            fa.seq=1006; fa.ack=c->snd_nxt;
+            fa.flags=TCPF_ACK; fa.window=65535;
+            int closed_before = svc443.closed;
+            tcp_input(&stack, &fa, NULL, NULL, log_emit, &log);
+            int closed_after = svc443.closed;
+            if (closed_after == closed_before + 1 && c->state == TCP_CLOSED)
+                 { printf("  PASS: on_close fired exactly once (closed %d->%d)\n",
+                          closed_before, closed_after); g_pass++; }
+            else { printf("  FAIL: closed %d->%d state=%d\n",
+                          closed_before, closed_after, c->state); g_fail++; }
+        }
+    }
+
+    /* (6) Pool exhaustion: open 2 conns (to fill 2-slot pool), then 3rd
+     * is refused -> on_open returns NULL -> RST + no on_close fired. */
+    echo_svc_reset(&svc443);
+    g_active_echo = &svc443;
+    /* Need to also reset the TCP stack's connection table state so we
+     * have fresh slots after the previous CLOSED conns. */
+    for (unsigned i = 0; i < TCP_TABLE_SIZE; i++) stack.conns[i].state = TCP_CLOSED;
+    {
+        for (int n = 0; n < 3; n++) {
+            tcp_seg_t syn = {0};
+            syn.src_ip=0x0a00000au + n; syn.dst_ip=0x0a000002u;
+            syn.src_port=6000+n;       syn.dst_port=443;
+            syn.seq=2000; syn.flags=TCPF_SYN; syn.window=65535;
+            log.n = 0;
+            tcp_input(&stack, &syn, NULL, NULL, log_emit, &log);
+            uint32_t iss = log.segs[0].seq;
+
+            tcp_seg_t ack = {0};
+            ack.src_ip=0x0a00000au + n; ack.dst_ip=0x0a000002u;
+            ack.src_port=6000+n;       ack.dst_port=443;
+            ack.seq=2001; ack.ack=iss+1;
+            ack.flags=TCPF_ACK; ack.window=65535;
+            log.n = 0;
+            tcp_input(&stack, &ack, NULL, NULL, log_emit, &log);
+            /* On the 3rd, expect RST in the emit log. */
+            if (n == 2) {
+                int saw_rst = 0;
+                for (int i = 0; i < log.n; i++)
+                    if (log.segs[i].flags & TCPF_RST) saw_rst = 1;
+                if (saw_rst)
+                     { printf("  PASS: 3rd conn -> RST (pool exhausted)\n"); g_pass++; }
+                else { printf("  FAIL: 3rd conn no RST n=%d\n", log.n); g_fail++; }
+            }
+        }
+        if (svc443.opened == 2 && svc443.closed == 0)
+             { printf("  PASS: only 2 successful on_opens, 0 on_closes (refused not closed)\n"); g_pass++; }
+        else { printf("  FAIL: opened=%d closed=%d\n", svc443.opened, svc443.closed); g_fail++; }
+    }
+
+    /* (7) tcp_sendv with 2-fragment iov coalesces correctly. */
+    {
+        /* Find any one of the still-ESTABLISHED conns from (6). */
+        tcp_conn_t* c = NULL;
+        for (unsigned i = 0; i < TCP_TABLE_SIZE; i++) {
+            if (stack.conns[i].state == TCP_ESTABLISHED) { c = &stack.conns[i]; break; }
+        }
+        if (!c) { printf("  FAIL: no ESTABLISHED conn for sendv test\n"); g_fail++; }
+        else {
+            log.n = 0;
+            const uint8_t a[] = "hello-";
+            const uint8_t b[] = "world";
+            pw_iov_t iov[2] = {
+                { .base = a, .len = sizeof(a)-1 },
+                { .base = b, .len = sizeof(b)-1 },
+            };
+            int rc = tcp_sendv(c, iov, 2, log_emit, &log);
+            const char* expect = "hello-world";
+            size_t elen = strlen(expect);
+            if (rc == (int)elen && log.n == 1 &&
+                log.segs[0].payload_len == elen &&
+                memcmp(log.segs[0].payload, expect, elen) == 0)
+                 { printf("  PASS: tcp_sendv 2-fragment coalesce (%zu B)\n", elen); g_pass++; }
+            else { printf("  FAIL: sendv rc=%d log.n=%d plen=%zu\n",
+                          rc, log.n, log.n?log.segs[0].payload_len:0); g_fail++; }
+        }
+    }
+
+    /* (8) Routing: data to port 80 hits svc80, not svc443. */
+    g_active_echo = &svc80;
+    /* Reset the TCP table so we can open a fresh conn on port 80. */
+    for (unsigned i = 0; i < TCP_TABLE_SIZE; i++) stack.conns[i].state = TCP_CLOSED;
+    {
+        tcp_seg_t syn = {0};
+        syn.src_ip=0x0a00000bu; syn.dst_ip=0x0a000002u;
+        syn.src_port=7777;     syn.dst_port=80;
+        syn.seq=4000; syn.flags=TCPF_SYN; syn.window=65535;
+        log.n = 0;
+        tcp_input(&stack, &syn, NULL, NULL, log_emit, &log);
+        uint32_t iss = log.segs[0].seq;
+
+        tcp_seg_t ack = {0};
+        ack.src_ip=0x0a00000bu; ack.dst_ip=0x0a000002u;
+        ack.src_port=7777;     ack.dst_port=80;
+        ack.seq=4001; ack.ack=iss+1;
+        ack.flags=TCPF_ACK; ack.window=65535;
+        log.n = 0;
+        int prev_443 = svc443.opened;
+        int prev_80  = svc80.opened;
+        tcp_input(&stack, &ack, NULL, NULL, log_emit, &log);
+        if (svc80.opened == prev_80 + 1 && svc443.opened == prev_443)
+             { printf("  PASS: port 80 conn routed to svc80 (svc443 untouched)\n"); g_pass++; }
+        else { printf("  FAIL: 80 routed wrong (svc443=%d svc80=%d)\n",
+                      svc443.opened, svc80.opened); g_fail++; }
+    }
+
+    g_active_echo = NULL;
+}
+
 int main(void) {
     /* Pick the best SHA-256 + ChaCha20 impls available; tests below
      * run through the public entry points so they exercise whichever
@@ -1606,6 +2183,10 @@ int main(void) {
     test_tls13_record_iov();
     test_pw_conn();
     test_tls13_finished();
+    test_tls13_build_messages();
+    test_tls13_transcript();
+    test_dispatch_table();
+    test_tcp_dispatch();
 
     printf("\n=== RESULTS: PASS=%d FAIL=%d ===\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;

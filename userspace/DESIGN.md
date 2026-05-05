@@ -1,13 +1,14 @@
 # picoweb userspace TCP + TLS — design spike
 
-> **Status: spike branch (`spike/userspace-tcp-tls`).** This is a
-> design + foundation spike, not a production stack. The work to ship
-> a real userspace TCP+TLS network path is months of engineering. The
-> purpose of this branch is to map the work, lay down the crypto
-> primitives, sketch the handshake and TCP state machines, and be
-> honest about what is and isn't done.
+> **Status: merged to `main`.** This started as a design + foundation
+> spike and has been promoted to the project's permanent userspace
+> network stack (see commit history on `main`). It is not a production
+> stack — the work to ship a real userspace TCP+TLS network path is
+> still months of engineering — but it is the canonical home of the
+> crypto, TLS, and TCP work and is exercised by 130 tests on every
+> build.
 >
-> **What is real, here, and green (81 RFC-vector + integration tests passing):**
+> **What is real, here, and green (130 RFC-vector + integration tests passing):**
 > SHA-256 (with runtime-dispatched **SHA-NI** HW acceleration on x86),
 > HMAC-SHA256, HKDF-SHA256, ChaCha20 (with runtime-dispatched **SSE2
 > 4-way** SIMD), Poly1305, ChaCha20-Poly1305 AEAD with both contiguous
@@ -15,20 +16,42 @@
 > HKDF-Expand-Label and Derive-Secret (RFC 8448 §3 vectors), TLS 1.3
 > record seal/open with sequence-number nonce **and** scatter-gather
 > seal (`tls13_seal_record_iov` proven byte-identical to the
-> contiguous path), TLS 1.3 ClientHello parser + ServerHello builder
-> + handshake-secret derivation, IPv4 + TCP header build/parse with
-> both IPv4 and TCP checksums, TCP passive-open state machine
-> (LISTEN → SYN-RECEIVED → ESTABLISHED → CLOSE-WAIT → LAST-ACK),
+> contiguous path), TLS 1.3 ClientHello parser, ServerHello /
+> EncryptedExtensions / Certificate / Finished wire builders,
+> handshake-secret derivation, running transcript-hash helper, Finished
+> compute + verify (RFC 8446 §4.4.4), IPv4 + TCP header build/parse
+> with both IPv4 and TCP checksums, TCP passive-open state machine
+> (LISTEN → SYN-RECEIVED → ESTABLISHED → CLOSE-WAIT → LAST-ACK), an
+> **L4 pre-jump table (`pw_dispatch_t`)** routing inbound bytes by
+> `(proto, dst_port)` so one TCP stack can host many services
+> independently (HTTPS, HTTP, gossip, DNS, …) with strict zero-alloc
+> per-conn pools and SYN-flood-safe `on_open`/`on_close` lifecycle,
 > SNI-aware in-memory cert store (env + disk, PEM decoder), per-worker
-> zero-allocation buffer pool, runtime CPU feature detection.
+> zero-allocation buffer pool, runtime CPU feature detection,
+> `pw_conn` run-to-completion runtime that walks RX → TLS-open → HTTP
+> slice → response_fn → TLS-seal → TX in one call.
 >
 > **What is sketched but not wired:** AF_PACKET I/O (compiles on
-> Linux, no E2E test), DPDK loop pattern (commented sketch only).
+> Linux, no E2E test), DPDK loop pattern (commented sketch only),
+> BearSSL-style explicit TLS engine state machine (planned next).
 >
-> **What is deliberately not in scope:** TLS 1.3 handshake message
-> parsing (ClientHello / ServerHello), ECDSA / RSA cert signing,
-> AES-GCM, TCP retransmit / RTO / congestion control / SACK, SYN
-> cookies, fuzz testing of parsers. All called out in §"Scope" below.
+> **What is deliberately not in scope:**
+> - **Ed25519 / ECDSA / RSA** cert signing — Ed25519 is the gating item
+>   for completing a real handshake (CertificateVerify); intentionally
+>   deferred until the dispatch + engine refactor settles.
+> - **AES-GCM** — TLS 1.3 ChaCha20-Poly1305 only. AES-GCM costs a real
+>   amount of code without a real perf win on modern CPUs that have AES-NI
+>   but no SHA-NI for AES-GCM's GHASH (and vice versa). One AEAD is
+>   plenty for a spike; we'll add AES-GCM if a use-case forces it.
+> - **`gzip`/`brotli`/`zstd`** — the picoweb HTTP server uses
+>   `picoweb-compress` (vendored, ~250 lines of LZ77, wire-compatible
+>   with BareMetal.Compress.js). No third-party compression code in tree.
+> - **TCP retransmit / RTO / congestion control / SACK / SYN cookies**
+>   — happy-path passive open only.
+> - **Receive-window-driven backpressure** — static 65535-byte window
+>   today; flagged in [next steps](#open-engineering-items).
+> - **Fuzz testing of parsers** — would be the right next thing once
+>   the handshake actually completes end-to-end.
 
 ## Why we'd ever do this
 
@@ -319,14 +342,128 @@ immutable `mprotect(PROT_READ)` arena.
 
 
 - TLS 1.3 Certificate / CertificateVerify (Ed25519 sign) / Finished —
-  without these no real client completes a handshake.
-- Receive-window-based backpressure on the TCP layer (rubber-duck'd:
-  "no ACK = backpressure" was wrong; the right answer is to advertise
-  zero rcv_wnd and support persist).
-- TCP retransmit + RTO. This is where the months go.
-- An mbuf class for reassembly large enough to hold a full TLS record
-  (~16.4 KiB on the wire); the per-worker pool slot size is currently
-  configurable but not yet sized for this.
-- Real driver integration: the `pw_iov_t` array on TX is ready to feed
-  `writev` / `io_uring_prep_writev` / `rte_mbuf` chains; the abstraction
-  is sketched but not wired to a live link.
+## L4 pre-jump table (`userspace/dispatch.{c,h}`)
+
+Right after iov was the load-bearing primitive for the data path,
+**dispatch** is the load-bearing primitive for the control path.
+
+The picoweb userspace stack is **multipurpose** — one TCP/UDP stack
+hosting many independent services on different ports (HTTPS on 443,
+plain HTTP on 80, gossip on 7777, DNS on 53, …). The dispatch table
+is what makes that work without a per-service stack.
+
+```c
+typedef enum { PW_PROTO_TCP = 6, PW_PROTO_UDP = 17 } pw_proto_t;
+
+typedef enum {
+    PW_DISP_NO_OUTPUT, PW_DISP_OUTPUT, PW_DISP_OUTPUT_AND_CLOSE,
+    PW_DISP_RESET, PW_DISP_ERROR,
+} pw_disp_status_t;
+
+typedef struct {
+    pw_proto_t      proto;
+    uint16_t        port;
+    void*           svc_state;
+    pw_on_open_fn   on_open;     // returns per-conn state, or NULL to refuse
+    pw_on_data_fn   on_data;     // status + iov_out[0..iov_n) bytes to send
+    pw_on_close_fn  on_close;    // called exactly once per successful on_open
+} pw_service_t;
+
+typedef struct {
+    pw_service_t entries[PW_DISPATCH_MAX];   // packed array, N <= 16
+    unsigned     n;
+} pw_dispatch_t;
+```
+
+### Why a packed linear scan and not a hash table
+
+`PW_DISPATCH_MAX` is 16. The entire array fits in one cache line, the
+comparison is a `u16 == u16`, and the branch predictor wins easily for
+small N. A hash with a separate bucket array would touch more cache
+and pay an extra indirection for nothing. Built once at startup,
+**immutable after attach** — matches the project's no-allocation-after-
+startup invariant.
+
+### Lifecycle contract (TCP)
+
+The contract is small but strict, because the alternative is leaks or
+double-frees:
+
+- `on_open` is called **exactly once per connection**, **after** TCP
+  reaches `ESTABLISHED`. Deliberately not at SYN: half-open
+  connections must not consume scarce per-conn state, or a SYN flood
+  trivially exhausts the service's pool. The hook returns a per-conn
+  state pointer (typically rented from a fixed-size pool the service
+  owns at startup) or `NULL` to refuse the connection (TCP layer
+  emits RST and never calls `on_close` for the refused conn).
+- `on_data` is called for each in-order data chunk. The service
+  populates `iov_out[0..iov_max)` with `(ptr, len)` descriptors
+  pointing at long-lived storage it owns, sets `*iov_n`, and returns
+  one of `NO_OUTPUT / OUTPUT / OUTPUT_AND_CLOSE / RESET / ERROR`.
+  TCP layer turns that into ACK / sendv / sendv+FIN / RST.
+- `on_close` is called **exactly once for every successful `on_open`**
+  (FIN, RST, app-initiated close). Never called if `on_open` refused.
+
+The dispatch table itself is **immutable after attach** — stored
+service pointers stay valid for the lifetime of the stack.
+
+### Wiring into TCP
+
+```c
+int tcp_attach_dispatch(tcp_stack_t* s, uint32_t local_ip,
+                        const pw_dispatch_t* d);
+int tcp_sendv(tcp_conn_t* c, const pw_iov_t* iov, unsigned n,
+              tcp_emit_fn emit, void* emit_user);
+```
+
+`tcp_input` looks up `(PW_PROTO_TCP, dst_port)` for inbound segments.
+Unknown port → RST. Match → standard SYN/ACK handshake; on the final
+ACK the conn transitions to `ESTABLISHED` and `on_open` fires.
+
+The legacy single-port `tcp_listen` API still works (back-compat for
+tests), but new code should use `tcp_attach_dispatch`.
+
+### Test coverage of the dispatch path
+
+`test_dispatch_table` (11 cases): register / lookup / duplicate
+rejection / invalid `on_data` / port=0 rejection / cap.
+
+`test_tcp_dispatch` (12 cases): unknown port → RST + no service
+touched, on_open fires at ESTABLISHED (not SYN — proven by counter
+inspection between SYN and final ACK), OUTPUT path delivers reply
+bytes, OUTPUT_AND_CLOSE emits data + FIN, on_close fires exactly once
+on LAST_ACK transition, pool exhaustion (3rd conn against a 2-slot
+pool) → RST + no phantom on_close, `tcp_sendv` 2-fragment coalesce,
+multi-service routing (port 443 → svc443, port 80 → svc80, no
+crosstalk).
+
+UDP support: API surface (`PW_PROTO_UDP`) is in place but `udp.c` is
+not yet written. When it lands, the dispatch table is the same.
+
+## <a id="open-engineering-items"></a>Open engineering items
+
+This is the running TODO for what's blocking real-traffic readiness.
+
+- **Ed25519 sign / verify** (RFC 8032). Gates real TLS handshakes
+  (CertificateVerify). Needs SHA-512 first. Without these no real
+  client completes a handshake.
+- **BearSSL-style explicit TLS engine.** Refactor `pw_conn`'s
+  run-to-completion path into a true byte-driven state machine with
+  `WANT_RX / WANT_TX / APP_IN / APP_OUT` ports, so any I/O backend
+  (epoll, io_uring, DPDK, in-tree dispatch) can drive TLS without a
+  callback inversion. Architecture-equivalent to today's pipeline,
+  just more control. Planned next.
+- **Receive-window-driven backpressure** on the TCP layer
+  (rubber-duck'd: "no ACK = backpressure" was wrong; the right answer
+  is to advertise zero `rcv_wnd` and support persist).
+- **TCP retransmit + RTO**. This is where the months go.
+- **mbuf class for reassembly** large enough to hold a full TLS
+  record (~16.4 KiB on the wire); the per-worker pool slot size is
+  currently configurable but not yet sized for this.
+- **Real driver integration:** the `pw_iov_t` array on TX is ready to
+  feed `writev` / `io_uring_prep_writev` / `rte_mbuf` chains; the
+  abstraction is sketched but not wired to a live link.
+- **Per-conn state rental from the buffer pool** when the service has
+  many concurrent flows (today services own their own fixed pool;
+  shared rental would let many low-traffic services share a single
+  budget).
