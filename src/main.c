@@ -13,11 +13,14 @@
 
 static void usage(const char* argv0) {
     fprintf(stderr,
-        "usage: %s [PORT] [WWWROOT] [WORKERS] [MAXREQS]\n"
+        "usage: %s [PORT] [WWWROOT] [WORKERS] [MAXREQS] [ZC_MIN]\n"
         "  PORT     listen port (default 8080)\n"
         "  WWWROOT  content root (default ./wwwroot)\n"
         "  WORKERS  worker threads (default = nproc)\n"
-        "  MAXREQS  max requests per connection (default 100; 0 = unlimited)\n", argv0);
+        "  MAXREQS  max requests per connection (default 100; 0 = unlimited)\n"
+        "  ZC_MIN   MSG_ZEROCOPY threshold in bytes (default 0 = off;\n"
+        "           recommended 16384 if enabled — small payloads regress)\n",
+        argv0);
 }
 
 int main(int argc, char** argv) {
@@ -26,6 +29,7 @@ int main(int argc, char** argv) {
     long workers = sysconf(_SC_NPROCESSORS_ONLN);
     if (workers < 1) workers = 1;
     long max_reqs = 100;
+    long zc_min = 0;
 
     if (argc > 1) {
         if (strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "--help") == 0) {
@@ -55,6 +59,14 @@ int main(int argc, char** argv) {
         }
         max_reqs = m;
     }
+    if (argc > 5) {
+        char* end = NULL;
+        long z = strtol(argv[5], &end, 10);
+        if (end == argv[5] || *end != '\0' || z < 0 || z > (long)(64*1024*1024)) {
+            usage(argv[0]); return 1;
+        }
+        zc_min = z;
+    }
 
     /* SIGPIPE: ignore so writes to a peer-closed socket return EPIPE
      * instead of killing the process. (We also pass MSG_NOSIGNAL on
@@ -83,6 +95,7 @@ int main(int argc, char** argv) {
         cfgs[i].idle_ms               = 10000;  /* 10s any-inactivity cap */
         cfgs[i].max_requests_per_conn = (uint32_t)max_reqs;
         cfgs[i].worker_index          = (int)i;
+        cfgs[i].zerocopy_threshold    = (size_t)zc_min;
         if (pthread_create(&threads[i], NULL, server_worker_main, &cfgs[i]) != 0) {
             metal_die("pthread_create #%ld", i);
         }
@@ -91,8 +104,13 @@ int main(int argc, char** argv) {
     /* Background thread that rebuilds the /stats body once per second. */
     metrics_start_updater();
 
-    metal_log("picoweb: %ld worker(s) on :%d, root=%s, maxreqs=%ld, simd=%s",
-              workers, port, wwwroot, max_reqs, metal_simd_describe());
+    metal_log("picoweb: %ld worker(s) on :%d, root=%s, maxreqs=%ld, "
+              "zerocopy=%s, simd=%s",
+              workers, port, wwwroot, max_reqs,
+              zc_min > 0 ? "on" : "off", metal_simd_describe());
+    if (zc_min > 0) {
+        metal_log("picoweb: MSG_ZEROCOPY threshold = %ld bytes", zc_min);
+    }
 
     for (long i = 0; i < workers; i++) {
         pthread_join(threads[i], NULL);

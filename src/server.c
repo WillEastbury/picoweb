@@ -16,10 +16,27 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+#ifdef __linux__
+#  include <linux/errqueue.h>   /* sock_extended_err, SO_EE_ORIGIN_ZEROCOPY */
+#endif
+
+#ifndef SO_ZEROCOPY
+#  define SO_ZEROCOPY 60        /* Linux 4.14+; in case the headers are old */
+#endif
+#ifndef MSG_ZEROCOPY
+#  define MSG_ZEROCOPY 0x4000000
+#endif
+
 #define LISTEN_BACKLOG     4096
 #define EPOLL_BATCH        128
 #define IDLE_SWEEP_MS      1000
 #define POST_SEND_BUDGET   8     /* max requests to drain per writable cb */
+
+/* MSG_ZEROCOPY threshold for this process. 0 = disabled. Set once by the
+ * first worker that initialises (all workers carry the same cfg). Reading
+ * a static int from many threads without a lock is fine because the value
+ * is written exactly once before any work happens. */
+static size_t g_zc_threshold = 0;
 
 /* ============================================================== */
 /* Listen socket per worker                                       */
@@ -73,6 +90,53 @@ static void ep_mod(int ep, int fd, void* ptr, uint32_t events) {
     }
 }
 
+/* Drain MSG_ERRQUEUE on a socket. Returns:
+ *   0 - the queue contained only MSG_ZEROCOPY completion notifications
+ *       (which we silently discard — our arena memory is immutable, so
+ *       we don't care WHEN the kernel finished with each pinned page).
+ *   1 - a real error was on the queue; caller should close the conn.
+ *
+ * Called only when EPOLLERR fires AND zerocopy is enabled. We loop until
+ * recvmsg returns -1/EAGAIN to fully drain in one pass — partial drains
+ * leave EPOLLERR sticky and burn epoll budget. */
+#ifdef __linux__
+static int drain_zc_errqueue(int fd) {
+    int real_error = 0;
+    /* The cmsg payload is sock_extended_err — small. 256 B headroom is
+     * plenty; iov is a 1-byte sink because we don't read packet data. */
+    char cbuf[256];
+    char dummy;
+    for (;;) {
+        struct iovec iov = { .iov_base = &dummy, .iov_len = sizeof(dummy) };
+        struct msghdr m = {0};
+        m.msg_iov = &iov;
+        m.msg_iovlen = 1;
+        m.msg_control = cbuf;
+        m.msg_controllen = sizeof(cbuf);
+        ssize_t r = recvmsg(fd, &m, MSG_ERRQUEUE | MSG_DONTWAIT);
+        if (r < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+            if (errno == EINTR) continue;
+            /* Anything else here itself counts as a real error. */
+            real_error = 1;
+            break;
+        }
+        for (struct cmsghdr* cm = CMSG_FIRSTHDR(&m); cm; cm = CMSG_NXTHDR(&m, cm)) {
+            if ((cm->cmsg_level == SOL_IP && cm->cmsg_type == IP_RECVERR) ||
+                (cm->cmsg_level == SOL_IPV6 && cm->cmsg_type == IPV6_RECVERR)) {
+                struct sock_extended_err* e = (struct sock_extended_err*)CMSG_DATA(cm);
+                if (e->ee_origin != SO_EE_ORIGIN_ZEROCOPY) {
+                    real_error = 1;
+                }
+                /* SO_EE_ORIGIN_ZEROCOPY: notification of completion. We
+                 * coalesce silently. Nothing to free, nothing to update. */
+            }
+        }
+    }
+    return real_error;
+}
+#endif
+
 /* ============================================================== */
 /* Connection lifecycle                                           */
 /* ============================================================== */
@@ -108,6 +172,22 @@ static void try_accept(int listen_fd, int ep, pool_t* pool) {
         /* Reduce ACK latency on first read; kernel may auto-disable. */
         setsockopt(c, IPPROTO_TCP, TCP_QUICKACK, &one, sizeof(one));
 #endif
+        if (g_zc_threshold > 0) {
+            /* Opt this socket in to MSG_ZEROCOPY. Soft-fail: if the kernel
+             * doesn't support it (older than 4.14, or missing CAP_NET_RAW
+             * on certain kernels) we just won't set MSG_ZEROCOPY on
+             * sendmsg — plain copy still works. We log only the first
+             * failure to avoid log spam. */
+            if (setsockopt(c, SOL_SOCKET, SO_ZEROCOPY, &one, sizeof(one)) != 0) {
+                static int logged = 0;
+                if (!logged) {
+                    metal_log("warn: SO_ZEROCOPY setsockopt: %s "
+                              "(falling back to plain sendmsg)",
+                              strerror(errno));
+                    logged = 1;
+                }
+            }
+        }
 
         conn_t* conn = pool_alloc(pool);
         if (!conn) {
@@ -199,7 +279,26 @@ static int try_send(conn_t* c) {
         struct msghdr m = {0};
         m.msg_iov = iov;
         m.msg_iovlen = n;
-        ssize_t s = sendmsg(c->fd, &m, MSG_NOSIGNAL);
+        /* MSG_ZEROCOPY pays off only above the configured byte threshold
+         * (kernel docs: roughly >10 KB per send). Below that, the per-
+         * send setup cost regresses throughput. We compute the remaining
+         * payload (total - bytes_sent) so a partial-send tail doesn't
+         * waste setup. The zerocopy_threshold value is set once at
+         * startup and never changes; reading it lockless from many
+         * worker threads is safe. */
+        int sm_flags = MSG_NOSIGNAL;
+        if (g_zc_threshold > 0 && (total - c->bytes_sent) >= g_zc_threshold) {
+            sm_flags |= MSG_ZEROCOPY;
+        }
+        ssize_t s = sendmsg(c->fd, &m, sm_flags);
+        if (s < 0 && errno == ENOBUFS && (sm_flags & MSG_ZEROCOPY)) {
+            /* optmem cap hit — too many in-flight zerocopy sends. Retry
+             * this exact iovec without MSG_ZEROCOPY rather than dropping
+             * the connection. The next loop iteration will try again
+             * once we drain the err queue (signalled via EPOLLERR). */
+            sm_flags &= ~MSG_ZEROCOPY;
+            s = sendmsg(c->fd, &m, sm_flags);
+        }
         if (s < 0) {
             if (errno == EINTR) continue;
             if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
@@ -429,6 +528,11 @@ void* server_worker_main(void* arg) {
         g_worker_metrics = &g_metrics[cfg->worker_index];
     }
 
+    /* All workers share the same MSG_ZEROCOPY threshold. Writing it from
+     * worker 0 first, then identical writes from later workers, is
+     * harmless — value never changes after main() spawned us. */
+    if (cfg->zerocopy_threshold > 0) g_zc_threshold = cfg->zerocopy_threshold;
+
     pool_t pool;
     if (!pool_init(&pool, cfg->pool_cap)) {
         metal_die("pool_init(%zu)", cfg->pool_cap);
@@ -468,8 +572,23 @@ void* server_worker_main(void* arg) {
             conn_t* c = (conn_t*)ptr;
 
             if (ev & EPOLLERR) {
-                close_conn(&pool, ep, c);
-                continue;
+                /* When MSG_ZEROCOPY is enabled, EPOLLERR usually fires
+                 * because of completion notifications on the err queue,
+                 * NOT a real socket error. Drain and discard them; only
+                 * close the connection if a non-ZC error was seen. */
+                if (g_zc_threshold > 0) {
+                    if (drain_zc_errqueue(c->fd) == 0) {
+                        /* Pure ZC notifications. Connection still good.
+                         * Fall through so any other event bits (EPOLLIN,
+                         * EPOLLOUT) on the same fd get handled. */
+                    } else {
+                        close_conn(&pool, ep, c);
+                        continue;
+                    }
+                } else {
+                    close_conn(&pool, ep, c);
+                    continue;
+                }
             }
 
             /* Track peer-half-close. Don't act on it until we either
