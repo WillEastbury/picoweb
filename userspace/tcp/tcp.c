@@ -359,6 +359,15 @@ void tcp_input_at(tcp_stack_t* s, const tcp_seg_t* seg,
         if ((seg->flags & TCPF_ACK) && seg->ack == c->snd_nxt) {
             c->snd_una = seg->ack;
             rtx_on_ack(c, seg->ack, now_ms);
+            /* Set ESTABLISHED before firing on_open so that any send
+             * the service issues from inside on_open (e.g. a server
+             * greeting) passes the c->state == ESTABLISHED gate in
+             * tcp_send_at. fire_open's refusal path resets state to
+             * CLOSED before returning, so the worst-case observable
+             * sequence (single-threaded stack) is
+             *   ESTABLISHED -> CLOSED inside one tcp_input call,
+             * which is identical to a normal RST teardown. Multi-
+             * threaded use is NOT supported by this stack. */
             c->state = TCP_ESTABLISHED;
 
             /* Fire on_open EXACTLY at ESTABLISHED, not at SYN. This
@@ -543,7 +552,7 @@ static void cc_on_dupack(tcp_conn_t* c, tcp_emit_fn emit, void* emit_user) {
     /* Enter fast recovery. */
     uint32_t flight = tcp_flight_size(c);
     uint32_t half   = flight / 2u;
-    c->ssthresh = (half > TCP_MIN_CWND) ? half : TCP_MIN_CWND;
+    c->ssthresh = (half >= TCP_MIN_CWND) ? half : TCP_MIN_CWND;
     c->cwnd     = c->ssthresh + 3u * TCP_MSS;
     c->recovery_seq = c->snd_nxt;
     c->in_recovery  = 1;
@@ -573,7 +582,7 @@ static void cc_on_dupack(tcp_conn_t* c, tcp_emit_fn emit, void* emit_user) {
 static void cc_on_rto(tcp_conn_t* c) {
     uint32_t flight = tcp_flight_size(c);
     uint32_t half   = flight / 2u;
-    c->ssthresh = (half > TCP_MIN_CWND) ? half : TCP_MIN_CWND;
+    c->ssthresh = (half >= TCP_MIN_CWND) ? half : TCP_MIN_CWND;
     c->cwnd        = TCP_MSS;
     c->dupack_n    = 0;
     c->in_recovery = 0;

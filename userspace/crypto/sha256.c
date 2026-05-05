@@ -7,9 +7,12 @@
  * sha256_armv8.c on aarch64) so each can be compiled with its own
  * `-mtarget`/intrinsic baseline without polluting this TU.
  *
- * The dispatch pointer `sha256_compress_fn` is selected on first
- * use via `sha256_select_impl()`. The scalar default makes the
- * unselected case still safe.
+ * The dispatch pointer `sha256_compress_fn` is initialised to the
+ * scalar implementation at static-init time (see line below), so
+ * concurrent first-use is safe even before sha256_select_impl()
+ * has been called. Calling sha256_select_impl() is recommended
+ * during single-threaded program startup so the HW path is picked
+ * up before any worker thread enters a hash routine.
  *
  * Memory:
  *   - All state is on the caller-provided sha256_ctx (no allocations).

@@ -67,4 +67,21 @@ int  pw_dpdk_pump(pw_dpdk_ctx_t* ctx);
 /* Stop the port, close it, rte_eal_cleanup. No-op in stub mode. */
 void pw_dpdk_shutdown(pw_dpdk_ctx_t* ctx);
 
+/* Bounded TX enqueue helper. Returns 0 on success, -1 if the ring
+ * is full (caller should drop the mbuf — pump will not free it).
+ *
+ * mbuf-ownership contract for owners of the on_segment callback:
+ *   - The mbuf passed into on_segment is owned by the RX-drain loop
+ *     in pw_dpdk_pump and is freed after on_segment returns; on_segment
+ *     MUST NOT retain a pointer to it (no zero-copy hand-off).
+ *   - mbufs pushed into ctx->tx_pending via this helper transfer
+ *     ownership to the pump; pump frees any mbufs not accepted by
+ *     rte_eth_tx_burst. */
+static inline int pw_dpdk_tx_enqueue(pw_dpdk_ctx_t* ctx, void* mbuf) {
+    if (!ctx || !mbuf) return -1;
+    if (ctx->tx_pending_n >= PW_DPDK_TX_PENDING_MAX) return -1;
+    ctx->tx_pending[ctx->tx_pending_n++] = mbuf;
+    return 0;
+}
+
 #endif

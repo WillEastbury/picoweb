@@ -88,6 +88,7 @@ void pw_dpdk_shutdown(pw_dpdk_ctx_t* ctx) {
 #include "../tls/engine.h"
 #include "../tls/engine_pool.h"
 #include "../conn.h"
+#include "af_packet.h"   /* ETH_TYPE_IPV4 */
 
 #define PW_DPDK_RX_BURST   32
 #define PW_DPDK_TX_BURST   32
@@ -106,7 +107,7 @@ static int handle_one_rx_mbuf(pw_dpdk_ctx_t* ctx, struct rte_mbuf* m) {
      * VLAN/IPv6 are out of scope for the spike. */
     if (len < 14) return -1;
     uint16_t etype = (uint16_t)((eth[12] << 8) | eth[13]);
-    if (etype != 0x0800) return -1;   /* not IPv4 */
+    if (etype != ETH_TYPE_IPV4) return -1;   /* not IPv4 */
 
     const uint8_t* l3 = eth + 14;
     size_t l3_len = (size_t)len - 14;
