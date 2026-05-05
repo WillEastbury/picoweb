@@ -402,9 +402,21 @@ int tls13_build_server_hello(uint8_t* out, size_t out_cap,
                              const uint8_t our_pubkey[32],
                              const uint8_t* session_id,
                              uint8_t session_id_len) {
+    return tls13_build_server_hello_psk(out, out_cap, server_random,
+                                        our_pubkey, session_id,
+                                        session_id_len, -1);
+}
+
+int tls13_build_server_hello_psk(uint8_t* out, size_t out_cap,
+                                 const uint8_t server_random[TLS13_RANDOM_LEN],
+                                 const uint8_t our_pubkey[32],
+                                 const uint8_t* session_id,
+                                 uint8_t session_id_len,
+                                 int selected_psk_identity) {
     if (!out || !server_random || !our_pubkey) return -1;
     if (session_id_len > 32) return -1;
     if (session_id_len > 0 && !session_id) return -1;
+    if (selected_psk_identity > 0xffff) return -1;
 
     uint8_t* p = out;
     size_t   rem = out_cap;
@@ -431,12 +443,17 @@ int tls13_build_server_hello(uint8_t* out, size_t out_cap,
     /* legacy_compression_method */
     if (wr_u8(&p, &rem, 0) != 0)              return -1;
 
-    /* extensions<6..2^16-1>:
-     *   supported_versions: type(2) + size(2) + selected_version(2) = 6
-     *   key_share:          type(2) + size(2) + group(2) + kx_len(2) + kx(32) = 40
-     *   total = 46
-     */
-    if (wr_u16(&p, &rem, 46) != 0) return -1;
+    /* extensions: supported_versions (6) + key_share (40) + maybe psk (8)
+     *   pre_shared_key (SH variant): type(2) + size(2) + selected_identity(2) = 6
+     *   wait, that's 8 with type+size header. */
+    uint16_t ext_total = 46;
+    if (selected_psk_identity >= 0) ext_total += 6 + 2;  /* hdr(4)+body(2) = 6, +2... */
+    /* Recompute: ext = type(2) + size(2) + body. body for PSK SH = 2.
+     * So extension occupies 4 + 2 = 6 bytes. */
+    /* Reset and recompute cleanly. */
+    ext_total = 46;
+    if (selected_psk_identity >= 0) ext_total = 46 + 6;
+    if (wr_u16(&p, &rem, ext_total) != 0) return -1;
 
     /* supported_versions */
     if (wr_u16(&p, &rem, 0x002b) != 0) return -1;
@@ -449,6 +466,13 @@ int tls13_build_server_hello(uint8_t* out, size_t out_cap,
     if (wr_u16(&p, &rem, TLS13_NAMED_GROUP_X25519) != 0) return -1;
     if (wr_u16(&p, &rem, 32) != 0) return -1;
     if (wr_bytes(&p, &rem, our_pubkey, 32) != 0) return -1;
+
+    /* pre_shared_key (SH variant): selected_identity uint16. */
+    if (selected_psk_identity >= 0) {
+        if (wr_u16(&p, &rem, 0x0029) != 0) return -1;
+        if (wr_u16(&p, &rem, 2)      != 0) return -1;
+        if (wr_u16(&p, &rem, (uint16_t)selected_psk_identity) != 0) return -1;
+    }
 
     /* Backfill 24-bit handshake length. */
     size_t body_len = (size_t)(p - body_start);

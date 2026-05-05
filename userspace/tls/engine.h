@@ -173,6 +173,38 @@ typedef struct pw_tls_engine {
     uint8_t           resumption_master_secret[32];
     int               has_rms;
 
+    /* ------------------------------------------------------------------
+     * Resumption / 0-RTT context. The engine BORROWS the ticket store —
+     * caller keeps it alive across the engine's lifetime. now_ms is the
+     * caller's monotonic clock in milliseconds, used for ticket
+     * expiry. Set both via pw_tls_engine_attach_resumption + before
+     * each step where time-sensitive decisions matter
+     * (pw_tls_engine_set_clock).
+     *
+     * `resumed` is set to 1 once a PSK was successfully accepted on
+     * a resumption handshake; the server flight then SKIPs Certificate
+     * + CertificateVerify per RFC 8446 §4.6.1.
+     *
+     * `selected_psk_identity` is the index of the accepted offer in
+     * the client's pre_shared_key extension (0-based).
+     *
+     * `selected_psk[32]` is the per-ticket PSK installed for this
+     * handshake; wiped at handshake completion. ------------------ */
+    struct pw_tls_ticket_store* ticket_store;   /* borrowed */
+    uint64_t          now_ms;
+    int               resumed;
+    int               selected_psk_identity;
+    uint8_t           selected_psk[32];
+
+    /* 0-RTT acceptance flags. `early_data_accepted` indicates the
+     * server has accepted early data (will surface plaintext via
+     * APP_IN before cFin). `early_data_max` is the per-ticket cap
+     * (0 if not accepting). `early_data_seen` counts plaintext bytes
+     * already surfaced; used to enforce the cap. */
+    int               early_data_accepted;
+    uint32_t          early_data_max;
+    uint32_t          early_data_seen;
+
     /* Diagnostics. */
     uint64_t records_in;
     uint64_t records_out;
@@ -224,6 +256,27 @@ int pw_tls_engine_install_app_keys(pw_tls_engine_t* eng,
  * BearSSL emits a real alert here. For the spike, we just drop into
  * CLOSED so the caller stops polling.) */
 void pw_tls_close(pw_tls_engine_t* eng);
+
+/* Attach a ticket store for both NewSessionTicket emission and
+ * inbound PSK acceptance. The engine BORROWS the pointer; caller
+ * keeps the store alive. May be called once after configure_server
+ * but before the first pw_tls_step. Pass NULL to detach. */
+struct pw_tls_ticket_store;
+void pw_tls_engine_attach_resumption(pw_tls_engine_t* eng,
+                                     struct pw_tls_ticket_store* store);
+
+/* Update the engine's monotonic millisecond clock. Used for ticket
+ * expiry checks during PSK acceptance. Caller should call this just
+ * before pw_tls_step on each driver loop iteration that may consume
+ * a ClientHello. */
+void pw_tls_engine_set_clock(pw_tls_engine_t* eng, uint64_t now_ms);
+
+/* Returns 1 iff the engine successfully completed a resumption
+ * handshake (PSK accepted). 0 otherwise. */
+int  pw_tls_engine_was_resumed(const pw_tls_engine_t* eng);
+
+/* Returns 1 iff 0-RTT early data was accepted on this handshake. */
+int  pw_tls_engine_early_data_accepted(const pw_tls_engine_t* eng);
 
 /* Emit a single NewSessionTicket (RFC 8446 §4.6.1) record on the TX
  * port, sealed under the current server-application-traffic write key.

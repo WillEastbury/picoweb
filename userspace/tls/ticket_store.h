@@ -40,7 +40,7 @@ typedef struct {
     int      used;
 } pw_tls_ticket_t;
 
-typedef struct {
+typedef struct pw_tls_ticket_store {
     pw_tls_ticket_t slots[PW_TLS_TICKET_SLOTS];
 } pw_tls_ticket_store_t;
 

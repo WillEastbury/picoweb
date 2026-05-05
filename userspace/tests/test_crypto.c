@@ -5010,7 +5010,190 @@ static void test_tls_psk_extension_parser(void) {
     }
 }
 
-/* ---------- DPDK stub backend ---------- */
+/* ---------- TLS engine: PSK resumption acceptance ---------- */
+
+static void test_engine_psk_resumption(void) {
+    printf("== TLS engine: PSK resumption (server-side) ==\n");
+
+    /* Pre-shared key + ticket id we'll plant in the store. The PSK is
+     * 32 bytes per RFC 8446 §4.6.1 (size matches Hash output). */
+    uint8_t psk[32];
+    for (int i = 0; i < 32; i++) psk[i] = (uint8_t)(0x60 + i);
+    const uint8_t ticket_id[8] = {
+        0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17
+    };
+
+    pw_tls_ticket_store_t store;
+    pw_tls_ticket_store_init(&store);
+    if (pw_tls_ticket_store_insert(&store, ticket_id, sizeof(ticket_id),
+                                   psk, 0xdeadbeef, 86400u,
+                                   /*issued_at_ms*/ 1000u,
+                                   /*max_early_data*/ 0u) == 0)
+         { printf("  PASS: ticket inserted\n"); g_pass++; }
+    else { printf("  FAIL: ticket insert\n"); g_fail++; return; }
+
+    /* Build a CH that offers exactly this PSK. We drop signature_algorithms
+     * (resumption doesn't need it) and append pre_shared_key as the LAST
+     * extension. The binder must verify: HMAC(binder_key, partial_ch_hash). */
+    uint8_t ch_rec[1024];
+    memset(ch_rec, 0, sizeof(ch_rec));
+    /* Reserve 5 bytes for record header. */
+    uint8_t* p = ch_rec + 5;
+    /* Handshake header: type=0x01 + 24-bit length backfilled */
+    *p++ = 0x01;
+    uint8_t* hs_len_at = p; p += 3;
+    uint8_t* hs_body = p;
+
+    *p++ = 0x03; *p++ = 0x03;                    /* legacy_version */
+    for (int j = 0; j < 32; j++) *p++ = (uint8_t)(0xC0 + j); /* random[32] */
+    *p++ = 0;                                     /* legacy_session_id len */
+    *p++ = 0x00; *p++ = 0x02;                    /* cipher_suites length */
+    *p++ = 0x13; *p++ = 0x03;                    /* TLS_CHACHA20_POLY1305_SHA256 */
+    *p++ = 0x01; *p++ = 0x00;                    /* compression_methods */
+
+    uint8_t* ext_len_at = p; p += 2;
+    uint8_t* ext_start = p;
+
+    /* supported_versions = TLS 1.3 */
+    *p++ = 0x00; *p++ = 0x2b;
+    *p++ = 0x00; *p++ = 0x03; *p++ = 0x02; *p++ = 0x03; *p++ = 0x04;
+    /* supported_groups = x25519 */
+    *p++ = 0x00; *p++ = 0x0a;
+    *p++ = 0x00; *p++ = 0x04; *p++ = 0x00; *p++ = 0x02; *p++ = 0x00; *p++ = 0x1d;
+    /* key_share = single x25519 entry, real client pubkey */
+    uint8_t cli_priv[32];
+    for (int j = 0; j < 32; j++) cli_priv[j] = (uint8_t)(0x55 ^ j);
+    cli_priv[0] &= 248; cli_priv[31] &= 127; cli_priv[31] |= 64;
+    uint8_t cli_pub[32];
+    x25519(cli_pub, cli_priv, X25519_BASE_POINT);
+    *p++ = 0x00; *p++ = 0x33;
+    *p++ = 0x00; *p++ = 0x26;                    /* ext_data len = 38 */
+    *p++ = 0x00; *p++ = 0x24;                    /* client_shares len = 36 */
+    *p++ = 0x00; *p++ = 0x1d;                    /* x25519 */
+    *p++ = 0x00; *p++ = 0x20;                    /* key length = 32 */
+    memcpy(p, cli_pub, 32); p += 32;
+    /* psk_key_exchange_modes = [psk_dhe_ke (0x01)] */
+    *p++ = 0x00; *p++ = 0x2d;
+    *p++ = 0x00; *p++ = 0x02;
+    *p++ = 0x01; *p++ = 0x01;
+
+    /* pre_shared_key (LAST). One identity. */
+    *p++ = 0x00; *p++ = 0x29;
+    /* ext_data len: identities_total(2) + (id_len(2)+8+age(4)) + binders_total(2) + binder(1+32)
+     *             = 2 + 14 + 2 + 33 = 51 */
+    *p++ = 0x00; *p++ = 51;
+    *p++ = 0x00; *p++ = 14;                      /* identities_total */
+    *p++ = 0x00; *p++ = 0x08;                    /* id_len = 8 */
+    memcpy(p, ticket_id, 8); p += 8;
+    /* obfuscated_ticket_age (any) */
+    *p++ = 0x00; *p++ = 0x00; *p++ = 0x00; *p++ = 0x00;
+    /* partial-CH ends here (RFC 8446 §4.2.11.2: hash includes everything
+     * up to but NOT including the binders length-prefix). */
+    uint8_t* binders_at = p;
+    *p++ = 0x00; *p++ = 33;                      /* binders_total */
+    *p++ = 32;                                    /* binder len */
+    uint8_t* binder_at = p;
+    memset(p, 0, 32); p += 32;                   /* placeholder, fill below */
+
+    /* Backfill ext + hs lengths first (binder is computed over the PARTIAL
+     * CH which excludes the binders<> field). */
+    uint16_t ext_len = (uint16_t)(p - ext_start);
+    ext_len_at[0] = (uint8_t)(ext_len >> 8);
+    ext_len_at[1] = (uint8_t)ext_len;
+    uint32_t hs_len = (uint32_t)(p - hs_body);
+    hs_len_at[0] = (uint8_t)(hs_len >> 16);
+    hs_len_at[1] = (uint8_t)(hs_len >> 8);
+    hs_len_at[2] = (uint8_t)hs_len;
+
+    /* Compute partial-CH hash + binder. partial_ch is the handshake msg
+     * (NOT the record header) from byte 0 through binders_at-1. */
+    size_t partial_off = (size_t)(binders_at - (ch_rec + 5));
+    uint8_t partial_hash[32];
+    sha256(ch_rec + 5, partial_off, partial_hash);
+    uint8_t es[32], bk[32], binder[32];
+    if (tls13_compute_early_secret(psk, 32, es) == 0
+        && tls13_compute_binder_key(es, 0 /*resumption*/, bk) == 0
+        && tls13_compute_psk_binder(bk, partial_hash, binder) == 0)
+         { memcpy(binder_at, binder, 32);
+           printf("  PASS: binder computed\n"); g_pass++; }
+    else { printf("  FAIL: binder compute\n"); g_fail++; return; }
+
+    /* Wrap in TLSPlaintext record header. */
+    size_t body_len = (size_t)(p - (ch_rec + 5));
+    ch_rec[0] = TLS_CT_HANDSHAKE;
+    ch_rec[1] = 0x03; ch_rec[2] = 0x03;
+    ch_rec[3] = (uint8_t)(body_len >> 8);
+    ch_rec[4] = (uint8_t)body_len;
+    size_t ch_total = 5 + body_len;
+
+    /* Configure engine. The cert seed + cert chain are still required
+     * by configure_server even though resumption skips Cert/CV. */
+    uint8_t srv_seed[32];
+    for (int j = 0; j < 32; j++) srv_seed[j] = (uint8_t)(0x40 + j);
+    const uint8_t fake_cert[8] = { 0x30,0x06,0x05,0x00, 1,2,3,4 };
+    const size_t  cert_lens[1] = { sizeof(fake_cert) };
+
+    pw_tls_engine_t* eng = malloc(sizeof(*eng));
+    pw_tls_engine_init(eng);
+    test_rng_state_t rng = { .next = 0 };
+    if (pw_tls_engine_configure_server(eng, test_rng, &rng, srv_seed,
+                                       fake_cert, cert_lens, 1) != 0)
+         { printf("  FAIL: configure_server\n"); g_fail++; free(eng); return; }
+    pw_tls_engine_attach_resumption(eng, &store);
+    pw_tls_engine_set_clock(eng, 2000u);
+
+    /* Feed CH and step. */
+    size_t cap; uint8_t* rx = pw_tls_rx_buf(eng, &cap);
+    memcpy(rx, ch_rec, ch_total);
+    pw_tls_rx_ack(eng, ch_total);
+
+    int want = pw_tls_step(eng);
+    if (want >= 0
+        && pw_tls_state(eng) == PW_TLS_ST_HANDSHAKE
+        && pw_tls_hs_phase(eng) == PW_TLS_HS_AFTER_SF_AWAIT_CF
+        && pw_tls_engine_was_resumed(eng))
+         { printf("  PASS: engine accepted PSK and reached AFTER_SF_AWAIT_CF\n"); g_pass++; }
+    else { printf("  FAIL: want=%d state=%d phase=%d resumed=%d\n",
+                  want, pw_tls_state(eng), pw_tls_hs_phase(eng),
+                  pw_tls_engine_was_resumed(eng));
+           g_fail++; free(eng); return; }
+
+    /* Inspect the TX buffer. First record is plaintext SH; verify it
+     * carries a pre_shared_key extension (search for type 0x00 0x29). */
+    size_t tx_len; const uint8_t* tx = pw_tls_tx_buf(eng, &tx_len);
+    if (tx_len < 5 || tx[0] != TLS_CT_HANDSHAKE)
+         { printf("  FAIL: first TX record not handshake\n"); g_fail++; free(eng); return; }
+    uint16_t sh_body = ((uint16_t)tx[3] << 8) | tx[4];
+    int found_psk_ext = 0;
+    /* Scan SH body for the 0x00 0x29 marker. SH layout is small and
+     * 0x0029 is a unique 2-byte token here so a linear scan is fine. */
+    for (size_t off = 0; off + 1 < (size_t)sh_body; off++) {
+        if (tx[5 + off] == 0x00 && tx[5 + off + 1] == 0x29) {
+            found_psk_ext = 1; break;
+        }
+    }
+    if (found_psk_ext) { printf("  PASS: SH carries pre_shared_key extension\n"); g_pass++; }
+    else { printf("  FAIL: SH missing pre_shared_key extension\n"); g_fail++; }
+
+    /* The remaining TX should be exactly TWO encrypted handshake records
+     * (EE + sFin), not four (no Cert, no CV). Walk records past SH. */
+    size_t off = 5 + (size_t)sh_body;
+    int enc_records = 0;
+    while (off + 5 <= tx_len) {
+        uint16_t rec_body = ((uint16_t)tx[off + 3] << 8) | tx[off + 4];
+        if (off + 5 + rec_body > tx_len) break;
+        enc_records++;
+        off += 5 + rec_body;
+    }
+    if (enc_records == 2)
+         { printf("  PASS: server flight has exactly 2 encrypted records (EE + sFin)\n"); g_pass++; }
+    else { printf("  FAIL: server flight had %d encrypted records (expected 2)\n",
+                  enc_records); g_fail++; }
+
+    free(eng);
+}
+
+
 
 #include "../io/dpdk.h"
 
@@ -5106,6 +5289,7 @@ int main(void) {
     test_tls_ticket_store();
     test_tls_early_secret_schedule();
     test_tls_psk_extension_parser();
+    test_engine_psk_resumption();
     test_dpdk_stub();
 
     printf("\n=== RESULTS: PASS=%d FAIL=%d ===\n", g_pass, g_fail);

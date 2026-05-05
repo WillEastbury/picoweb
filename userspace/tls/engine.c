@@ -12,10 +12,12 @@
 #include <string.h>
 
 #include "../crypto/util.h"
+#include "../crypto/sha256.h"
 #include "../crypto/x25519.h"
 #include "handshake.h"
 #include "keysched.h"
 #include "record.h"
+#include "ticket_store.h"
 
 /* Memory-shift the head of a buffer down by `n` bytes. Used after
  * draining ciphertext from RX or after the caller acks plaintext
@@ -110,6 +112,25 @@ void pw_tls_close(pw_tls_engine_t* eng) {
     /* TODO: emit close_notify alert into TX (TLS 1.3 §6.1). For the
      * spike we just transition state so the caller stops polling. */
     eng->state = PW_TLS_ST_CLOSED;
+}
+
+void pw_tls_engine_attach_resumption(pw_tls_engine_t* eng,
+                                     struct pw_tls_ticket_store* store) {
+    if (!eng) return;
+    eng->ticket_store = store;
+}
+
+void pw_tls_engine_set_clock(pw_tls_engine_t* eng, uint64_t now_ms) {
+    if (!eng) return;
+    eng->now_ms = now_ms;
+}
+
+int pw_tls_engine_was_resumed(const pw_tls_engine_t* eng) {
+    return (eng && eng->resumed) ? 1 : 0;
+}
+
+int pw_tls_engine_early_data_accepted(const pw_tls_engine_t* eng) {
+    return (eng && eng->early_data_accepted) ? 1 : 0;
 }
 
 int pw_tls_engine_emit_session_ticket(pw_tls_engine_t* eng,
@@ -408,6 +429,9 @@ static void wipe_handshake_secrets(pw_tls_engine_t* eng) {
     secure_zero(eng->ss_app_traffic_secret, sizeof(eng->ss_app_traffic_secret));
     secure_zero(eng->resumption_master_secret, sizeof(eng->resumption_master_secret));
     eng->has_rms = 0;
+    /* Resumption + 0-RTT context. The accepted-PSK material lives only
+     * for the handshake; once we transition to APP we no longer need it. */
+    secure_zero(eng->selected_psk, sizeof(eng->selected_psk));
 }
 
 /* Wipe ALL key material — secrets + installed record-layer keys/IVs
@@ -481,7 +505,75 @@ static int try_drive_handshake_server(pw_tls_engine_t* eng) {
     if (!ch.offers_tls13)        return -1;
     if (!ch.offers_chacha_poly)  return -1;
     if (!ch.offers_x25519)       return -1;
-    if (!ch.offers_ed25519)      return -1;
+
+    /* ---- PSK acceptance (RFC 8446 §4.2.11) ---------------------
+     * Try to resume only if (a) a ticket store is attached, (b) the
+     * client offered pre_shared_key + psk_dhe_ke. Walk the offers in
+     * order and accept the FIRST match whose binder verifies. */
+    eng->resumed                = 0;
+    eng->selected_psk_identity  = -1;
+    secure_zero(eng->selected_psk, sizeof(eng->selected_psk));
+    if (eng->ticket_store && ch.psk_present && ch.psk_dhe_ke_offered) {
+        for (unsigned i = 0; i < ch.psk_offer_count
+                          && i < TLS13_PSK_MAX_OFFERS; i++) {
+            const uint8_t* id_bytes = hs_msg + ch.psk_id_off[i];
+            size_t         id_len   = ch.psk_id_len[i];
+            pw_tls_ticket_t* t = pw_tls_ticket_store_lookup(
+                eng->ticket_store, id_bytes, id_len, eng->now_ms);
+            if (!t) continue;
+
+            /* Hash the partial CH (everything before binders<>). */
+            uint8_t partial_hash[32];
+            sha256(hs_msg, ch.psk_partial_ch_off, partial_hash);
+
+            uint8_t es[32], bk[32], expected[32];
+            if (tls13_compute_early_secret(t->psk, 32, es) != 0
+                || tls13_compute_binder_key(es, 0 /*resumption*/, bk) != 0
+                || tls13_compute_psk_binder(bk, partial_hash, expected) != 0) {
+                secure_zero(es, sizeof(es));
+                secure_zero(bk, sizeof(bk));
+                secure_zero(partial_hash, sizeof(partial_hash));
+                continue;
+            }
+
+            const uint8_t* offered_binder = hs_msg + ch.psk_binder_off[i];
+            size_t         binder_len     = ch.psk_binder_len[i];
+            int match = 0;
+            if (binder_len == 32) {
+                uint8_t acc = 0;
+                for (size_t k = 0; k < 32; k++) acc |= (uint8_t)(expected[k] ^ offered_binder[k]);
+                match = (acc == 0);
+            }
+            secure_zero(es,           sizeof(es));
+            secure_zero(bk,           sizeof(bk));
+            secure_zero(expected,     sizeof(expected));
+            secure_zero(partial_hash, sizeof(partial_hash));
+
+            if (!match) continue;
+
+            eng->resumed               = 1;
+            eng->selected_psk_identity = (int)i;
+            memcpy(eng->selected_psk, t->psk, 32);
+
+            /* 0-RTT acceptance: client must have sent early_data AND
+             * the ticket must permit it. We only accept 0-RTT for the
+             * FIRST offered identity (RFC 8446 §4.2.10), which is the
+             * one we matched at i=0. */
+            if (i == 0 && ch.offers_early_data
+                && pw_tls_ticket_can_early_data(t)) {
+                eng->early_data_accepted = 1;
+                eng->early_data_max      = t->max_early_data;
+                eng->early_data_seen     = 0;
+                pw_tls_ticket_consume_for_0rtt(t);
+            }
+            break;
+        }
+    }
+
+    /* Full handshake requires ed25519 for the CertificateVerify. A
+     * resumption handshake skips Cert+CV entirely so this requirement
+     * is dropped. */
+    if (!eng->resumed && !ch.offers_ed25519) return -1;
 
     /* Generate server randomness and X25519 ephemeral keypair. */
     if (eng->rng_fn(eng->rng_user, eng->server_random, 32) != 0) {
@@ -516,11 +608,14 @@ static int try_drive_handshake_server(pw_tls_engine_t* eng) {
 
     /* Build SH into a stack scratch buffer (ServerHello max ~130 B). */
     uint8_t sh_msg[256];
-    int sh_len = tls13_build_server_hello(sh_msg, sizeof(sh_msg),
-                                          eng->server_random,
-                                          eng->eph_pub,
-                                          ch.legacy_session_id,
-                                          ch.legacy_session_id_len);
+    int sh_len = tls13_build_server_hello_psk(sh_msg, sizeof(sh_msg),
+                                              eng->server_random,
+                                              eng->eph_pub,
+                                              ch.legacy_session_id,
+                                              ch.legacy_session_id_len,
+                                              eng->resumed
+                                                ? eng->selected_psk_identity
+                                                : -1);
     if (sh_len <= 0) {
         secure_zero(shared, sizeof(shared));
         secure_zero(eng->eph_priv, sizeof(eng->eph_priv));
@@ -546,11 +641,22 @@ static int try_drive_handshake_server(pw_tls_engine_t* eng) {
     uint8_t th[32];
     tls13_transcript_snapshot(&eng->transcript, th);
 
-    /* Derive the handshake secrets. */
-    if (tls13_compute_handshake_secrets(shared, th,
-                                        eng->handshake_secret,
-                                        eng->cs_handshake_secret,
-                                        eng->ss_handshake_secret) != 0) {
+    /* Derive the handshake secrets. PSK-aware variant on resumption,
+     * zero-PSK variant otherwise. */
+    int sec_rc;
+    if (eng->resumed) {
+        sec_rc = tls13_compute_handshake_secrets_psk(
+                     eng->selected_psk, 32, shared, th,
+                     eng->handshake_secret,
+                     eng->cs_handshake_secret,
+                     eng->ss_handshake_secret);
+    } else {
+        sec_rc = tls13_compute_handshake_secrets(shared, th,
+                     eng->handshake_secret,
+                     eng->cs_handshake_secret,
+                     eng->ss_handshake_secret);
+    }
+    if (sec_rc != 0) {
         secure_zero(shared, sizeof(shared));
         secure_zero(th, sizeof(th));
         wipe_handshake_secrets(eng);
@@ -653,6 +759,10 @@ static int try_emit_server_flight(pw_tls_engine_t* eng) {
         if (seal_one_handshake_msg(eng, ee, (size_t)ee_len) != 0) return -1;
     }
 
+    /* ---- Certificate + CertificateVerify (skipped on resumption,
+     *      RFC 8446 §4.6.1: server MUST NOT send Certificate or
+     *      CertificateVerify when resuming via PSK). ----*/
+    if (!eng->resumed) {
     /* ---- Certificate ---- */
     {
         /* Compute the exact certificate message size up front; we
@@ -688,6 +798,7 @@ static int try_emit_server_flight(pw_tls_engine_t* eng) {
         if (cv_len <= 0) return -1;
         if (seal_one_handshake_msg(eng, cv, (size_t)cv_len) != 0) return -1;
     }
+    } /* end if (!eng->resumed) */
 
     /* ---- server Finished ---- */
     {

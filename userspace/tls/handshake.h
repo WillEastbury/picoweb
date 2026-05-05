@@ -150,6 +150,17 @@ int tls13_build_server_hello(uint8_t* out, size_t out_cap,
                              const uint8_t* session_id,
                              uint8_t session_id_len);
 
+/* PSK-aware variant. If `selected_psk_identity` >= 0, the SH includes
+ * a pre_shared_key extension (RFC 8446 §4.2.11) advertising the
+ * accepted identity index. Otherwise behaves identically to
+ * tls13_build_server_hello. */
+int tls13_build_server_hello_psk(uint8_t* out, size_t out_cap,
+                                 const uint8_t server_random[TLS13_RANDOM_LEN],
+                                 const uint8_t our_pubkey[32],
+                                 const uint8_t* session_id,
+                                 uint8_t session_id_len,
+                                 int selected_psk_identity);
+
 /* Build an EncryptedExtensions handshake message (RFC 8446 §4.3.1).
  *
  * Spike: emits an empty extensions list. (No ALPN, no SNI ack — both
