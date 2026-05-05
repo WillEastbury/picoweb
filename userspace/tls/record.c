@@ -41,6 +41,12 @@ size_t tls13_seal_record(tls_record_dir_t* dir,
     out[3] = (uint8_t)(cipher_len >> 8);
     out[4] = (uint8_t)cipher_len;
 
+    /* Refuse to seal if the next increment would wrap dir->seq.
+     * RFC 8446 §5.3: the per-direction sequence number MUST NOT
+     * wrap. Wrapping reuses an AEAD nonce and breaks confidentiality
+     * + integrity guarantees catastrophically. */
+    if (dir->seq == UINT64_MAX) return 0;
+
     /* Build TLSInnerPlaintext = plaintext || type byte. We overwrite
      * `out + 5` with the encrypted form. The type byte must live in
      * the buffer that gets encrypted, so copy plaintext to its final
@@ -85,6 +91,9 @@ size_t tls13_seal_record_iov(tls_record_dir_t* dir,
     out[3] = (uint8_t)(cipher_len >> 8);
     out[4] = (uint8_t)cipher_len;
 
+    /* Refuse to seal if dir->seq is about to wrap (would reuse nonce). */
+    if (dir->seq == UINT64_MAX) return 0;
+
     uint8_t* body     = out + TLS13_RECORD_HEADER_LEN;
     uint8_t* tag_dst  = body + inner_len;
 
@@ -115,6 +124,9 @@ int tls13_open_record(tls_record_dir_t* dir,
                       tls_content_type_t* inner_type_out,
                       uint8_t** plaintext_out, size_t* plaintext_len_out) {
     if (record_len < TLS13_RECORD_HEADER_LEN + TLS13_AEAD_TAG_LEN) return -1;
+    /* Refuse to open if dir->seq is at its max (would reuse nonce on
+     * the next record). Treat this as a hard protocol failure. */
+    if (dir->seq == UINT64_MAX) return -1;
     size_t cipher_len = ((size_t)record[3] << 8) | record[4];
     if (cipher_len + TLS13_RECORD_HEADER_LEN != record_len) return -1;
     if (cipher_len < TLS13_AEAD_TAG_LEN) return -1;

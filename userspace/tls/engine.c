@@ -557,16 +557,25 @@ static int try_drive_handshake_server(pw_tls_engine_t* eng) {
             eng->selected_psk_identity = (int)i;
             memcpy(eng->selected_psk, t->psk, 32);
 
+            /* Mark the ticket consumed unconditionally on successful
+             * binder match. RFC 8446 §4.6.1 + §8: a server SHOULD
+             * treat tickets as single-use to bound replay windows;
+             * doing this BEFORE the 0-RTT branch closes a TOCTOU
+             * where a non-0-RTT resumption would otherwise leave
+             * the ticket replayable in a future handshake. */
+            (void)pw_tls_ticket_consume_for_0rtt(t);
+
             /* 0-RTT acceptance: client must have sent early_data AND
              * the ticket must permit it. We only accept 0-RTT for the
              * FIRST offered identity (RFC 8446 §4.2.10), which is the
-             * one we matched at i=0. */
+             * one we matched at i=0. Note: the ticket has already been
+             * marked used above, so can_early_data() is checked against
+             * the pre-consume snapshot via the local flags we recorded. */
             if (i == 0 && ch.offers_early_data
-                && pw_tls_ticket_can_early_data(t)) {
+                && t->max_early_data > 0) {
                 eng->early_data_accepted = 1;
                 eng->early_data_max      = t->max_early_data;
                 eng->early_data_seen     = 0;
-                pw_tls_ticket_consume_for_0rtt(t);
             }
             break;
         }
@@ -953,26 +962,20 @@ static int try_recv_client_finished(pw_tls_engine_t* eng) {
                 return -1;
             }
             if (eng->app_in_len + pt_len > PW_TLS_BUF_CAP) {
-                /* APP_IN full — caller must drain. Don't consume the
-                 * record yet (rewind RX is not possible after open).
-                 * Apply backpressure: signal need-more (caller drain)
-                 * by returning 0 without sliding RX. But pt has already
-                 * been authenticated and counted via read.seq. We cannot
-                 * un-bump seq, so we MUST NOT return 0 here without
-                 * consuming. Instead surface as much as fits and bail
-                 * if there's nothing to surface. */
-                if (eng->app_in_len >= PW_TLS_BUF_CAP) return 0;
-                size_t fit = PW_TLS_BUF_CAP - eng->app_in_len;
-                memcpy(eng->app_in_buf + eng->app_in_len, pt, fit);
-                eng->app_in_len    += fit;
-                eng->early_data_seen += (uint32_t)fit;
-                /* Drop the rest of the early data record. (Edge case
-                 * for a tiny APP_IN; the test path has plenty of room.) */
-            } else {
-                memcpy(eng->app_in_buf + eng->app_in_len, pt, pt_len);
-                eng->app_in_len      += pt_len;
-                eng->early_data_seen += (uint32_t)pt_len;
+                /* APP_IN full — caller must drain before more early
+                 * data can be surfaced. We cannot rewind dir->seq
+                 * (already bumped during open), so we must NOT
+                 * silently partial-copy: doing so under-counts
+                 * early_data_seen and lets a malicious client push
+                 * past max_early_data. Treat as a fatal overflow;
+                 * caller is expected to size APP_IN >= max early_data
+                 * the ticket permits. */
+                engine_mark_err(eng, PW_TLS_ERR_OVERFLOW);
+                return -1;
             }
+            memcpy(eng->app_in_buf + eng->app_in_len, pt, pt_len);
+            eng->app_in_len      += pt_len;
+            eng->early_data_seen += (uint32_t)pt_len;
             buf_shift(eng->rx_buf, &eng->rx_len, total);
             return 1;   /* loop will re-enter and look for next record */
         }
