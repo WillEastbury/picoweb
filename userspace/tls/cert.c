@@ -147,6 +147,11 @@ static int add_entry(cert_store_t* s, const char* hostname,
                 for (uint8_t j = 0; j < nb; j++) l = (l << 8) | chain[off + 2 + j];
                 header_len = 2 + nb;
             }
+            /* Bound the cert length to a sane ceiling. A real cert
+             * is at most a few KB; multi-MB values can only be
+             * malformed or hostile. Also avoids any chance of
+             * header_len + l wrapping size_t on 32-bit builds. */
+            if (l > (1u << 20)) return -1;
             cert_lens[i] = header_len + l;
             if (off + cert_lens[i] > (size_t)chain_len) return -1;
             off += cert_lens[i];

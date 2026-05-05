@@ -169,6 +169,11 @@ void poly1305_finish(poly1305_ctx_t* ctx, uint8_t tag[POLY1305_TAG_LEN]) {
     c  = g3 >> 26; g3 &= 0x03ffffff;
     uint32_t g4 = h4 + c - (1u << 26);
 
+    /* Constant-time select between h (if h < p) and g (if h >= p).
+     * Matches RFC 8439 §2.5.1 reference exactly: g4>>31 is 1 when
+     * the trial subtraction underflowed (h<p, keep h) and 0 otherwise
+     * (h>=p, keep g). Both `(g4>>31)-1` and `0u-(g4>>31)` are
+     * well-defined unsigned wrap; we use the RFC's literal form. */
     uint32_t mask = (g4 >> 31) - 1;
     g0 &= mask; g1 &= mask; g2 &= mask; g3 &= mask; g4 &= mask;
     mask = ~mask;
