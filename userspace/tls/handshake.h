@@ -80,6 +80,48 @@ typedef struct {
      * transcript hash. */
     const uint8_t* raw;
     size_t         raw_len;
+
+    /* ---- pre_shared_key (RFC 8446 §4.2.11) — captured but not
+     * verified by the parser. The engine performs binder verification
+     * after a ticket lookup. ----
+     *
+     * `psk_present` is 1 iff the extension was present and parsed
+     * cleanly (well-formed lengths, at least one identity, matching
+     * binder count). `psk_offer_count` is the number of (identity,
+     * binder) pairs the client offered. The parser captures up to
+     * TLS13_PSK_MAX_OFFERS pairs; extras are silently ignored.
+     *
+     * For each captured offer:
+     *   psk_id_off[i]/psk_id_len[i]: byte range in `raw` of the
+     *     identity opaque (the "ticket" the client returns)
+     *   psk_obfuscated_age[i]: the 32-bit obfuscated_ticket_age
+     *   psk_binder_off[i]/psk_binder_len[i]: byte range in `raw`
+     *     of the binder HMAC value
+     *
+     * `psk_partial_ch_off` is the offset within `raw` at which the
+     * truncated ClientHello ends — i.e., the first byte of the
+     * binders<> length-prefix. The transcript hash for binder
+     * verification is computed over raw[0..psk_partial_ch_off).
+     *
+     * Per RFC 8446 §4.2.11 pre_shared_key MUST be the LAST
+     * extension in the CH; the parser enforces this. */
+    int            psk_present;
+    unsigned       psk_offer_count;
+    size_t         psk_partial_ch_off;
+    /* psk_key_exchange_modes (RFC 8446 §4.2.9) — required when
+     * pre_shared_key is offered. We only support psk_dhe_ke (1). */
+    int            psk_dhe_ke_offered;
+    /* early_data extension (RFC 8446 §4.2.10) appearance in CH —
+     * presence indicates the client wants 0-RTT under the FIRST
+     * offered ticket. */
+    int            offers_early_data;
+
+#define TLS13_PSK_MAX_OFFERS 4
+    size_t   psk_id_off       [TLS13_PSK_MAX_OFFERS];
+    size_t   psk_id_len       [TLS13_PSK_MAX_OFFERS];
+    uint32_t psk_obfuscated_age[TLS13_PSK_MAX_OFFERS];
+    size_t   psk_binder_off   [TLS13_PSK_MAX_OFFERS];
+    size_t   psk_binder_len   [TLS13_PSK_MAX_OFFERS];
 } tls13_client_hello_t;
 
 /* Parse a ClientHello from the wire. `msg` points at the first byte
@@ -285,6 +327,53 @@ int tls13_compute_resumption_master_secret(
     const uint8_t master_secret[32],
     const uint8_t transcript_hash_through_client_finished[32],
     uint8_t       resumption_master_secret[32]);
+
+/* ---------------- Early-secret schedule (RFC 8446 §7.1) ---------------- */
+
+/* early_secret = HKDF-Extract(salt=00..00, IKM = psk or 00..00).
+ * Pass psk=NULL or psk_len=0 to get the "no-PSK" early secret used
+ * by full handshakes. Output is 32 bytes. */
+int tls13_compute_early_secret(const uint8_t* psk, size_t psk_len,
+                               uint8_t early_secret[32]);
+
+/* binder_key = Derive-Secret(early_secret,
+ *                            is_external ? "ext binder" : "res binder",
+ *                            "")
+ * Used to verify PSK binders in CH (RFC 8446 §4.2.11.2).
+ * is_external should be 0 for resumption PSKs (NewSessionTicket),
+ * 1 for externally-provisioned PSKs. */
+int tls13_compute_binder_key(const uint8_t early_secret[32],
+                             int is_external,
+                             uint8_t binder_key[32]);
+
+/* Compute the 32-byte PSK binder over `partial_ch_hash`, which is
+ * SHA-256 of the ClientHello bytes from the start of the handshake
+ * message up to (but not including) the binders length-prefix.
+ * Returns 0 on success. Equivalent to a Finished computation under
+ * binder_key. */
+int tls13_compute_psk_binder(const uint8_t binder_key[32],
+                             const uint8_t partial_ch_hash[32],
+                             uint8_t binder_out[32]);
+
+/* client_early_traffic_secret = Derive-Secret(early_secret,
+ *                                  "c e traffic", H(CH))
+ * Used to install 0-RTT decryption keys on the server BEFORE the
+ * handshake-traffic keys come online. */
+int tls13_compute_client_early_traffic_secret(
+    const uint8_t early_secret[32],
+    const uint8_t transcript_hash_through_client_hello[32],
+    uint8_t       client_early_traffic_secret[32]);
+
+/* PSK-aware variant of tls13_compute_handshake_secrets. The early
+ * secret is extracted from the supplied PSK rather than from the
+ * all-zero IKM. Pass psk=NULL or psk_len=0 to fall back to the
+ * full-handshake derivation. */
+int tls13_compute_handshake_secrets_psk(const uint8_t* psk, size_t psk_len,
+                                        const uint8_t ecdhe_shared[32],
+                                        const uint8_t transcript_hash[32],
+                                        uint8_t handshake_secret[32],
+                                        uint8_t client_hs_traffic_secret[32],
+                                        uint8_t server_hs_traffic_secret[32]);
 
 /* ---------------- Handshake transcript hash ---------------- */
 /*

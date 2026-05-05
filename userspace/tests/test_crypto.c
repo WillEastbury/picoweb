@@ -30,6 +30,7 @@
 #include "../tls/cert.h"
 #include "../tls/handshake.h"
 #include "../tls/engine.h"
+#include "../tls/ticket_store.h"
 #include "../crypto/x25519.h"
 #include "../tcp/ip.h"
 #include "../tcp/tcp.h"
@@ -4747,6 +4748,268 @@ static void test_engine_pool(void) {
     else { printf("  FAIL: release(NULL) corrupted in_use\n"); g_fail++; }
 }
 
+/* ---------- TLS ticket store + early-secret schedule ---------- */
+
+static void test_tls_ticket_store(void) {
+    printf("== TLS ticket store (insert / lookup / consume / evict) ==\n");
+    pw_tls_ticket_store_t s;
+    pw_tls_ticket_store_init(&s);
+
+    uint8_t id1[8] = {1,1,1,1,1,1,1,1};
+    uint8_t id2[8] = {2,2,2,2,2,2,2,2};
+    uint8_t psk[32]; memset(psk, 0xAA, 32);
+
+    if (pw_tls_ticket_store_insert(&s, id1, 8, psk, 0xdeadbeef, 7200, 1000, 0) == 0)
+         { printf("  PASS: insert id1\n"); g_pass++; }
+    else { printf("  FAIL: insert id1\n"); g_fail++; }
+
+    pw_tls_ticket_t* t = pw_tls_ticket_store_lookup(&s, id1, 8, 1500);
+    if (t && t->age_add == 0xdeadbeef && memcmp(t->psk, psk, 32) == 0)
+         { printf("  PASS: lookup id1 returns inserted ticket\n"); g_pass++; }
+    else { printf("  FAIL: lookup id1\n"); g_fail++; return; }
+
+    if (!pw_tls_ticket_store_lookup(&s, id2, 8, 1500))
+         { printf("  PASS: lookup unknown returns NULL\n"); g_pass++; }
+    else { printf("  FAIL: lookup unknown\n"); g_fail++; }
+
+    /* Expiry: lifetime 7200s -> exp = 1000 + 7_200_000 = 7_201_000 ms. */
+    if (!pw_tls_ticket_store_lookup(&s, id1, 8, 7202000))
+         { printf("  PASS: expired lookup returns NULL + invalidates\n"); g_pass++; }
+    else { printf("  FAIL: expired lookup returned a ticket\n"); g_fail++; }
+    if (!pw_tls_ticket_store_lookup(&s, id1, 8, 1500))
+         { printf("  PASS: previously-expired ticket fully invalidated\n"); g_pass++; }
+    else { printf("  FAIL: invalidate did not stick\n"); g_fail++; }
+
+    /* Reinsert + 0-RTT consume. */
+    pw_tls_ticket_store_insert(&s, id1, 8, psk, 0, 7200, 1000, 16384);
+    pw_tls_ticket_t* tt = pw_tls_ticket_store_lookup(&s, id1, 8, 1500);
+    if (tt && pw_tls_ticket_can_early_data(tt) == 1)
+         { printf("  PASS: fresh ticket allows early data\n"); g_pass++; }
+    else { printf("  FAIL: fresh ticket disallows early data\n"); g_fail++; }
+    if (pw_tls_ticket_consume_for_0rtt(tt) == 0)
+         { printf("  PASS: first consume_for_0rtt OK\n"); g_pass++; }
+    else { printf("  FAIL: first consume\n"); g_fail++; }
+    if (pw_tls_ticket_consume_for_0rtt(tt) == -1
+        && pw_tls_ticket_can_early_data(tt) == 0)
+         { printf("  PASS: second consume rejected; 0-RTT now disabled\n"); g_pass++; }
+    else { printf("  FAIL: replay defense did not engage\n"); g_fail++; }
+
+    /* Eviction: fill all PW_TLS_TICKET_SLOTS-1 more slots, then one
+     * extra forces eviction of the oldest. */
+    pw_tls_ticket_store_init(&s);
+    for (unsigned i = 0; i < PW_TLS_TICKET_SLOTS; i++) {
+        uint8_t id[2] = { (uint8_t)(0xC0 + i), (uint8_t)i };
+        pw_tls_ticket_store_insert(&s, id, 2, psk, 0, 7200,
+                                   /* issued_at: ascending */ 100ULL + i, 0);
+    }
+    /* All 16 should be present. */
+    int found_all = 1;
+    for (unsigned i = 0; i < PW_TLS_TICKET_SLOTS; i++) {
+        uint8_t id[2] = { (uint8_t)(0xC0 + i), (uint8_t)i };
+        if (!pw_tls_ticket_store_lookup(&s, id, 2, 200)) { found_all = 0; break; }
+    }
+    if (found_all) { printf("  PASS: store full, all 16 lookups OK\n"); g_pass++; }
+    else           { printf("  FAIL: not all 16 found\n"); g_fail++; }
+
+    /* Insert one more — the OLDEST (index 0, issued_at=100) gets evicted. */
+    uint8_t id_new[2] = { 0xFF, 0xFF };
+    pw_tls_ticket_store_insert(&s, id_new, 2, psk, 0, 7200, 9999, 0);
+    uint8_t id_old[2] = { 0xC0, 0x00 };
+    if (!pw_tls_ticket_store_lookup(&s, id_old, 2, 200)
+        &&  pw_tls_ticket_store_lookup(&s, id_new, 2, 200))
+         { printf("  PASS: oldest evicted, new ticket present\n"); g_pass++; }
+    else { printf("  FAIL: eviction policy wrong\n"); g_fail++; }
+}
+
+static void test_tls_early_secret_schedule(void) {
+    printf("== TLS early secret + binder key + c_e_traffic ==\n");
+
+    /* Self-consistent vector: zero-PSK early_secret should equal
+     * HKDF-Extract(00..00, 00..00). */
+    uint8_t es[32];
+    if (tls13_compute_early_secret(NULL, 0, es) == 0)
+         { printf("  PASS: tls13_compute_early_secret(NULL) OK\n"); g_pass++; }
+    else { printf("  FAIL: early_secret returns -1\n"); g_fail++; return; }
+
+    uint8_t es_ref[32];
+    {
+        uint8_t zero32[32] = {0};
+        hkdf_extract(zero32, 32, zero32, 32, es_ref);
+    }
+    if (memcmp(es, es_ref, 32) == 0)
+         { printf("  PASS: zero-PSK early_secret matches HKDF-Extract(0,0)\n"); g_pass++; }
+    else { printf("  FAIL: early_secret mismatch\n"); g_fail++; }
+
+    /* PSK variant: with PSK={0xAA*32}, recompute and ensure it
+     * differs from the zero-PSK one. */
+    uint8_t psk[32]; memset(psk, 0xAA, 32);
+    uint8_t es_psk[32];
+    tls13_compute_early_secret(psk, 32, es_psk);
+    if (memcmp(es_psk, es, 32) != 0)
+         { printf("  PASS: PSK early_secret differs from zero variant\n"); g_pass++; }
+    else { printf("  FAIL: PSK early_secret matches zero (HKDF broken)\n"); g_fail++; }
+
+    /* binder_key: res vs ext distinct. */
+    uint8_t bk_res[32], bk_ext[32];
+    tls13_compute_binder_key(es_psk, 0, bk_res);
+    tls13_compute_binder_key(es_psk, 1, bk_ext);
+    if (memcmp(bk_res, bk_ext, 32) != 0)
+         { printf("  PASS: res binder vs ext binder distinct\n"); g_pass++; }
+    else { printf("  FAIL: binder labels collide\n"); g_fail++; }
+
+    /* binder = Finished(binder_key, partial_ch_hash). Verify path. */
+    uint8_t partial_hash[32]; memset(partial_hash, 0x55, 32);
+    uint8_t binder_a[32], binder_b[32];
+    tls13_compute_psk_binder(bk_res, partial_hash, binder_a);
+    tls13_compute_finished(bk_res, partial_hash, binder_b);
+    if (memcmp(binder_a, binder_b, 32) == 0)
+         { printf("  PASS: binder == Finished(binder_key, hash)\n"); g_pass++; }
+    else { printf("  FAIL: binder != Finished\n"); g_fail++; }
+
+    /* c_e_traffic — sanity: nonzero and label-dependent. */
+    uint8_t cet[32];
+    tls13_compute_client_early_traffic_secret(es_psk, partial_hash, cet);
+    uint8_t any = 0;
+    for (int i = 0; i < 32; i++) any |= cet[i];
+    if (any) { printf("  PASS: c_e_traffic_secret nonzero\n"); g_pass++; }
+    else     { printf("  FAIL: c_e_traffic all zero\n"); g_fail++; }
+}
+
+static void test_tls_psk_extension_parser(void) {
+    printf("== TLS pre_shared_key extension parser ==\n");
+
+    /* Build a synthetic CH with one PSK identity + binder + the
+     * extensions ordering rule (PSK MUST be last). */
+    uint8_t ch[512];
+    memset(ch, 0, sizeof(ch));
+    /* Handshake header backfill at the end. */
+    /* legacy_version */
+    size_t i = 4;
+    ch[i++] = 0x03; ch[i++] = 0x03;
+    /* random[32] */
+    memset(ch + i, 0xAB, 32); i += 32;
+    /* legacy_session_id<0> */
+    ch[i++] = 0;
+    /* cipher_suites: [0x1303] */
+    ch[i++] = 0x00; ch[i++] = 0x02;
+    ch[i++] = 0x13; ch[i++] = 0x03;
+    /* legacy_compression_methods: [0x00] */
+    ch[i++] = 0x01; ch[i++] = 0x00;
+
+    /* extensions block: backfill u16 length later. */
+    size_t ext_len_off = i;
+    i += 2;
+
+    /* supported_versions = TLS 1.3. */
+    ch[i++] = 0x00; ch[i++] = 0x2b;
+    ch[i++] = 0x00; ch[i++] = 0x03;
+    ch[i++] = 0x02;
+    ch[i++] = 0x03; ch[i++] = 0x04;
+    /* supported_groups = x25519. */
+    ch[i++] = 0x00; ch[i++] = 0x0a;
+    ch[i++] = 0x00; ch[i++] = 0x04;
+    ch[i++] = 0x00; ch[i++] = 0x02;
+    ch[i++] = 0x00; ch[i++] = 0x1d;
+    /* key_share = single x25519 entry, all-zero pubkey (parser doesn't validate). */
+    ch[i++] = 0x00; ch[i++] = 0x33;
+    ch[i++] = 0x00; ch[i++] = 0x26;
+    ch[i++] = 0x00; ch[i++] = 0x24;
+    ch[i++] = 0x00; ch[i++] = 0x1d;
+    ch[i++] = 0x00; ch[i++] = 0x20;
+    /* x25519 pubkey: any nonzero so engine wouldn't choke. */
+    for (int j = 0; j < 32; j++) ch[i++] = 0x42;
+    /* signature_algorithms = ed25519. */
+    ch[i++] = 0x00; ch[i++] = 0x0d;
+    ch[i++] = 0x00; ch[i++] = 0x04;
+    ch[i++] = 0x00; ch[i++] = 0x02;
+    ch[i++] = 0x08; ch[i++] = 0x07;
+    /* psk_key_exchange_modes = [psk_dhe_ke]. */
+    ch[i++] = 0x00; ch[i++] = 0x2d;
+    ch[i++] = 0x00; ch[i++] = 0x02;
+    ch[i++] = 0x01;
+    ch[i++] = 0x01;
+    /* early_data (CH variant: empty body). */
+    ch[i++] = 0x00; ch[i++] = 0x2a;
+    ch[i++] = 0x00; ch[i++] = 0x00;
+
+    /* pre_shared_key (MUST be last). One identity (8 bytes) + binder. */
+    ch[i++] = 0x00; ch[i++] = 0x29;
+    /* extension_data length: identities_total(2) + ids(2+8+4) + binders_total(2) + binder(1+32) = 51 */
+    ch[i++] = 0x00; ch[i++] = 51;
+    /* identities<7..>: 14 bytes ((u16 id_len + 8 + u32 age) = 14) */
+    ch[i++] = 0x00; ch[i++] = 14;
+    ch[i++] = 0x00; ch[i++] = 0x08;
+    size_t expected_id_off = i;
+    for (int j = 0; j < 8; j++) ch[i++] = (uint8_t)(0x10 + j);
+    ch[i++] = 0xDE; ch[i++] = 0xAD; ch[i++] = 0xBE; ch[i++] = 0xEF;
+    /* binders<33..>: u8 binder_len(32) + 32 bytes => total 33 */
+    size_t expected_partial_off = i;
+    ch[i++] = 0x00; ch[i++] = 33;
+    ch[i++] = 32;
+    size_t expected_binder_off = i;
+    for (int j = 0; j < 32; j++) ch[i++] = (uint8_t)(0xB0 + j);
+
+    /* Backfill extensions length. */
+    size_t ext_total = i - (ext_len_off + 2);
+    ch[ext_len_off]     = (uint8_t)(ext_total >> 8);
+    ch[ext_len_off + 1] = (uint8_t)ext_total;
+
+    /* Backfill handshake header. */
+    ch[0] = 0x01;   /* client_hello */
+    size_t hs_body = i - 4;
+    ch[1] = (uint8_t)(hs_body >> 16);
+    ch[2] = (uint8_t)(hs_body >> 8);
+    ch[3] = (uint8_t)hs_body;
+
+    tls13_client_hello_t out;
+    if (tls13_parse_client_hello(ch, i, &out) == 0)
+         { printf("  PASS: parse CH with PSK extension OK\n"); g_pass++; }
+    else { printf("  FAIL: parse CH returned -1\n"); g_fail++; return; }
+
+    if (out.psk_present == 1 && out.psk_offer_count == 1
+        && out.psk_dhe_ke_offered == 1 && out.offers_early_data == 1)
+         { printf("  PASS: PSK + psk_dhe_ke + early_data flags set\n"); g_pass++; }
+    else { printf("  FAIL: psk_present=%d cnt=%u dhe=%d ed=%d\n",
+                  out.psk_present, out.psk_offer_count,
+                  out.psk_dhe_ke_offered, out.offers_early_data); g_fail++; }
+
+    if (out.psk_id_off[0] == expected_id_off
+        && out.psk_id_len[0] == 8
+        && out.psk_obfuscated_age[0] == 0xdeadbeef
+        && out.psk_binder_off[0] == expected_binder_off
+        && out.psk_binder_len[0] == 32
+        && out.psk_partial_ch_off == expected_partial_off)
+         { printf("  PASS: id_off=%zu binder_off=%zu partial_off=%zu\n",
+                  out.psk_id_off[0], out.psk_binder_off[0], out.psk_partial_ch_off); g_pass++; }
+    else { printf("  FAIL: id_off=%zu(want %zu) binder_off=%zu(want %zu) partial_off=%zu(want %zu)\n",
+                  out.psk_id_off[0], expected_id_off,
+                  out.psk_binder_off[0], expected_binder_off,
+                  out.psk_partial_ch_off, expected_partial_off); g_fail++; }
+
+    /* Negative test: PSK NOT last must be rejected. Move PSK to before
+     * sig_algorithms by swapping with early_data. Simpler: build a
+     * CH where pre_shared_key is followed by an extra signature_algorithms.
+     * Reuse `ch` buffer — append extra ext after PSK. */
+    if (i + 8 < sizeof(ch)) {
+        /* append 8-byte signature_algorithms after PSK. */
+        ch[i++] = 0x00; ch[i++] = 0x0d;
+        ch[i++] = 0x00; ch[i++] = 0x04;
+        ch[i++] = 0x00; ch[i++] = 0x02;
+        ch[i++] = 0x08; ch[i++] = 0x07;
+        /* Patch ext_total + hs_len. */
+        ext_total = i - (ext_len_off + 2);
+        ch[ext_len_off]     = (uint8_t)(ext_total >> 8);
+        ch[ext_len_off + 1] = (uint8_t)ext_total;
+        hs_body = i - 4;
+        ch[1] = (uint8_t)(hs_body >> 16);
+        ch[2] = (uint8_t)(hs_body >> 8);
+        ch[3] = (uint8_t)hs_body;
+        if (tls13_parse_client_hello(ch, i, &out) == -1)
+             { printf("  PASS: PSK-not-last -> parse rejects\n"); g_pass++; }
+        else { printf("  FAIL: PSK-not-last accepted\n"); g_fail++; }
+    }
+}
+
 /* ---------- DPDK stub backend ---------- */
 
 #include "../io/dpdk.h"
@@ -4840,6 +5103,9 @@ int main(void) {
     test_engine_last_error_init();
     test_pw_rx_reassembly_slot_sizing();
     test_engine_pool();
+    test_tls_ticket_store();
+    test_tls_early_secret_schedule();
+    test_tls_psk_extension_parser();
     test_dpdk_stub();
 
     printf("\n=== RESULTS: PASS=%d FAIL=%d ===\n", g_pass, g_fail);

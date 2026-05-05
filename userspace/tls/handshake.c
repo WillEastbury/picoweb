@@ -83,6 +83,91 @@ static inline int wr_bytes(uint8_t** p, size_t* rem, const uint8_t* src, size_t 
 
 /* ------------------ ClientHello parser ------------------ */
 
+static int parse_psk_extension(const uint8_t* eb_start, size_t er_total,
+                               const uint8_t* raw_base, size_t raw_total,
+                               tls13_client_hello_t* out) {
+    /* RFC 8446 §4.2.11 OfferedPsks layout:
+     *   PskIdentity identities<7..2^16-1>      // u16 length, then list
+     *     each: opaque identity<1..2^16-1>     // u16 + bytes
+     *           uint32 obfuscated_ticket_age
+     *   PskBinderEntry binders<33..2^16-1>     // u16 length, then list
+     *     each: opaque<32..255>                // u8 + bytes
+     */
+    const uint8_t* p = eb_start;
+    size_t rem = er_total;
+
+    uint16_t ids_total;
+    if (rd_u16(&p, &rem, &ids_total) != 0) return -1;
+    if (ids_total < 7 || rem < ids_total) return -1;
+
+    /* Consume identities into out->psk_id_off/_len + obfuscated age. */
+    {
+        const uint8_t* lp = p;
+        size_t         lr = ids_total;
+        unsigned       n  = 0;
+        while (lr > 0) {
+            uint16_t id_len;
+            if (rd_u16(&lp, &lr, &id_len) != 0) return -1;
+            if (id_len < 1 || lr < id_len)      return -1;
+            size_t id_off_in_raw = (size_t)((lp) - raw_base);
+            if (id_off_in_raw > raw_total)      return -1;
+            const uint8_t* id_start = lp;
+            (void)id_start;
+            if (rd_skip(&lp, &lr, id_len) != 0) return -1;
+            uint32_t age;
+            uint16_t hi, lo;
+            if (rd_u16(&lp, &lr, &hi) != 0)     return -1;
+            if (rd_u16(&lp, &lr, &lo) != 0)     return -1;
+            age = ((uint32_t)hi << 16) | lo;
+            if (n < TLS13_PSK_MAX_OFFERS) {
+                out->psk_id_off[n]        = id_off_in_raw;
+                out->psk_id_len[n]        = id_len;
+                out->psk_obfuscated_age[n] = age;
+            }
+            n++;
+        }
+        out->psk_offer_count = n;
+        if (n == 0) return -1;
+    }
+    /* Skip past identities to binders. */
+    if (rd_skip(&p, &rem, ids_total) != 0)        return -1;
+
+    /* The OFFSET (within raw_base) of the start of the binders
+     * length-prefix is the truncation point for the transcript hash
+     * over the partial ClientHello. */
+    out->psk_partial_ch_off = (size_t)(p - raw_base);
+
+    uint16_t bs_total;
+    if (rd_u16(&p, &rem, &bs_total) != 0)         return -1;
+    if (bs_total < 33 || rem < bs_total)          return -1;
+    /* The pre_shared_key extension MUST consume exactly its entire
+     * extension_data (no trailing bytes). */
+    if (rem != bs_total)                          return -1;
+
+    {
+        const uint8_t* lp = p;
+        size_t         lr = bs_total;
+        unsigned       n  = 0;
+        while (lr > 0) {
+            uint8_t bl;
+            if (rd_u8(&lp, &lr, &bl) != 0)        return -1;
+            if (bl < 32 || lr < bl)               return -1;
+            size_t off_in_raw = (size_t)(lp - raw_base);
+            if (off_in_raw > raw_total)           return -1;
+            if (n < TLS13_PSK_MAX_OFFERS) {
+                out->psk_binder_off[n] = off_in_raw;
+                out->psk_binder_len[n] = bl;
+            }
+            n++;
+            if (rd_skip(&lp, &lr, bl) != 0)       return -1;
+        }
+        if (n != out->psk_offer_count)            return -1;   /* must match */
+    }
+
+    out->psk_present = 1;
+    return 0;
+}
+
 static int parse_extensions(const uint8_t* ext_data, size_t ext_len,
                             tls13_client_hello_t* out) {
     const uint8_t* p = ext_data;
@@ -212,6 +297,26 @@ static int parse_extensions(const uint8_t* ext_data, size_t ext_len,
         default:
             /* Ignore unrecognised extensions (forward compat). */
             break;
+        case 0x002a:                  /* early_data (CH variant: empty body) */
+            /* RFC 8446 §4.2.10: in CH the extension_data is empty. */
+            if (er != 0) return -1;
+            out->offers_early_data = 1;
+            break;
+        case 0x002d: {                /* psk_key_exchange_modes (RFC 8446 §4.2.9) */
+            uint8_t list_len;
+            if (rd_u8(&eb, &er, &list_len) != 0) return -1;
+            if (list_len < 1 || er < list_len)   return -1;
+            for (uint8_t i = 0; i < list_len; i++) {
+                if (eb[i] == 1 /* psk_dhe_ke */) out->psk_dhe_ke_offered = 1;
+            }
+            break;
+        }
+        case 0x0029: {                /* pre_shared_key (RFC 8446 §4.2.11) */
+            /* MUST be the LAST extension in CH per §4.2.11. */
+            if (rem != 0) return -1;
+            if (parse_psk_extension(eb, er, out->raw, out->raw_len, out) != 0) return -1;
+            break;
+        }
         }
     }
     return 0;
@@ -670,5 +775,102 @@ int tls13_compute_resumption_master_secret(
     if (tls13_hkdf_expand_label(master_secret, "res master",
                                 transcript_hash_through_client_finished, 32,
                                 resumption_master_secret, 32) != 0) return -1;
+    return 0;
+}
+
+/* ---------------- Early-secret schedule (RFC 8446 §7.1) ---------------- */
+
+int tls13_compute_early_secret(const uint8_t* psk, size_t psk_len,
+                               uint8_t early_secret[32]) {
+    if (!early_secret) return -1;
+    /* early_secret = HKDF-Extract(salt=00..00, IKM=PSK or 00..00). */
+    uint8_t zero32[32] = {0};
+    const uint8_t* ikm     = psk     ? psk     : zero32;
+    size_t         ikm_len = psk     ? psk_len : sizeof(zero32);
+    if (psk && psk_len == 0) { ikm = zero32; ikm_len = sizeof(zero32); }
+    hkdf_extract(zero32, sizeof(zero32), ikm, ikm_len, early_secret);
+    return 0;
+}
+
+int tls13_compute_binder_key(const uint8_t early_secret[32],
+                             int is_external,
+                             uint8_t binder_key[32]) {
+    if (!early_secret || !binder_key) return -1;
+    /* binder_key = Derive-Secret(early_secret,
+     *               is_external ? "ext binder" : "res binder", "")
+     * "" -> hash of empty string. */
+    uint8_t empty_hash[32];
+    sha256("", 0, empty_hash);
+    const char* label = is_external ? "ext binder" : "res binder";
+    if (tls13_hkdf_expand_label(early_secret, label,
+                                empty_hash, sizeof(empty_hash),
+                                binder_key, 32) != 0) return -1;
+    return 0;
+}
+
+int tls13_compute_psk_binder(const uint8_t binder_key[32],
+                             const uint8_t partial_ch_hash[32],
+                             uint8_t binder_out[32]) {
+    if (!binder_key || !partial_ch_hash || !binder_out) return -1;
+    /* Per RFC 8446 §4.2.11.2 the binder is a Finished-style HMAC:
+     *   finished_key = HKDF-Expand-Label(binder_key, "finished", "", 32)
+     *   binder       = HMAC-SHA256(finished_key, partial_ch_hash)
+     * (We reuse tls13_compute_finished — same construction.) */
+    return tls13_compute_finished(binder_key, partial_ch_hash, binder_out);
+}
+
+int tls13_compute_client_early_traffic_secret(
+    const uint8_t early_secret[32],
+    const uint8_t transcript_hash_through_client_hello[32],
+    uint8_t       client_early_traffic_secret[32]) {
+    if (!early_secret || !transcript_hash_through_client_hello
+        || !client_early_traffic_secret) return -1;
+    /* Derive-Secret(early_secret, "c e traffic", H(CH)) */
+    if (tls13_hkdf_expand_label(early_secret, "c e traffic",
+                                transcript_hash_through_client_hello, 32,
+                                client_early_traffic_secret, 32) != 0) return -1;
+    return 0;
+}
+
+int tls13_compute_handshake_secrets_psk(const uint8_t* psk, size_t psk_len,
+                                        const uint8_t ecdhe_shared[32],
+                                        const uint8_t transcript_hash[32],
+                                        uint8_t handshake_secret[32],
+                                        uint8_t client_hs_traffic_secret[32],
+                                        uint8_t server_hs_traffic_secret[32]) {
+    /* Same derivation as tls13_compute_handshake_secrets, but the
+     * early_secret is extracted from a real PSK (rather than the
+     * all-zero IKM). RFC 8446 §7.1. */
+    uint8_t early_secret[32];
+    uint8_t derived[32];
+    uint8_t empty_hash[32];
+
+    if (tls13_compute_early_secret(psk, psk_len, early_secret) != 0) return -1;
+
+    sha256("", 0, empty_hash);
+    if (tls13_hkdf_expand_label(early_secret, "derived",
+                                empty_hash, sizeof(empty_hash),
+                                derived, sizeof(derived)) != 0) {
+        secure_zero(early_secret, sizeof(early_secret));
+        return -1;
+    }
+    secure_zero(early_secret, sizeof(early_secret));
+
+    hkdf_extract(derived, sizeof(derived),
+                 ecdhe_shared, 32, handshake_secret);
+
+    if (tls13_hkdf_expand_label(handshake_secret, "c hs traffic",
+                                transcript_hash, 32,
+                                client_hs_traffic_secret, 32) != 0) {
+        secure_zero(derived, sizeof(derived));
+        return -1;
+    }
+    if (tls13_hkdf_expand_label(handshake_secret, "s hs traffic",
+                                transcript_hash, 32,
+                                server_hs_traffic_secret, 32) != 0) {
+        secure_zero(derived, sizeof(derived));
+        return -1;
+    }
+    secure_zero(derived, sizeof(derived));
     return 0;
 }
