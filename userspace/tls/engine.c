@@ -52,6 +52,18 @@ int pw_tls_engine_configure_server(pw_tls_engine_t* eng,
     if (eng->state != PW_TLS_ST_HANDSHAKE) return -1;
     if (eng->hs_phase != PW_TLS_HS_WAIT_CH) return -1;
 
+    /* Validate cert chain fits in the per-message stack scratch the
+     * flight emitter uses (PW_TLS_ENGINE_CERT_MSG_MAX). Catching
+     * misconfiguration at config time is much friendlier than mid-
+     * handshake — the latter would expose us to peers seeing a
+     * partial handshake before we abort. */
+    size_t cert_msg_size = 4 + 1 + 3;       /* hdr + ctx_len + list_len */
+    for (unsigned i = 0; i < n_certs; i++) {
+        if (cert_lens[i] == 0 || cert_lens[i] > 0xFFFFFFu) return -1;
+        cert_msg_size += 3 + cert_lens[i] + 2;
+    }
+    if (cert_msg_size > PW_TLS_ENGINE_CERT_MSG_MAX) return -1;
+
     eng->rng_fn         = rng_fn;
     eng->rng_user       = rng_user;
     memcpy(eng->seed_ed25519, seed_ed25519, 32);
@@ -288,15 +300,31 @@ static int try_seal_one(pw_tls_engine_t* eng) {
 
 /* ----------------------- handshake driver (server) ----------------------- */
 
-/* Wipe handshake-context secrets after a fatal handshake error. The
- * engine is about to transition to FAILED; the caller will eventually
- * destroy it, but we don't want secrets sitting in memory in the
- * meantime. */
+/* Wipe handshake-context secrets AND any installed record-layer keys
+ * after a fatal handshake error or after a successful transition to
+ * APP. Caller is responsible for advancing state. */
 static void wipe_handshake_secrets(pw_tls_engine_t* eng) {
-    secure_zero(eng->eph_priv,            sizeof(eng->eph_priv));
-    secure_zero(eng->handshake_secret,    sizeof(eng->handshake_secret));
-    secure_zero(eng->cs_handshake_secret, sizeof(eng->cs_handshake_secret));
-    secure_zero(eng->ss_handshake_secret, sizeof(eng->ss_handshake_secret));
+    secure_zero(eng->eph_priv,             sizeof(eng->eph_priv));
+    secure_zero(eng->handshake_secret,     sizeof(eng->handshake_secret));
+    secure_zero(eng->cs_handshake_secret,  sizeof(eng->cs_handshake_secret));
+    secure_zero(eng->ss_handshake_secret,  sizeof(eng->ss_handshake_secret));
+    secure_zero(eng->master_secret,        sizeof(eng->master_secret));
+    secure_zero(eng->cs_app_traffic_secret, sizeof(eng->cs_app_traffic_secret));
+    secure_zero(eng->ss_app_traffic_secret, sizeof(eng->ss_app_traffic_secret));
+}
+
+/* Wipe ALL key material — secrets + installed record-layer keys/IVs
+ * + their sequence numbers. Used on fatal handshake failure so an
+ * engine in FAILED state retains no key material. */
+static void wipe_all_key_material(pw_tls_engine_t* eng) {
+    wipe_handshake_secrets(eng);
+    secure_zero(eng->read.key,         sizeof(eng->read.key));
+    secure_zero(eng->read.static_iv,   sizeof(eng->read.static_iv));
+    eng->read.seq = 0;
+    secure_zero(eng->write.key,        sizeof(eng->write.key));
+    secure_zero(eng->write.static_iv,  sizeof(eng->write.static_iv));
+    eng->write.seq = 0;
+    eng->keys_installed = 0;
 }
 
 /* Drive the server-side handshake: parse one inbound ClientHello,
@@ -454,10 +482,245 @@ static int try_drive_handshake_server(pw_tls_engine_t* eng) {
 
     eng->keys_installed = 1;
     eng->hs_phase       = PW_TLS_HS_AFTER_SH_KEYS;
-    /* state stays PW_TLS_ST_HANDSHAKE — Commit B will emit the
-     * encrypted EE/Cert/CV/Finished flight and transition to APP. */
+    /* state stays PW_TLS_ST_HANDSHAKE — the encrypted EE/Cert/CV/sFin
+     * flight is emitted by try_emit_server_flight on the next step
+     * (or this same step, see the loop in pw_tls_step). */
 
     /* Slide RX past the consumed CH record. */
+    buf_shift(eng->rx_buf, &eng->rx_len, total);
+    return 1;
+}
+
+/* Seal a single handshake-type message into TX as an encrypted record
+ * using eng->write (currently the server handshake-traffic key). The
+ * `msg` bytes are the raw handshake message (header + body); they are
+ * also fed into the running transcript before being sealed.
+ *
+ * Returns 0 on success, -1 on overflow / seal error. */
+static int seal_one_handshake_msg(pw_tls_engine_t* eng,
+                                  const uint8_t* msg, size_t msg_len) {
+    size_t need = TLS13_RECORD_HEADER_LEN + msg_len + 1 + TLS13_AEAD_TAG_LEN;
+    if (need > PW_TLS_BUF_CAP - eng->tx_len) return -1;
+
+    tls13_transcript_update(&eng->transcript, msg, msg_len);
+
+    size_t wrote = tls13_seal_record(&eng->write,
+                                     TLS_CT_HANDSHAKE,
+                                     TLS_CT_APPLICATION_DATA,
+                                     msg, msg_len,
+                                     eng->tx_buf + eng->tx_len,
+                                     PW_TLS_BUF_CAP - eng->tx_len);
+    if (wrote == 0) return -1;
+    eng->tx_len += wrote;
+    eng->records_out++;
+    return 0;
+}
+
+/* Emit the server's encrypted handshake flight: EE, Certificate,
+ * CertificateVerify, server Finished — all sealed under the server
+ * handshake-traffic key. After emission, derive + cache application
+ * traffic secrets, and transition hs_phase to AFTER_SF_AWAIT_CF.
+ *
+ * Returns 1 on transition, 0 if nothing to do (wrong phase) or TX
+ * is too full to fit the flight, -1 on fatal error. */
+static int try_emit_server_flight(pw_tls_engine_t* eng) {
+    if (eng->hs_phase != PW_TLS_HS_AFTER_SH_KEYS) return 0;
+    if (!eng->configured) return -1;
+
+    /* Conservative TX-room check: the four messages are all small
+     * except Certificate, which is bounded by the configured chain
+     * size. Sum: 4*(record_hdr+type+tag) + EE + Cert + CV + Fin
+     * worst case. We compute precise sizes below; if any seal
+     * fails on bounds we return -1 and FAILED. */
+
+    /* ---- EE ---- */
+    {
+        uint8_t ee[16];
+        int ee_len = tls13_build_encrypted_extensions(ee, sizeof(ee));
+        if (ee_len <= 0) return -1;
+        if (seal_one_handshake_msg(eng, ee, (size_t)ee_len) != 0) return -1;
+    }
+
+    /* ---- Certificate ---- */
+    {
+        /* Compute the exact certificate message size up front; we
+         * already validated this fits in PW_TLS_ENGINE_CERT_MSG_MAX
+         * at configure_server time, so this stack buffer is safe. */
+        size_t cert_msg_size = 4 + 1 + 3;
+        for (unsigned i = 0; i < eng->n_certs; i++) {
+            cert_msg_size += 3 + eng->cert_lens[i] + 2;
+        }
+        if (cert_msg_size > PW_TLS_ENGINE_CERT_MSG_MAX) return -1;
+
+        uint8_t cert_msg[PW_TLS_ENGINE_CERT_MSG_MAX];
+        int cert_len = tls13_build_certificate(cert_msg, sizeof(cert_msg),
+                                               eng->cert_chain_der,
+                                               eng->cert_lens,
+                                               eng->n_certs);
+        if (cert_len <= 0) return -1;
+        if (seal_one_handshake_msg(eng, cert_msg, (size_t)cert_len) != 0) return -1;
+    }
+
+    /* ---- CertificateVerify ---- */
+    {
+        /* CV signs the transcript hash through Certificate (the prior
+         * snapshot we just took before sealing), so snapshot now. */
+        uint8_t th_through_cert[32];
+        tls13_transcript_snapshot(&eng->transcript, th_through_cert);
+
+        uint8_t cv[128];
+        int cv_len = tls13_build_certificate_verify(cv, sizeof(cv),
+                                                    th_through_cert,
+                                                    eng->seed_ed25519);
+        secure_zero(th_through_cert, sizeof(th_through_cert));
+        if (cv_len <= 0) return -1;
+        if (seal_one_handshake_msg(eng, cv, (size_t)cv_len) != 0) return -1;
+    }
+
+    /* ---- server Finished ---- */
+    {
+        /* server Finished verify_data = HMAC(server_finished_key,
+         * H(CH..CV)). After sealing CV the transcript is at H(CH..CV). */
+        uint8_t th_through_cv[32];
+        tls13_transcript_snapshot(&eng->transcript, th_through_cv);
+
+        uint8_t verify_data[32];
+        if (tls13_compute_finished(eng->ss_handshake_secret,
+                                   th_through_cv,
+                                   verify_data) != 0) {
+            secure_zero(th_through_cv, sizeof(th_through_cv));
+            return -1;
+        }
+        secure_zero(th_through_cv, sizeof(th_through_cv));
+
+        uint8_t fin[4 + 32];
+        int fin_len = tls13_build_finished(fin, sizeof(fin), verify_data);
+        secure_zero(verify_data, sizeof(verify_data));
+        if (fin_len <= 0) return -1;
+        if (seal_one_handshake_msg(eng, fin, (size_t)fin_len) != 0) return -1;
+    }
+
+    /* ---- Derive + cache application secrets (T4 = H(CH..sFin)) ---- */
+    {
+        uint8_t th_through_sf[32];
+        tls13_transcript_snapshot(&eng->transcript, th_through_sf);
+
+        if (tls13_compute_application_secrets(eng->handshake_secret,
+                                              th_through_sf,
+                                              eng->master_secret,
+                                              eng->cs_app_traffic_secret,
+                                              eng->ss_app_traffic_secret) != 0) {
+            secure_zero(th_through_sf, sizeof(th_through_sf));
+            return -1;
+        }
+        secure_zero(th_through_sf, sizeof(th_through_sf));
+    }
+
+    eng->hs_phase = PW_TLS_HS_AFTER_SF_AWAIT_CF;
+    return 1;
+}
+
+/* Try to consume one inbound record while in AFTER_SF_AWAIT_CF phase.
+ *
+ * Three things can come in here:
+ *   1) A dummy ChangeCipherSpec record (RFC 8446 §D.4) — silently
+ *      consumed. Plain TLSPlaintext, content_type=20, body=0x01.
+ *   2) An encrypted handshake record containing the client Finished.
+ *      Decrypt with cs_handshake_traffic key, verify, transition to APP.
+ *   3) Anything else -> protocol error.
+ *
+ * Returns 1 on transition (cFin verified, state→APP), 0 on
+ * need-more-bytes, -1 on protocol/auth error. */
+static int try_recv_client_finished(pw_tls_engine_t* eng) {
+    if (eng->hs_phase != PW_TLS_HS_AFTER_SF_AWAIT_CF) return 0;
+    if (eng->rx_len < TLS13_RECORD_HEADER_LEN) return 0;
+
+    /* Compute snapshot transcript hash through server Finished BEFORE
+     * we feed the client Finished into the transcript (we don't, but
+     * staying explicit helps). The cs_finished verify_data is HMAC
+     * over T4 = H(CH..sFin). */
+
+    /* Peek at the record header. */
+    uint8_t  ct      = eng->rx_buf[0];
+    uint16_t rec_len = ((uint16_t)eng->rx_buf[3] << 8) | eng->rx_buf[4];
+    if (eng->rx_buf[1] != 0x03) return -1;
+    if (eng->rx_buf[2] != 0x03 && eng->rx_buf[2] != 0x01) return -1;
+    if (rec_len == 0 || rec_len > TLS13_MAX_CIPHERTEXT) return -1;
+    size_t total = TLS13_RECORD_HEADER_LEN + rec_len;
+    if (total > PW_TLS_BUF_CAP) return -1;
+    if (eng->rx_len < total) return 0;
+
+    /* Dummy ChangeCipherSpec — RFC 8446 §D.4 compat-mode. Always
+     * exactly one byte of value 0x01. Silently drop and signal the
+     * step loop to retry (the next record may be the cFin). */
+    if (ct == TLS_CT_CHANGE_CIPHER_SPEC) {
+        if (rec_len != 1 || eng->rx_buf[TLS13_RECORD_HEADER_LEN] != 0x01) return -1;
+        buf_shift(eng->rx_buf, &eng->rx_len, total);
+        return 1;   /* made progress; loop will re-enter and process cFin */
+    }
+
+    /* Otherwise it must be the encrypted client Finished. The wire
+     * outer type for any encrypted TLS 1.3 record is APPLICATION_DATA. */
+    if (ct != TLS_CT_APPLICATION_DATA) return -1;
+
+    tls_content_type_t inner = TLS_CT_INVALID;
+    uint8_t* pt = NULL;
+    size_t   pt_len = 0;
+    if (tls13_open_record(&eng->read, eng->rx_buf, total,
+                          &inner, &pt, &pt_len) != 0) return -1;
+
+    if (inner != TLS_CT_HANDSHAKE)            return -1;
+    /* Finished message header: 0x14 + 24-bit length = 32. */
+    if (pt_len != 4 + 32)                     return -1;
+    if (pt[0] != 0x14)                        return -1;
+    if (pt[1] != 0x00 || pt[2] != 0x00 || pt[3] != 0x20) return -1;
+
+    /* Verify against transcript-through-server-Finished + the client
+     * handshake-traffic secret. */
+    uint8_t th_through_sf[32];
+    tls13_transcript_snapshot(&eng->transcript, th_through_sf);
+    if (tls13_verify_finished(eng->cs_handshake_secret,
+                              th_through_sf,
+                              pt + 4) != 0) {
+        secure_zero(th_through_sf, sizeof(th_through_sf));
+        return -1;
+    }
+    secure_zero(th_through_sf, sizeof(th_through_sf));
+
+    /* Feed the client Finished into the transcript. We don't need it
+     * for this spike's secret derivations (we do not implement
+     * resumption_master_secret), but it keeps the transcript honest
+     * for any post-handshake messages. */
+    tls13_transcript_update(&eng->transcript, pt, pt_len);
+
+    /* Switch read+write to application-traffic keys. */
+    {
+        uint8_t k[32], iv[12];
+        tls13_derive_traffic_keys(eng->cs_app_traffic_secret, k, iv);
+        memcpy(eng->read.key,        k,  32);
+        memcpy(eng->read.static_iv,  iv, 12);
+        eng->read.seq = 0;
+
+        tls13_derive_traffic_keys(eng->ss_app_traffic_secret, k, iv);
+        memcpy(eng->write.key,       k,  32);
+        memcpy(eng->write.static_iv, iv, 12);
+        eng->write.seq = 0;
+
+        secure_zero(k,  sizeof(k));
+        secure_zero(iv, sizeof(iv));
+    }
+
+    /* Wipe handshake-only secrets. (Application traffic secrets stay
+     * in case we ever implement KeyUpdate; that's a refinement.) */
+    secure_zero(eng->handshake_secret,    sizeof(eng->handshake_secret));
+    secure_zero(eng->cs_handshake_secret, sizeof(eng->cs_handshake_secret));
+    secure_zero(eng->ss_handshake_secret, sizeof(eng->ss_handshake_secret));
+
+    eng->state    = PW_TLS_ST_APP;
+    /* hs_phase remains AFTER_SF_AWAIT_CF — but it's no longer
+     * meaningful in APP state. */
+
+    /* Slide RX past consumed cFin record. */
     buf_shift(eng->rx_buf, &eng->rx_len, total);
     return 1;
 }
@@ -466,22 +729,39 @@ int pw_tls_step(pw_tls_engine_t* eng) {
     if (!eng) return -1;
     if (eng->state == PW_TLS_ST_FAILED) return -1;
     if (eng->state == PW_TLS_ST_HANDSHAKE) {
-        /* Drive the handshake forward. For the spike, only the
-         * server-side path is implemented (CH -> SH + install
-         * handshake-traffic keys). A client engine without a
-         * configure_server will simply no-op here, matching the
-         * old behaviour. */
-        int rc;
-        do {
-            rc = try_drive_handshake_server(eng);
-            if (rc < 0) {
-                wipe_handshake_secrets(eng);
-                eng->state = PW_TLS_ST_FAILED;
-                return -1;
-            }
-        } while (rc == 1 && eng->state == PW_TLS_ST_HANDSHAKE
-                         && eng->hs_phase == PW_TLS_HS_WAIT_CH);
+        /* Drive the handshake forward. Each helper is a no-op outside
+         * its own phase, so calling them in order walks WAIT_CH ->
+         * AFTER_SH_KEYS -> AFTER_SF_AWAIT_CF -> APP without needing a
+         * dispatch table. */
+        for (int spin = 0; spin < 8; spin++) {
+            int rc = try_drive_handshake_server(eng);
+            if (rc < 0) goto fail;
+            if (rc > 0) continue;
+
+            rc = try_emit_server_flight(eng);
+            if (rc < 0) goto fail;
+            if (rc > 0) continue;
+
+            rc = try_recv_client_finished(eng);
+            if (rc < 0) goto fail;
+            if (rc > 0) continue;
+
+            /* No phase made progress this round — wait for more I/O. */
+            break;
+        }
         return (int)pw_tls_want(eng);
+
+      fail:
+        /* On any fatal handshake failure: wipe ALL key material AND
+         * drop any partially-emitted bytes from TX. The engine MUST
+         * NOT expose half-emitted handshake records to a caller that
+         * reads pw_tls_tx_buf after we go FAILED. (Rubber-duck blocker
+         * #1 from the Commit B critique.) */
+        wipe_all_key_material(eng);
+        eng->tx_len     = 0;
+        eng->app_in_len = 0;
+        eng->state      = PW_TLS_ST_FAILED;
+        return -1;
     }
 
     /* Drain RX -> APP_IN, one record at a time, until empty / blocked. */

@@ -47,6 +47,12 @@
  * keeps the engine struct trivially aligned and predictable. */
 #define PW_TLS_BUF_CAP  (TLS13_RECORD_HEADER_LEN + TLS13_MAX_CIPHERTEXT)
 
+/* Maximum size of the Certificate handshake message the engine will
+ * build (includes the 4-byte handshake header). 8 KiB is more than
+ * enough for one or two real certs of typical size; a chain too large
+ * to fit is rejected at configure_server time. */
+#define PW_TLS_ENGINE_CERT_MSG_MAX 8192u
+
 typedef enum {
     PW_TLS_ST_HANDSHAKE = 0,   /* no app keys yet, can't process records   */
     PW_TLS_ST_APP       = 1,   /* keys installed, processing app data      */
@@ -57,8 +63,10 @@ typedef enum {
 /* Sub-state inside HANDSHAKE — tracks where we are in the handshake
  * flight. Only meaningful while state == PW_TLS_ST_HANDSHAKE. */
 typedef enum {
-    PW_TLS_HS_WAIT_CH        = 0,  /* server: waiting for ClientHello       */
-    PW_TLS_HS_AFTER_SH_KEYS  = 1,  /* server: SH sent, hs traffic keys in   */
+    PW_TLS_HS_WAIT_CH         = 0,  /* server: waiting for ClientHello       */
+    PW_TLS_HS_AFTER_SH_KEYS   = 1,  /* server: SH sent, hs traffic keys in   */
+    PW_TLS_HS_AFTER_SF_AWAIT_CF = 2,/* server: EE/Cert/CV/sFin sent, app
+                                       secrets cached; awaiting client Fin  */
 } pw_tls_hs_phase_t;
 
 /* Bitmask returned by pw_tls_want(). The caller checks these to know
@@ -124,6 +132,13 @@ typedef struct pw_tls_engine {
     uint8_t           handshake_secret[32];
     uint8_t           cs_handshake_secret[32];   /* client -> server */
     uint8_t           ss_handshake_secret[32];   /* server -> client */
+
+    /* Application-phase secrets (cached after sFin emission, used to
+     * derive the read+write app keys after the client Finished is
+     * verified). */
+    uint8_t           master_secret[32];
+    uint8_t           cs_app_traffic_secret[32];
+    uint8_t           ss_app_traffic_secret[32];
 
     /* Diagnostics. */
     uint64_t records_in;

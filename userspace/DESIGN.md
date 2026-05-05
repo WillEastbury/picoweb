@@ -547,11 +547,23 @@ and calling `pw_tls_step` will:
 8. Wipe `eph_priv` and `shared`.
 9. Emit the SH as a plaintext TLS record into TX.
 
-State stays `HANDSHAKE`; an internal `hs_phase` advances from
-`WAIT_CH` → `AFTER_SH_KEYS`. Commit B will emit the encrypted
-EE / Cert / CV / Finished flight from `AFTER_SH_KEYS`, receive the
-client Finished, derive application traffic secrets, and finally
-transition to APP.
+State stays `HANDSHAKE`; an internal `hs_phase` walks
+`WAIT_CH` → `AFTER_SH_KEYS` → `AFTER_SF_AWAIT_CF`. Within a single
+`pw_tls_step()` call after the CH lands, the engine drives
+`try_drive_handshake_server` (CH→SH+keys), then
+`try_emit_server_flight` (encrypted EE / Cert / CV / sFin sealed
+under the server handshake-traffic key, and application-traffic
+secrets derived + cached), then sits in `AFTER_SF_AWAIT_CF` waiting
+for the client Finished. Inbound dummy ChangeCipherSpec records
+(RFC 8446 §D.4 compat-mode) are silently consumed in this phase.
+Once the client Finished verifies, the engine swaps `read`/`write`
+to application-traffic keys (both `seq` reset to 0), wipes all
+handshake-phase secrets, and transitions to `APP`.
+
+On any fatal handshake failure the engine wipes ALL key material
+(handshake + installed record-layer keys) AND clears `tx_len`, so a
+caller that reads `pw_tls_tx_buf` after a failure sees no bytes —
+i.e. partial encrypted handshake records are never flushable.
 
 **Want bits** are the only thing the I/O loop needs to look at:
 - `WANT_RX`: room in the RX buffer; safe to `recv()`.
@@ -690,16 +702,13 @@ future verify path for mTLS) can construct it directly.
 
 This is the running TODO for what's blocking real-traffic readiness.
 
-- **Drive engine through full handshake**. CH parse → SH +
-  install handshake-traffic keys (server side) is in
-  (`pw_tls_engine_configure_server` + the new server-side handshake
-  driver in `engine.c`). What's left:
-  - Emit encrypted EE / Cert / CV / Finished flight from
-    `AFTER_SH_KEYS`.
-  - Tolerate inbound dummy CCS records (RFC 8446 §D.4 compat-mode).
-  - Receive client Finished, verify, derive application traffic
-    secrets, transition state→APP, delete the spike-mode
-    `install_app_keys` shortcut.
+- **Migrate `pw_conn` to the engine**. The legacy run-to-completion
+  path in `pw_conn.c` (RX → tls13_open_record → handler → tls13_seal_record
+  → TX) duplicates engine logic; switch it to a thin user of `pw_tls_step`
+  and delete the duplicate seal/open glue.
+- **Delete or test-only-flag `pw_tls_engine_install_app_keys`**. It
+  was a spike shortcut; with the full handshake driver landed it is
+  unused except by the early `test_tls_engine` bootstrap test.
 - **Receive-window-driven backpressure** on the TCP layer
   (rubber-duck'd: "no ACK = backpressure" was wrong; the right answer
   is to advertise zero `rcv_wnd` and support persist).

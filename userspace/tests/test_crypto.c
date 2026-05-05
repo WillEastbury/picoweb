@@ -3115,22 +3115,26 @@ static void test_engine_handshake_server(void) {
              { printf("  PASS: state still HANDSHAKE\n"); g_pass++; }
         else { printf("  FAIL: state=%d\n", pw_tls_state(eng)); g_fail++; }
 
-        if (pw_tls_hs_phase(eng) == PW_TLS_HS_AFTER_SH_KEYS)
-             { printf("  PASS: hs_phase advanced to AFTER_SH_KEYS\n"); g_pass++; }
+        /* The engine drives forward in a single step: CH -> SH ->
+         * install hs keys -> emit encrypted EE/Cert/CV/sFin. After
+         * that it sits in AFTER_SF_AWAIT_CF waiting for client Fin. */
+        if (pw_tls_hs_phase(eng) == PW_TLS_HS_AFTER_SF_AWAIT_CF)
+             { printf("  PASS: hs_phase advanced to AFTER_SF_AWAIT_CF\n"); g_pass++; }
         else { printf("  FAIL: hs_phase=%d\n", pw_tls_hs_phase(eng)); g_fail++; }
 
         if (eng->keys_installed)
              { printf("  PASS: handshake-traffic keys installed\n"); g_pass++; }
         else { printf("  FAIL: keys_installed=0\n"); g_fail++; }
 
-        /* TX must contain a plaintext SH record. */
+        /* TX: first record is the plaintext SH; then 4 encrypted
+         * application_data records (EE, Cert, CV, sFin). */
         size_t tx_len;
         const uint8_t* tx = pw_tls_tx_buf(eng, &tx_len);
         int sh_ok = (tx_len >= TLS13_RECORD_HEADER_LEN + 4)
                  && tx[0] == TLS_CT_HANDSHAKE
                  && tx[1] == 0x03 && tx[2] == 0x03
                  && tx[TLS13_RECORD_HEADER_LEN] == 0x02; /* server_hello */
-        if (sh_ok) { printf("  PASS: TX has plaintext SH record\n"); g_pass++; }
+        if (sh_ok) { printf("  PASS: TX[0] is plaintext SH record\n"); g_pass++; }
         else       { printf("  FAIL: TX[0..]=%02x %02x %02x ... [hdr_msg]=%02x\n",
                             tx[0],tx[1],tx[2],
                             tx_len > TLS13_RECORD_HEADER_LEN ?
@@ -3145,6 +3149,24 @@ static void test_engine_handshake_server(void) {
             else         { printf("  FAIL: SH session_id len=%u\n", tx[43]); g_fail++; }
         } else {
             printf("  FAIL: SH too short for session_id check\n"); g_fail++;
+        }
+
+        /* After SH there must be 4 encrypted application_data records
+         * (EE, Cert, CV, sFin). Don't decrypt — that's the integration
+         * test's job. Just count them. */
+        {
+            uint16_t sh_body = ((uint16_t)tx[3] << 8) | tx[4];
+            size_t off = TLS13_RECORD_HEADER_LEN + sh_body;
+            int n_enc = 0;
+            while (off + TLS13_RECORD_HEADER_LEN <= tx_len) {
+                if (tx[off] != TLS_CT_APPLICATION_DATA) break;
+                uint16_t rl = ((uint16_t)tx[off+3] << 8) | tx[off+4];
+                if (off + TLS13_RECORD_HEADER_LEN + rl > tx_len) break;
+                off += TLS13_RECORD_HEADER_LEN + rl;
+                n_enc++;
+            }
+            if (n_enc == 4) { printf("  PASS: 4 encrypted records follow SH (EE/Cert/CV/sFin)\n"); g_pass++; }
+            else            { printf("  FAIL: %d encrypted records after SH\n", n_enc); g_fail++; }
         }
 
         /* Independently re-derive the read+write keys and verify they
@@ -3188,18 +3210,22 @@ static void test_engine_handshake_server(void) {
                         && memcmp(eng->read.static_iv, ivref, 12) == 0
                         && eng->read.seq == 0;
             tls13_derive_traffic_keys(ss_hs, kref, ivref);
+            /* eng->write has sealed 4 encrypted handshake records by
+             * now (EE/Cert/CV/sFin) so seq has advanced to 4; the key
+             * and iv are still the server-handshake-traffic ones. */
             int write_ok = memcmp(eng->write.key, kref, 32) == 0
                         && memcmp(eng->write.static_iv, ivref, 12) == 0
-                        && eng->write.seq == 0;
+                        && eng->write.seq == 4;
             if (read_ok)  { printf("  PASS: engine.read keys match independent derive\n"); g_pass++; }
             else          { printf("  FAIL: engine.read keys mismatch\n"); g_fail++; }
             if (write_ok) { printf("  PASS: engine.write keys match independent derive\n"); g_pass++; }
-            else          { printf("  FAIL: engine.write keys mismatch\n"); g_fail++; }
+            else          { printf("  FAIL: engine.write keys mismatch (seq=%llu)\n",
+                                  (unsigned long long)eng->write.seq); g_fail++; }
 
-            /* The SH bytes the engine emitted should also match our
-             * reference SH byte-for-byte (deterministic RNG -> same
-             * server_random and same server_pub). */
-            if (tx_len == TLS13_RECORD_HEADER_LEN + (size_t)ref_sh_len
+            /* The first record's SH bytes the engine emitted should
+             * match our reference SH byte-for-byte (deterministic RNG
+             * -> same server_random and same server_pub). */
+            if (tx_len >= TLS13_RECORD_HEADER_LEN + (size_t)ref_sh_len
                 && memcmp(tx + TLS13_RECORD_HEADER_LEN, ref_sh, (size_t)ref_sh_len) == 0)
                  { printf("  PASS: emitted SH matches reference byte-for-byte\n"); g_pass++; }
             else { printf("  FAIL: SH bytes differ from reference\n"); g_fail++; }
@@ -3344,6 +3370,677 @@ static void test_engine_handshake_server(void) {
     }
 }
 
+/* ============================================================
+ *  Full TLS 1.3 server-side handshake roundtrip through the engine.
+ *  The test mirrors a real client by:
+ *   - generating an X25519 keypair
+ *   - building a CH and pushing to the engine
+ *   - parsing the SH the engine emits, deriving handshake secrets
+ *   - decrypting EE/Cert/CV/sFin, verifying CV signature + sFin
+ *   - deriving app secrets independently
+ *   - building + encrypting client Finished, pushing to engine RX
+ *   - asserting state transitions to APP and engine app-keys match
+ *   - sending one app-data record from "client" to "server", asserting
+ *     the engine surfaces the plaintext via APP_IN
+ * ============================================================ */
+static void test_engine_handshake_roundtrip(void) {
+    printf("== TLS engine: full server handshake roundtrip ==\n");
+
+    /* ---- Server identity: deterministic ed25519 seed (not secret in
+     * this test). The engine uses this to sign CV. ---- */
+    uint8_t srv_seed[32];
+    for (int i = 0; i < 32; i++) srv_seed[i] = 0x40 + (uint8_t)i;
+    uint8_t srv_pub[32];
+    ed25519_pubkey_from_seed(srv_pub, srv_seed);
+
+    /* Build a fake DER cert chain. The engine just shovels these
+     * bytes into the Certificate handshake message; we check the
+     * length round-trip but never parse them as real ASN.1. */
+    const uint8_t fake_cert[64] = {
+        0x30, 0x3e, 0x05, 0x00, /* trivial-looking SEQUENCE+NULL */
+        0xde, 0xad, 0xbe, 0xef, 0xca, 0xfe, 0xba, 0xbe,
+    };
+    const uint8_t* cert_chain = fake_cert;
+    size_t         cert_lens[1]  = { sizeof(fake_cert) };
+
+    /* ---- Client identity: hard-wired X25519 priv (RFC 7748 §6.1
+     * Alice's private key would do, but any 32 bytes are fine).
+     * Compute pub via x25519(priv, base). ---- */
+    uint8_t cli_priv[32];
+    for (int i = 0; i < 32; i++) cli_priv[i] = 0x77 ^ (uint8_t)i;
+    cli_priv[0]  &= 248;
+    cli_priv[31] &= 127;
+    cli_priv[31] |= 64;
+    uint8_t cli_pub[32];
+    x25519(cli_pub, cli_priv, X25519_BASE_POINT);
+
+    /* ---- Configure the engine. Deterministic test_rng so both
+     * server_random and the server's eph priv are reproducible. ---- */
+    pw_tls_engine_t* eng = malloc(sizeof(*eng));
+    pw_tls_engine_init(eng);
+    test_rng_state_t rng_st = { .next = 0 };
+    if (pw_tls_engine_configure_server(eng, test_rng, &rng_st, srv_seed,
+                                       cert_chain, cert_lens, 1) == 0)
+         { printf("  PASS: configure_server\n"); g_pass++; }
+    else { printf("  FAIL: configure_server\n"); g_fail++; free(eng); return; }
+
+    /* The two random reads test_rng will satisfy from server side
+     * (server_random[32], then server_eph_priv[32]) come out as
+     * 0..31 and 32..63 thanks to the counter RNG. */
+    uint8_t srv_random_expected[32];
+    uint8_t srv_eph_priv_clamped[32];
+    {
+        test_rng_state_t r = { .next = 0 };
+        test_rng(&r, srv_random_expected, 32);
+        test_rng(&r, srv_eph_priv_clamped, 32);
+        srv_eph_priv_clamped[0]  &= 248;
+        srv_eph_priv_clamped[31] &= 127;
+        srv_eph_priv_clamped[31] |= 64;
+    }
+    uint8_t srv_pub_eph[32];
+    x25519(srv_pub_eph, srv_eph_priv_clamped, X25519_BASE_POINT);
+    uint8_t shared[32];
+    x25519(shared, cli_priv, srv_pub_eph);
+
+    /* ---- Build CH and feed it to the engine. ---- */
+    uint8_t  ch_rec[2048];
+    uint8_t  sid[32]; for (int i = 0; i < 32; i++) sid[i] = 0xa0 + (uint8_t)i;
+    size_t   ch_len = build_test_ch_record(ch_rec, sizeof(ch_rec),
+                                           cli_pub, sid, 32,
+                                           "example.com", 1, 1);
+    if (ch_len == 0) { printf("  FAIL: build CH\n"); g_fail++; free(eng); return; }
+
+    size_t cap; uint8_t* rx = pw_tls_rx_buf(eng, &cap);
+    memcpy(rx, ch_rec, ch_len); pw_tls_rx_ack(eng, ch_len);
+
+    int want = pw_tls_step(eng);
+    if (want >= 0 && pw_tls_state(eng) == PW_TLS_ST_HANDSHAKE
+                  && pw_tls_hs_phase(eng) == PW_TLS_HS_AFTER_SF_AWAIT_CF)
+         { printf("  PASS: engine drove CH -> AFTER_SF_AWAIT_CF\n"); g_pass++; }
+    else { printf("  FAIL: want=%d state=%d phase=%d\n",
+                  want, pw_tls_state(eng), pw_tls_hs_phase(eng));
+           g_fail++; free(eng); return; }
+
+    /* ---- Parse the SH: skip past record header, then walk the
+     * server_hello extensions to find key_share -> server pub. We
+     * already know what server_pub_eph is (computed independently)
+     * but we still want to assert it matches what the engine put on
+     * the wire. ---- */
+    size_t tx_len; const uint8_t* tx = pw_tls_tx_buf(eng, &tx_len);
+    if (tx_len < 5 || tx[0] != TLS_CT_HANDSHAKE)
+         { printf("  FAIL: SH header\n"); g_fail++; free(eng); return; }
+    uint16_t sh_body = ((uint16_t)tx[3] << 8) | tx[4];
+    if ((size_t)sh_body + 5 > tx_len)
+         { printf("  FAIL: SH truncated\n"); g_fail++; free(eng); return; }
+    const uint8_t* sh_msg = tx + 5;            /* server_hello handshake msg */
+    size_t sh_msg_len     = sh_body;
+
+    /* sanity: msg type=0x02 + 24-bit len matches body-4 */
+    if (sh_msg[0] != 0x02) { printf("  FAIL: SH msg_type\n"); g_fail++; free(eng); return; }
+
+    /* Handshake transcript: client side, in parallel with the
+     * engine's. */
+    tls13_transcript_t cli_ts;
+    tls13_transcript_init(&cli_ts);
+
+    /* CH body inside the record we built starts at offset 5. */
+    tls13_transcript_update(&cli_ts, ch_rec + 5, ch_len - 5);
+    /* Then SH msg. */
+    tls13_transcript_update(&cli_ts, sh_msg, sh_msg_len);
+
+    /* ---- Derive handshake secrets independently and confirm they
+     * match what the engine installed (eng->read uses cs_hs key,
+     * eng->write uses ss_hs key). ---- */
+    uint8_t T1[32];
+    tls13_transcript_snapshot(&cli_ts, T1);
+    uint8_t hs_secret[32], cs_hs[32], ss_hs[32];
+    if (tls13_compute_handshake_secrets(shared, T1, hs_secret, cs_hs, ss_hs) != 0)
+         { printf("  FAIL: derive hs secrets\n"); g_fail++; free(eng); return; }
+
+    /* ---- Decrypt the four encrypted records that follow the SH. ---- */
+    tls_record_dir_t cli_read = {0};   /* mirrors the server's WRITE direction */
+    tls13_derive_traffic_keys(ss_hs, cli_read.key, cli_read.static_iv);
+    cli_read.seq = 0;
+
+    /* Walk records starting at offset 5 + sh_body. Need a scratch
+     * copy to decrypt in place. */
+    size_t off = 5 + sh_body;
+    int got_ee = 0, got_cert = 0, got_cv = 0, got_fin = 0;
+    uint8_t srv_cv_sig[64];
+    uint8_t srv_fin_vd[32];
+
+    /* T2 transcript snapshot (through Cert) needed to verify CV. */
+    uint8_t T2_through_cert[32] = {0};
+
+    while (off + 5 <= tx_len) {
+        uint16_t rl = ((uint16_t)tx[off+3] << 8) | tx[off+4];
+        if (off + 5 + rl > tx_len) break;
+        if (tx[off] != TLS_CT_APPLICATION_DATA) break;
+
+        /* Copy this record into a scratch buffer because tls13_open
+         * mutates in place. */
+        uint8_t scratch[2048];
+        if ((size_t)rl + 5 > sizeof(scratch))
+             { printf("  FAIL: encrypted record too big\n"); g_fail++; free(eng); return; }
+        memcpy(scratch, tx + off, 5 + rl);
+
+        tls_content_type_t inner = TLS_CT_INVALID;
+        uint8_t* pt = NULL; size_t pt_len = 0;
+        if (tls13_open_record(&cli_read, scratch, 5 + rl,
+                              &inner, &pt, &pt_len) != 0)
+             { printf("  FAIL: open record at off=%zu\n", off); g_fail++; free(eng); return; }
+        if (inner != TLS_CT_HANDSHAKE)
+             { printf("  FAIL: inner type %d\n", (int)inner); g_fail++; free(eng); return; }
+
+        /* Update client-side transcript with the plaintext handshake msg. */
+        tls13_transcript_update(&cli_ts, pt, pt_len);
+
+        /* Identify by handshake msg type byte. */
+        switch (pt[0]) {
+            case 0x08: got_ee = 1; break;
+            case 0x0b:
+                got_cert = 1;
+                /* Snapshot transcript through Cert for CV verify. */
+                tls13_transcript_snapshot(&cli_ts, T2_through_cert);
+                break;
+            case 0x0f:
+                got_cv = 1;
+                /* CV body: hs hdr 4 + sig_scheme 2 + sig_len 2 + sig 64. */
+                if (pt_len < 4 + 2 + 2 + 64)
+                     { printf("  FAIL: CV size\n"); g_fail++; free(eng); return; }
+                if (pt[4] != 0x08 || pt[5] != 0x07) /* ed25519 */
+                     { printf("  FAIL: CV scheme %02x%02x\n", pt[4],pt[5]); g_fail++; free(eng); return; }
+                memcpy(srv_cv_sig, pt + 8, 64);
+                break;
+            case 0x14:
+                got_fin = 1;
+                if (pt_len != 4 + 32)
+                     { printf("  FAIL: sFin size %zu\n", pt_len); g_fail++; free(eng); return; }
+                memcpy(srv_fin_vd, pt + 4, 32);
+                break;
+            default:
+                printf("  FAIL: unknown hs msg %02x\n", pt[0]); g_fail++; free(eng); return;
+        }
+
+        off += 5 + rl;
+    }
+
+    if (got_ee && got_cert && got_cv && got_fin)
+         { printf("  PASS: decrypted EE+Cert+CV+sFin from engine\n"); g_pass++; }
+    else { printf("  FAIL: missing msgs ee=%d cert=%d cv=%d fin=%d\n",
+                  got_ee, got_cert, got_cv, got_fin); g_fail++; free(eng); return; }
+
+    /* ---- Verify CV signature against derived server pubkey + the
+     * transcript snapshot through Cert. ---- */
+    {
+        uint8_t signed_data[TLS13_CV_SIGNED_LEN];
+        if (tls13_build_certificate_verify_signed_data(signed_data,
+                                                       T2_through_cert,
+                                                       1 /*is_server*/) != 0)
+             { printf("  FAIL: CV signed data\n"); g_fail++; free(eng); return; }
+        if (ed25519_verify(srv_cv_sig, signed_data, sizeof(signed_data), srv_pub) == 1)
+             { printf("  PASS: CV signature verifies against server Ed25519 pubkey\n"); g_pass++; }
+        else { printf("  FAIL: CV signature\n"); g_fail++; free(eng); return; }
+    }
+
+    /* ---- Verify server Finished. T3 = transcript through CV (we
+     * already have that captured as T2_through_cert WAS through
+     * Certificate; we need a fresh snapshot — but our running
+     * transcript has since been updated with CV and sFin too).
+     *
+     * Workaround: re-derive T3 by feeding only CH..CV into a fresh
+     * transcript. Faster trick: tls13_verify_finished + the running
+     * transcript snapshot taken *before* sFin was added.  Since we
+     * already updated the transcript with sFin, recompute. ---- */
+    {
+        tls13_transcript_t ts2;
+        tls13_transcript_init(&ts2);
+        tls13_transcript_update(&ts2, ch_rec + 5, ch_len - 5);
+        tls13_transcript_update(&ts2, sh_msg, sh_msg_len);
+        /* re-walk decrypted msgs but stop after CV */
+        size_t off2 = 5 + sh_body;
+        int seen_cv = 0;
+        while (off2 + 5 <= tx_len && !seen_cv) {
+            uint16_t rl = ((uint16_t)tx[off2+3] << 8) | tx[off2+4];
+            uint8_t scratch[2048];
+            memcpy(scratch, tx + off2, 5 + rl);
+            tls_record_dir_t tmp = {0};
+            tls13_derive_traffic_keys(ss_hs, tmp.key, tmp.static_iv);
+            /* compute the right seq for this position */
+            tmp.seq = 0;
+            for (size_t o3 = 5 + sh_body; o3 < off2; ) {
+                uint16_t rl3 = ((uint16_t)tx[o3+3] << 8) | tx[o3+4];
+                tmp.seq++;
+                o3 += 5 + rl3;
+            }
+            tls_content_type_t inner; uint8_t* pt; size_t pl;
+            tls13_open_record(&tmp, scratch, 5 + rl, &inner, &pt, &pl);
+            tls13_transcript_update(&ts2, pt, pl);
+            if (pt[0] == 0x0f) seen_cv = 1;
+            off2 += 5 + rl;
+        }
+        uint8_t T3[32];
+        tls13_transcript_snapshot(&ts2, T3);
+        if (tls13_verify_finished(ss_hs, T3, srv_fin_vd) == 0)
+             { printf("  PASS: server Finished verifies\n"); g_pass++; }
+        else { printf("  FAIL: server Finished\n"); g_fail++; free(eng); return; }
+    }
+
+    /* ---- Compute T4 = transcript through sFin (current cli_ts state).
+     * Derive app secrets. ---- */
+    uint8_t T4[32];
+    tls13_transcript_snapshot(&cli_ts, T4);
+    uint8_t master[32], cs_app[32], ss_app[32];
+    if (tls13_compute_application_secrets(hs_secret, T4, master, cs_app, ss_app) != 0)
+         { printf("  FAIL: derive app secrets\n"); g_fail++; free(eng); return; }
+
+    /* ---- Build client Finished and seal under cs_hs. Push to engine RX. ---- */
+    {
+        uint8_t cfin_vd[32];
+        if (tls13_compute_finished(cs_hs, T4, cfin_vd) != 0)
+             { printf("  FAIL: cFin compute\n"); g_fail++; free(eng); return; }
+        uint8_t cfin_msg[4 + 32];
+        int cfin_len = tls13_build_finished(cfin_msg, sizeof(cfin_msg), cfin_vd);
+        if (cfin_len <= 0) { printf("  FAIL: cFin build\n"); g_fail++; free(eng); return; }
+
+        tls_record_dir_t cli_write = {0};
+        tls13_derive_traffic_keys(cs_hs, cli_write.key, cli_write.static_iv);
+        cli_write.seq = 0;
+
+        uint8_t sealed[256];
+        size_t sw = tls13_seal_record(&cli_write,
+                                      TLS_CT_HANDSHAKE,
+                                      TLS_CT_APPLICATION_DATA,
+                                      cfin_msg, (size_t)cfin_len,
+                                      sealed, sizeof(sealed));
+        if (sw == 0) { printf("  FAIL: seal cFin\n"); g_fail++; free(eng); return; }
+
+        /* Drop into engine RX. The engine's RX is empty after consuming
+         * the CH, so this should fit. */
+        size_t rcap; uint8_t* rrx = pw_tls_rx_buf(eng, &rcap);
+        if (sw > rcap) { printf("  FAIL: cFin too big for RX\n"); g_fail++; free(eng); return; }
+        memcpy(rrx, sealed, sw); pw_tls_rx_ack(eng, sw);
+
+        int w = pw_tls_step(eng);
+        if (w >= 0 && pw_tls_state(eng) == PW_TLS_ST_APP)
+             { printf("  PASS: engine transitioned to APP after cFin\n"); g_pass++; }
+        else { printf("  FAIL: state=%d phase=%d w=%d\n",
+                      pw_tls_state(eng), pw_tls_hs_phase(eng), w);
+               g_fail++; free(eng); return; }
+    }
+
+    /* ---- Engine should now have read/write keys = app traffic.
+     * Verify by independent derive + memcmp (read should be cs_app
+     * with seq=0; write should be ss_app with seq=0). ---- */
+    {
+        uint8_t kref[32], ivref[12];
+        tls13_derive_traffic_keys(cs_app, kref, ivref);
+        if (memcmp(eng->read.key, kref, 32) == 0
+            && memcmp(eng->read.static_iv, ivref, 12) == 0
+            && eng->read.seq == 0)
+             { printf("  PASS: engine.read = client_app_traffic key, seq=0\n"); g_pass++; }
+        else { printf("  FAIL: engine.read mismatch (seq=%llu)\n",
+                      (unsigned long long)eng->read.seq); g_fail++; }
+        tls13_derive_traffic_keys(ss_app, kref, ivref);
+        if (memcmp(eng->write.key, kref, 32) == 0
+            && memcmp(eng->write.static_iv, ivref, 12) == 0
+            && eng->write.seq == 0)
+             { printf("  PASS: engine.write = server_app_traffic key, seq=0\n"); g_pass++; }
+        else { printf("  FAIL: engine.write mismatch (seq=%llu)\n",
+                      (unsigned long long)eng->write.seq); g_fail++; }
+    }
+
+    /* ---- App data roundtrip: encrypt "hello" with cs_app, push,
+     * step, drain APP_IN. ---- */
+    {
+        tls_record_dir_t cli_app_w = {0};
+        tls13_derive_traffic_keys(cs_app, cli_app_w.key, cli_app_w.static_iv);
+        cli_app_w.seq = 0;
+
+        const char* msg = "hello";
+        uint8_t sealed[64];
+        size_t sw = tls13_seal_record(&cli_app_w,
+                                      TLS_CT_APPLICATION_DATA,
+                                      TLS_CT_APPLICATION_DATA,
+                                      (const uint8_t*)msg, 5,
+                                      sealed, sizeof(sealed));
+        if (sw == 0) { printf("  FAIL: seal app\n"); g_fail++; free(eng); return; }
+
+        size_t rcap; uint8_t* rrx = pw_tls_rx_buf(eng, &rcap);
+        memcpy(rrx, sealed, sw); pw_tls_rx_ack(eng, sw);
+
+        int w = pw_tls_step(eng);
+        if (w < 0) { printf("  FAIL: step app\n"); g_fail++; free(eng); return; }
+
+        size_t app_in_len; const uint8_t* app_in = pw_tls_app_in_buf(eng, &app_in_len);
+        if (app_in_len == 5 && memcmp(app_in, "hello", 5) == 0)
+             { printf("  PASS: APP_IN surfaces \"hello\" plaintext\n"); g_pass++; }
+        else { printf("  FAIL: app_in_len=%zu\n", app_in_len); g_fail++; }
+    }
+
+    /* ---- Handshake secrets must have been wiped. ---- */
+    {
+        uint8_t zero[32] = {0};
+        if (memcmp(eng->handshake_secret, zero, 32) == 0
+            && memcmp(eng->cs_handshake_secret, zero, 32) == 0
+            && memcmp(eng->ss_handshake_secret, zero, 32) == 0)
+             { printf("  PASS: handshake-phase secrets wiped\n"); g_pass++; }
+        else { printf("  FAIL: handshake secrets not wiped\n"); g_fail++; }
+    }
+
+    free(eng);
+}
+
+/* ============================================================
+ *  Tolerance test variant: CCS in one rx_ack, then cFin in a second.
+ *  This exercises the "step returns WANT_RX after CCS, then we get
+ *  more bytes" path that's hidden in the bundled-ack version.
+ * ============================================================ */
+static void test_engine_tolerates_dummy_ccs_split(void) {
+    printf("== TLS engine: tolerates dummy CCS (split from cFin) ==\n");
+
+    uint8_t srv_seed[32];  for (int i = 0; i < 32; i++) srv_seed[i] = 0x60 + (uint8_t)i;
+    uint8_t srv_pub[32];   ed25519_pubkey_from_seed(srv_pub, srv_seed);
+    const uint8_t fake_cert[16] = { 0x30, 0x0e, 0x05, 0x00 };
+    const uint8_t* cert_chain = fake_cert;
+    size_t         cert_lens[1]  = { sizeof(fake_cert) };
+
+    uint8_t cli_priv[32];  for (int i = 0; i < 32; i++) cli_priv[i] = 0x33 ^ (uint8_t)i;
+    cli_priv[0] &= 248; cli_priv[31] &= 127; cli_priv[31] |= 64;
+    uint8_t cli_pub[32];   x25519(cli_pub, cli_priv, X25519_BASE_POINT);
+
+    pw_tls_engine_t* eng = malloc(sizeof(*eng));
+    pw_tls_engine_init(eng);
+    test_rng_state_t rng_st = { .next = 0 };
+    pw_tls_engine_configure_server(eng, test_rng, &rng_st, srv_seed,
+                                   cert_chain, cert_lens, 1);
+
+    uint8_t srv_eph_priv[32];
+    {
+        test_rng_state_t r = { .next = 0 };
+        uint8_t scratch[32];
+        test_rng(&r, scratch, 32);
+        test_rng(&r, srv_eph_priv, 32);
+        srv_eph_priv[0] &= 248; srv_eph_priv[31] &= 127; srv_eph_priv[31] |= 64;
+    }
+    uint8_t srv_pub_eph[32]; x25519(srv_pub_eph, srv_eph_priv, X25519_BASE_POINT);
+    uint8_t shared[32];      x25519(shared, cli_priv, srv_pub_eph);
+
+    uint8_t ch_rec[2048];
+    uint8_t sid[32]; for (int i = 0; i < 32; i++) sid[i] = (uint8_t)i;
+    size_t  ch_len = build_test_ch_record(ch_rec, sizeof(ch_rec), cli_pub, sid, 32,
+                                          "h.example", 1, 1);
+    size_t cap; uint8_t* rxb = pw_tls_rx_buf(eng, &cap);
+    memcpy(rxb, ch_rec, ch_len); pw_tls_rx_ack(eng, ch_len);
+    pw_tls_step(eng);
+
+    /* Replay client-side transcript & derive keys (same as bundled
+     * test). */
+    size_t tx_len; const uint8_t* tx = pw_tls_tx_buf(eng, &tx_len);
+    uint16_t sh_body = ((uint16_t)tx[3] << 8) | tx[4];
+    tls13_transcript_t cts;
+    tls13_transcript_init(&cts);
+    tls13_transcript_update(&cts, ch_rec + 5, ch_len - 5);
+    tls13_transcript_update(&cts, tx + 5, sh_body);
+
+    uint8_t T1[32]; tls13_transcript_snapshot(&cts, T1);
+    uint8_t hs[32], cs_hs[32], ss_hs[32];
+    tls13_compute_handshake_secrets(shared, T1, hs, cs_hs, ss_hs);
+
+    tls_record_dir_t cli_r = {0};
+    tls13_derive_traffic_keys(ss_hs, cli_r.key, cli_r.static_iv);
+    size_t off = 5 + sh_body;
+    while (off + 5 <= tx_len) {
+        uint16_t rl = ((uint16_t)tx[off+3] << 8) | tx[off+4];
+        uint8_t scr[2048]; memcpy(scr, tx + off, 5 + rl);
+        tls_content_type_t inner; uint8_t* pt; size_t pl;
+        tls13_open_record(&cli_r, scr, 5 + rl, &inner, &pt, &pl);
+        tls13_transcript_update(&cts, pt, pl);
+        off += 5 + rl;
+    }
+
+    uint8_t T4[32]; tls13_transcript_snapshot(&cts, T4);
+
+    /* ---- Push only the dummy CCS first. ---- */
+    static const uint8_t dummy_ccs[6] = { 0x14, 0x03, 0x03, 0x00, 0x01, 0x01 };
+    {
+        size_t rcap; uint8_t* rrx = pw_tls_rx_buf(eng, &rcap);
+        memcpy(rrx, dummy_ccs, 6); pw_tls_rx_ack(eng, 6);
+    }
+    pw_tls_step(eng);
+    if (pw_tls_state(eng) == PW_TLS_ST_HANDSHAKE
+        && pw_tls_hs_phase(eng) == PW_TLS_HS_AFTER_SF_AWAIT_CF)
+         { printf("  PASS: CCS-only step stays in AFTER_SF_AWAIT_CF\n"); g_pass++; }
+    else { printf("  FAIL: state=%d phase=%d after CCS-only\n",
+                  pw_tls_state(eng), pw_tls_hs_phase(eng)); g_fail++; free(eng); return; }
+
+    /* ---- Now push the cFin. ---- */
+    uint8_t cfin_vd[32]; tls13_compute_finished(cs_hs, T4, cfin_vd);
+    uint8_t cfin_msg[36]; int cfin_len = tls13_build_finished(cfin_msg, sizeof(cfin_msg), cfin_vd);
+    tls_record_dir_t cli_w = {0};
+    tls13_derive_traffic_keys(cs_hs, cli_w.key, cli_w.static_iv);
+    uint8_t sealed[128];
+    size_t sw = tls13_seal_record(&cli_w, TLS_CT_HANDSHAKE, TLS_CT_APPLICATION_DATA,
+                                  cfin_msg, (size_t)cfin_len, sealed, sizeof(sealed));
+    {
+        size_t rcap; uint8_t* rrx = pw_tls_rx_buf(eng, &rcap);
+        memcpy(rrx, sealed, sw); pw_tls_rx_ack(eng, sw);
+    }
+    pw_tls_step(eng);
+    if (pw_tls_state(eng) == PW_TLS_ST_APP)
+         { printf("  PASS: engine transitions to APP after split CCS+cFin\n"); g_pass++; }
+    else { printf("  FAIL: state=%d after cFin (split)\n", pw_tls_state(eng)); g_fail++; }
+
+    free(eng);
+}
+
+/* ============================================================
+ *  After fatal handshake error, the engine MUST NOT expose any
+ *  partial bytes via pw_tls_tx_buf() and MUST have wiped its
+ *  installed record-layer keys. Driven by a hostile cFin (random
+ *  verify_data) — the engine has the encrypted server flight in TX
+ *  by the time it tries to verify the cFin, so this exercises the
+ *  half-emitted-flight rollback path AND the keys-wiped path.
+ * ============================================================ */
+static void test_engine_fatal_wipes_tx_and_keys(void) {
+    printf("== TLS engine: fatal handshake wipes TX + keys ==\n");
+
+    uint8_t srv_seed[32];  for (int i = 0; i < 32; i++) srv_seed[i] = 0xb0 + (uint8_t)i;
+    const uint8_t fake_cert[16] = { 0x30, 0x0e, 0x05, 0x00 };
+    const uint8_t* cert_chain = fake_cert;
+    size_t         cert_lens[1]  = { sizeof(fake_cert) };
+
+    uint8_t cli_priv[32];  for (int i = 0; i < 32; i++) cli_priv[i] = 0x21 ^ (uint8_t)i;
+    cli_priv[0] &= 248; cli_priv[31] &= 127; cli_priv[31] |= 64;
+    uint8_t cli_pub[32];   x25519(cli_pub, cli_priv, X25519_BASE_POINT);
+
+    pw_tls_engine_t* eng = malloc(sizeof(*eng));
+    pw_tls_engine_init(eng);
+    test_rng_state_t rng_st = { .next = 0 };
+    pw_tls_engine_configure_server(eng, test_rng, &rng_st, srv_seed,
+                                   cert_chain, cert_lens, 1);
+
+    /* Drive CH -> AFTER_SF_AWAIT_CF (server flight already in TX). */
+    uint8_t ch_rec[2048];
+    uint8_t sid[32]; for (int i = 0; i < 32; i++) sid[i] = (uint8_t)i;
+    size_t  ch_len = build_test_ch_record(ch_rec, sizeof(ch_rec), cli_pub, sid, 32,
+                                          "h.example", 1, 1);
+    size_t cap; uint8_t* rxb = pw_tls_rx_buf(eng, &cap);
+    memcpy(rxb, ch_rec, ch_len); pw_tls_rx_ack(eng, ch_len);
+    pw_tls_step(eng);
+
+    /* Sanity: TX is non-empty (SH + 4 encrypted records) and the
+     * engine has handshake-traffic keys installed. */
+    size_t tx_len; const uint8_t* tx = pw_tls_tx_buf(eng, &tx_len);
+    if (tx_len > 0 && eng->keys_installed)
+         { printf("  PASS: pre-fail TX non-empty + keys installed\n"); g_pass++; }
+    else { printf("  FAIL: pre-fail tx_len=%zu keys=%d\n",
+                  tx_len, eng->keys_installed); g_fail++; free(eng); return; }
+    (void)tx;
+
+    /* Now derive the CORRECT cs_hs key but build a Finished message
+     * with a DELIBERATELY WRONG verify_data. The engine should decrypt
+     * the record (so AEAD tag is fine), parse the Finished header,
+     * but fail tls13_verify_finished and go FAILED. */
+    uint16_t sh_body = ((uint16_t)tx[3] << 8) | tx[4];
+    const uint8_t* sh_msg = tx + 5;
+    tls13_transcript_t cts;
+    tls13_transcript_init(&cts);
+    tls13_transcript_update(&cts, ch_rec + 5, ch_len - 5);
+    tls13_transcript_update(&cts, sh_msg, sh_body);
+
+    /* Compute shared via expected server eph priv. */
+    uint8_t srv_eph_priv[32];
+    {
+        test_rng_state_t r = { .next = 0 };
+        uint8_t scratch[32]; test_rng(&r, scratch, 32);
+        test_rng(&r, srv_eph_priv, 32);
+        srv_eph_priv[0] &= 248; srv_eph_priv[31] &= 127; srv_eph_priv[31] |= 64;
+    }
+    uint8_t srv_pub_eph[32]; x25519(srv_pub_eph, srv_eph_priv, X25519_BASE_POINT);
+    uint8_t shared[32]; x25519(shared, cli_priv, srv_pub_eph);
+
+    uint8_t T1[32]; tls13_transcript_snapshot(&cts, T1);
+    uint8_t hs[32], cs_hs[32], ss_hs[32];
+    tls13_compute_handshake_secrets(shared, T1, hs, cs_hs, ss_hs);
+
+    /* Build a cFin with garbage verify_data. */
+    uint8_t bad_vd[32]; for (int i = 0; i < 32; i++) bad_vd[i] = 0xee;
+    uint8_t cfin_msg[36]; int cfin_len = tls13_build_finished(cfin_msg, sizeof(cfin_msg), bad_vd);
+    tls_record_dir_t cli_w = {0};
+    tls13_derive_traffic_keys(cs_hs, cli_w.key, cli_w.static_iv);
+    uint8_t sealed[128];
+    size_t sw = tls13_seal_record(&cli_w, TLS_CT_HANDSHAKE, TLS_CT_APPLICATION_DATA,
+                                  cfin_msg, (size_t)cfin_len, sealed, sizeof(sealed));
+
+    size_t rcap; uint8_t* rrx = pw_tls_rx_buf(eng, &rcap);
+    memcpy(rrx, sealed, sw); pw_tls_rx_ack(eng, sw);
+    int rc = pw_tls_step(eng);
+
+    if (rc < 0 && pw_tls_state(eng) == PW_TLS_ST_FAILED)
+         { printf("  PASS: bad cFin moves engine to FAILED\n"); g_pass++; }
+    else { printf("  FAIL: rc=%d state=%d\n", rc, pw_tls_state(eng)); g_fail++; free(eng); return; }
+
+    size_t tx2; (void)pw_tls_tx_buf(eng, &tx2);
+    if (tx2 == 0)
+         { printf("  PASS: TX cleared after fatal handshake failure\n"); g_pass++; }
+    else { printf("  FAIL: tx_len=%zu (should be 0)\n", tx2); g_fail++; }
+
+    {
+        uint8_t zero32[32] = {0}, zero12[12] = {0};
+        int wiped = (memcmp(eng->read.key, zero32, 32) == 0)
+                 && (memcmp(eng->read.static_iv, zero12, 12) == 0)
+                 && (memcmp(eng->write.key, zero32, 32) == 0)
+                 && (memcmp(eng->write.static_iv, zero12, 12) == 0)
+                 && (eng->keys_installed == 0);
+        if (wiped) { printf("  PASS: record-layer keys wiped on fatal\n"); g_pass++; }
+        else       { printf("  FAIL: keys_installed=%d\n", eng->keys_installed); g_fail++; }
+    }
+
+    free(eng);
+}
+
+/* ============================================================
+ *  Tolerance test for RFC 8446 §D.4 dummy ChangeCipherSpec.
+ *
+ *  Real TLS 1.3 clients in compatibility mode emit
+ *      14 03 03 00 01 01
+ *  between their CH and their encrypted Finished. The engine must
+ *  silently drop these and still process the cFin that follows.
+ * ============================================================ */
+static void test_engine_tolerates_dummy_ccs(void) {
+    printf("== TLS engine: tolerates dummy ChangeCipherSpec ==\n");
+
+    /* Setup mirrors the roundtrip test, but condensed. */
+    uint8_t srv_seed[32];  for (int i = 0; i < 32; i++) srv_seed[i] = 0x10 + (uint8_t)i;
+    uint8_t srv_pub[32];   ed25519_pubkey_from_seed(srv_pub, srv_seed);
+    const uint8_t fake_cert[16] = { 0x30, 0x0e, 0x05, 0x00 };
+    const uint8_t* cert_chain = fake_cert;
+    size_t         cert_lens[1]  = { sizeof(fake_cert) };
+
+    uint8_t cli_priv[32];  for (int i = 0; i < 32; i++) cli_priv[i] = 0x55 ^ (uint8_t)i;
+    cli_priv[0] &= 248; cli_priv[31] &= 127; cli_priv[31] |= 64;
+    uint8_t cli_pub[32];   x25519(cli_pub, cli_priv, X25519_BASE_POINT);
+
+    pw_tls_engine_t* eng = malloc(sizeof(*eng));
+    pw_tls_engine_init(eng);
+    test_rng_state_t rng_st = { .next = 0 };
+    pw_tls_engine_configure_server(eng, test_rng, &rng_st, srv_seed,
+                                   cert_chain, cert_lens, 1);
+
+    uint8_t srv_eph_priv[32];
+    {
+        test_rng_state_t r = { .next = 0 };
+        uint8_t scratch[32];
+        test_rng(&r, scratch, 32);            /* server_random */
+        test_rng(&r, srv_eph_priv, 32);
+        srv_eph_priv[0] &= 248; srv_eph_priv[31] &= 127; srv_eph_priv[31] |= 64;
+    }
+    uint8_t srv_pub_eph[32]; x25519(srv_pub_eph, srv_eph_priv, X25519_BASE_POINT);
+    uint8_t shared[32];      x25519(shared, cli_priv, srv_pub_eph);
+
+    uint8_t ch_rec[2048];
+    uint8_t sid[32]; for (int i = 0; i < 32; i++) sid[i] = (uint8_t)i;
+    size_t  ch_len = build_test_ch_record(ch_rec, sizeof(ch_rec), cli_pub, sid, 32,
+                                          "h.example", 1, 1);
+    size_t cap; uint8_t* rxb = pw_tls_rx_buf(eng, &cap);
+    memcpy(rxb, ch_rec, ch_len); pw_tls_rx_ack(eng, ch_len);
+    pw_tls_step(eng);
+
+    if (pw_tls_hs_phase(eng) != PW_TLS_HS_AFTER_SF_AWAIT_CF)
+         { printf("  FAIL: did not reach AFTER_SF_AWAIT_CF\n"); g_fail++; free(eng); return; }
+
+    /* Replay client transcript & derive keys. */
+    size_t tx_len; const uint8_t* tx = pw_tls_tx_buf(eng, &tx_len);
+    uint16_t sh_body = ((uint16_t)tx[3] << 8) | tx[4];
+    tls13_transcript_t cts;
+    tls13_transcript_init(&cts);
+    tls13_transcript_update(&cts, ch_rec + 5, ch_len - 5);
+    tls13_transcript_update(&cts, tx + 5, sh_body);
+
+    uint8_t T1[32]; tls13_transcript_snapshot(&cts, T1);
+    uint8_t hs[32], cs_hs[32], ss_hs[32];
+    tls13_compute_handshake_secrets(shared, T1, hs, cs_hs, ss_hs);
+
+    /* Decrypt server's encrypted flight to update transcript. */
+    tls_record_dir_t cli_r = {0};
+    tls13_derive_traffic_keys(ss_hs, cli_r.key, cli_r.static_iv);
+    size_t off = 5 + sh_body;
+    while (off + 5 <= tx_len) {
+        uint16_t rl = ((uint16_t)tx[off+3] << 8) | tx[off+4];
+        uint8_t scr[2048]; memcpy(scr, tx + off, 5 + rl);
+        tls_content_type_t inner; uint8_t* pt; size_t pl;
+        tls13_open_record(&cli_r, scr, 5 + rl, &inner, &pt, &pl);
+        tls13_transcript_update(&cts, pt, pl);
+        off += 5 + rl;
+    }
+
+    uint8_t T4[32]; tls13_transcript_snapshot(&cts, T4);
+
+    /* Build cFin. */
+    uint8_t cfin_vd[32]; tls13_compute_finished(cs_hs, T4, cfin_vd);
+    uint8_t cfin_msg[36]; int cfin_len = tls13_build_finished(cfin_msg, sizeof(cfin_msg), cfin_vd);
+    tls_record_dir_t cli_w = {0};
+    tls13_derive_traffic_keys(cs_hs, cli_w.key, cli_w.static_iv);
+    uint8_t sealed[128];
+    size_t sw = tls13_seal_record(&cli_w, TLS_CT_HANDSHAKE, TLS_CT_APPLICATION_DATA,
+                                  cfin_msg, (size_t)cfin_len, sealed, sizeof(sealed));
+
+    /* Push CCS THEN cFin into RX in one ack. */
+    static const uint8_t dummy_ccs[6] = { 0x14, 0x03, 0x03, 0x00, 0x01, 0x01 };
+    size_t rcap; uint8_t* rrx = pw_tls_rx_buf(eng, &rcap);
+    memcpy(rrx,           dummy_ccs, 6);
+    memcpy(rrx + 6,       sealed,    sw);
+    pw_tls_rx_ack(eng, 6 + sw);
+
+    pw_tls_step(eng);
+    if (pw_tls_state(eng) == PW_TLS_ST_APP)
+         { printf("  PASS: engine consumed CCS + processed cFin\n"); g_pass++; }
+    else { printf("  FAIL: state=%d after CCS+cFin\n", pw_tls_state(eng)); g_fail++; }
+
+    free(eng);
+}
+
 int main(void) {
     /* Pick the best SHA-256 + ChaCha20 impls available; tests below
      * run through the public entry points so they exercise whichever
@@ -3389,6 +4086,10 @@ int main(void) {
     test_tls_engine();
     test_engine_via_dispatch();
     test_engine_handshake_server();
+    test_engine_handshake_roundtrip();
+    test_engine_tolerates_dummy_ccs();
+    test_engine_tolerates_dummy_ccs_split();
+    test_engine_fatal_wipes_tx_and_keys();
 
     printf("\n=== RESULTS: PASS=%d FAIL=%d ===\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;

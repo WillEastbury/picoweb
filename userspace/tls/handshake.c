@@ -572,3 +572,34 @@ int tls13_compute_handshake_secrets(const uint8_t ecdhe_shared[32],
     secure_zero(derived,      sizeof(derived));
     return 0;
 }
+
+int tls13_compute_application_secrets(const uint8_t handshake_secret[32],
+                                      const uint8_t transcript_hash_through_server_finished[32],
+                                      uint8_t master_secret[32],
+                                      uint8_t client_ap_traffic_secret[32],
+                                      uint8_t server_ap_traffic_secret[32]) {
+    uint8_t zero32[32] = {0};
+    uint8_t derived[32];
+    uint8_t empty_hash[32];
+
+    /* derived = Derive-Secret(handshake_secret, "derived", "") */
+    sha256("", 0, empty_hash);
+    if (tls13_hkdf_expand_label(handshake_secret, "derived",
+                                empty_hash, sizeof(empty_hash),
+                                derived, sizeof(derived)) != 0) return -1;
+
+    /* master_secret = HKDF-Extract(salt=derived, IKM=00..00) */
+    hkdf_extract(derived, sizeof(derived),
+                 zero32,  sizeof(zero32),
+                 master_secret);
+
+    if (tls13_hkdf_expand_label(master_secret, "c ap traffic",
+                                transcript_hash_through_server_finished, 32,
+                                client_ap_traffic_secret, 32) != 0) return -1;
+    if (tls13_hkdf_expand_label(master_secret, "s ap traffic",
+                                transcript_hash_through_server_finished, 32,
+                                server_ap_traffic_secret, 32) != 0) return -1;
+
+    secure_zero(derived, sizeof(derived));
+    return 0;
+}

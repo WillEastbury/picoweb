@@ -218,6 +218,28 @@ int tls13_compute_handshake_secrets(const uint8_t ecdhe_shared[32],
                                     uint8_t client_hs_traffic_secret[32],
                                     uint8_t server_hs_traffic_secret[32]);
 
+/* Compute the TLS 1.3 application-phase secrets per RFC 8446 §7.1.
+ *
+ *   derived       = Derive-Secret(handshake_secret, "derived", "")
+ *   master_secret = HKDF-Extract(salt=derived, IKM=00..00)
+ *   c_ap_traffic  = Derive-Secret(master_secret, "c ap traffic",
+ *                                 H(ClientHello..ServerFinished))
+ *   s_ap_traffic  = Derive-Secret(master_secret, "s ap traffic",
+ *                                 H(ClientHello..ServerFinished))
+ *
+ * `transcript_hash_through_server_finished` is the SHA-256 of the
+ * full handshake-message stream up to AND including the server's
+ * Finished message. (NOT including the client Finished — that
+ * appears later and is verified against the SAME transcript hash.)
+ *
+ * Returns 0 on success, -1 on internal error. All sensitive
+ * intermediates are wiped before return. */
+int tls13_compute_application_secrets(const uint8_t handshake_secret[32],
+                                      const uint8_t transcript_hash_through_server_finished[32],
+                                      uint8_t master_secret[32],
+                                      uint8_t client_ap_traffic_secret[32],
+                                      uint8_t server_ap_traffic_secret[32]);
+
 /* ---------------- Handshake transcript hash ---------------- */
 /*
  * Convenience wrapper around the SHA-256 streaming context for the
