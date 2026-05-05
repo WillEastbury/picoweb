@@ -35,8 +35,52 @@ static tcp_conn_t* alloc_conn(tcp_stack_t* s) {
     return NULL;
 }
 
+uint16_t tcp_advertised_wnd(const tcp_conn_t* c) {
+    if (!c) return 0;
+    /* Legacy default: cap == 0 means flow-control disabled. */
+    if (c->rcv_buf_cap == 0) return 65535;
+    if (c->rcv_buf_used >= c->rcv_buf_cap) return 0;
+    uint32_t free_bytes = c->rcv_buf_cap - c->rcv_buf_used;
+    return (free_bytes > 65535u) ? 65535u : (uint16_t)free_bytes;
+}
+
+void tcp_set_rcv_buf_cap(tcp_conn_t* c, uint32_t cap) {
+    if (!c) return;
+    c->rcv_buf_cap  = cap;
+    c->rcv_buf_used = 0;
+    c->rcv_wnd      = tcp_advertised_wnd(c);
+}
+
+void tcp_rcv_consumed(tcp_conn_t* c, uint32_t n,
+                      tcp_emit_fn emit, void* emit_user) {
+    if (!c || n == 0) return;
+    uint16_t old_wnd = c->rcv_wnd;
+    if (n >= c->rcv_buf_used) c->rcv_buf_used = 0;
+    else                      c->rcv_buf_used -= n;
+    uint16_t new_wnd = tcp_advertised_wnd(c);
+    c->rcv_wnd = new_wnd;
+    /* Window opened from 0 -> >0: emit a window-update ACK so the
+     * peer (who has been sending persist probes) starts sending data
+     * again. RFC 9293 §3.8.6.2. */
+    if (old_wnd == 0 && new_wnd > 0 && c->state == TCP_ESTABLISHED && emit) {
+        tcp_seg_t s = {0};
+        s.src_ip   = c->local_ip;
+        s.dst_ip   = c->remote_ip;
+        s.src_port = c->local_port;
+        s.dst_port = c->remote_port;
+        s.seq      = c->snd_nxt;
+        s.ack      = c->rcv_nxt;
+        s.flags    = TCPF_ACK;
+        s.window   = new_wnd;
+        emit(&s, emit_user);
+    }
+}
+
 static void emit_ctrl(tcp_conn_t* c, uint8_t flags,
                       tcp_emit_fn emit, void* user) {
+    /* Always recompute the window at emit time so any application
+     * activity since the last segment is reflected. */
+    c->rcv_wnd = tcp_advertised_wnd(c);
     tcp_seg_t s = {0};
     s.src_ip   = c->local_ip;
     s.dst_ip   = c->remote_ip;
@@ -262,6 +306,20 @@ void tcp_input(tcp_stack_t* s, const tcp_seg_t* seg,
         }
         if (seg->flags & TCPF_ACK) c->snd_una = seg->ack;
         if (seg->payload_len) {
+            /* Zero-window flow control: if we have advertised a zero
+             * window, we MUST NOT consume the bytes. Any segment
+             * arriving here is either:
+             *   - a persist probe (RFC 9293 §3.8.6.1, typically 1
+             *     byte) sent because our last ACK had wnd=0, or
+             *   - a stale in-flight segment from before we closed
+             *     the window.
+             * In either case: drop the data, do NOT advance rcv_nxt,
+             * and re-ACK with the current (still 0) window so the
+             * peer keeps probing instead of giving up. */
+            if (tcp_advertised_wnd(c) == 0) {
+                emit_ctrl(c, TCPF_ACK, emit, emit_user);
+                return;
+            }
             if (c->svc) {
                 if (!drive_service_data(c, seg->payload, seg->payload_len,
                                         emit, emit_user)) return;
@@ -269,6 +327,15 @@ void tcp_input(tcp_stack_t* s, const tcp_seg_t* seg,
                 on_data(c, seg->payload, seg->payload_len, on_data_user);
             }
             c->rcv_nxt += seg->payload_len;
+            /* Application has accepted these bytes into its buffer.
+             * It must call tcp_rcv_consumed() once it has drained
+             * them so the window can re-open. */
+            if (c->rcv_buf_cap > 0) {
+                uint32_t add = seg->payload_len;
+                if (add > (c->rcv_buf_cap - c->rcv_buf_used))
+                    add = c->rcv_buf_cap - c->rcv_buf_used;
+                c->rcv_buf_used += add;
+            }
             emit_ctrl(c, TCPF_ACK, emit, emit_user);
         }
         if (seg->flags & TCPF_FIN) {

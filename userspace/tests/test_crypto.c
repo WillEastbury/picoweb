@@ -877,6 +877,111 @@ static void test_tcp_state(void) {
 }
 
 /* ============================================================== */
+/* TCP zero-window flow control + persist probe handling          */
+/* ============================================================== */
+static void test_tcp_zero_window(void) {
+    printf("== TCP zero-window flow control + persist probe ==\n");
+
+    tcp_stack_t stack;
+    tcp_listen(&stack, 0x0a000002u, 80);
+
+    emit_log_t emit_log = {0};
+    app_buf_t  app = {0};
+
+    /* SYN -> SYN+ACK */
+    tcp_seg_t syn = {0};
+    syn.src_ip = 0x0a000001u; syn.dst_ip = 0x0a000002u;
+    syn.src_port = 5050;     syn.dst_port = 80;
+    syn.seq = 7000;          syn.flags = TCPF_SYN;
+    tcp_input(&stack, &syn, on_data, &app, log_emit, &emit_log);
+    uint32_t srv_iss = emit_log.segs[0].seq;
+
+    /* Find the server PCB; cap rcv buffer to 8 bytes. */
+    tcp_conn_t* srv = NULL;
+    for (uint32_t i = 0; i < TCP_TABLE_SIZE; i++) {
+        if (stack.conns[i].state == TCP_SYN_RECEIVED) { srv = &stack.conns[i]; break; }
+    }
+    if (!srv) { printf("  FAIL: no SYN_RECEIVED PCB\n"); g_fail++; return; }
+    tcp_set_rcv_buf_cap(srv, 8);
+
+    /* Final ACK to reach ESTABLISHED. */
+    emit_log.n = 0;
+    tcp_seg_t ack = {0};
+    ack.src_ip = 0x0a000001u; ack.dst_ip = 0x0a000002u;
+    ack.src_port = 5050;     ack.dst_port = 80;
+    ack.seq = 7001;          ack.ack = srv_iss + 1;
+    ack.flags = TCPF_ACK;
+    tcp_input(&stack, &ack, on_data, &app, log_emit, &emit_log);
+
+    /* Send 8 bytes - exactly fills the buffer. ACK must advertise wnd=0. */
+    emit_log.n = 0;
+    tcp_seg_t pkt = {0};
+    pkt.src_ip = 0x0a000001u; pkt.dst_ip = 0x0a000002u;
+    pkt.src_port = 5050;     pkt.dst_port = 80;
+    pkt.seq = 7001;          pkt.ack = srv_iss + 1;
+    pkt.flags = TCPF_ACK | TCPF_PSH;
+    pkt.payload = (const uint8_t*)"AAAAAAAA";
+    pkt.payload_len = 8;
+    tcp_input(&stack, &pkt, on_data, &app, log_emit, &emit_log);
+
+    if (emit_log.n == 1 && emit_log.segs[0].window == 0 && app.len == 8)
+         { printf("  PASS: full buffer -> ACK with window=0, data delivered\n"); g_pass++; }
+    else { printf("  FAIL: emit.n=%d wnd=%u app.len=%zu\n",
+                  emit_log.n, emit_log.segs[0].window, app.len); g_fail++; }
+
+    /* Persist probe: peer sends 1 byte at next seq. We MUST drop it
+     * (no app delivery, no rcv_nxt advance) and re-ACK with wnd=0. */
+    emit_log.n = 0;
+    size_t app_len_before = app.len;
+    uint32_t rcv_nxt_before = srv->rcv_nxt;
+    pkt.seq = 7009;
+    pkt.payload = (const uint8_t*)"X";
+    pkt.payload_len = 1;
+    tcp_input(&stack, &pkt, on_data, &app, log_emit, &emit_log);
+
+    if (emit_log.n == 1 && emit_log.segs[0].window == 0
+        && emit_log.segs[0].ack == rcv_nxt_before
+        && app.len == app_len_before
+        && srv->rcv_nxt == rcv_nxt_before)
+         { printf("  PASS: persist probe dropped + re-ACKed with wnd=0\n"); g_pass++; }
+    else { printf("  FAIL: emit.n=%d wnd=%u ack=%u app.len=%zu rcv_nxt=%u\n",
+                  emit_log.n, emit_log.segs[0].window,
+                  emit_log.segs[0].ack, app.len, srv->rcv_nxt); g_fail++; }
+
+    /* Drain the application buffer; tcp_rcv_consumed must emit a
+     * window-update ACK because window opened from 0 -> 8. */
+    emit_log.n = 0;
+    app.len = 0;
+    tcp_rcv_consumed(srv, 8, log_emit, &emit_log);
+
+    if (emit_log.n == 1
+        && (emit_log.segs[0].flags & TCPF_ACK)
+        && emit_log.segs[0].window == 8)
+         { printf("  PASS: window-update ACK emitted on 0->non-zero\n"); g_pass++; }
+    else { printf("  FAIL: emit.n=%d wnd=%u flags=%02x\n",
+                  emit_log.n, emit_log.segs[0].window,
+                  emit_log.n ? emit_log.segs[0].flags : 0); g_fail++; }
+
+    /* Calling tcp_rcv_consumed when window was already non-zero must
+     * NOT emit (avoid spurious window updates). */
+    emit_log.n = 0;
+    /* Refill so we have something to drain. */
+    tcp_set_rcv_buf_cap(srv, 8);
+    srv->rcv_buf_used = 4;
+    srv->rcv_wnd = tcp_advertised_wnd(srv);
+    tcp_rcv_consumed(srv, 4, log_emit, &emit_log);
+    if (emit_log.n == 0)
+         { printf("  PASS: no spurious update when window already open\n"); g_pass++; }
+    else { printf("  FAIL: emit.n=%d (want 0)\n", emit_log.n); g_fail++; }
+
+    /* Default behaviour (cap=0) advertises 65535. */
+    tcp_conn_t legacy = {0};
+    if (tcp_advertised_wnd(&legacy) == 65535)
+         { printf("  PASS: cap=0 -> legacy 65535 advertised window\n"); g_pass++; }
+    else { printf("  FAIL: cap=0 wnd=%u\n", tcp_advertised_wnd(&legacy)); g_fail++; }
+}
+
+/* ============================================================== */
 /* SHA-256 dispatch — verify scalar and HW path agree on vectors. */
 /* ============================================================== */
 static void test_sha256_dispatch(void) {
@@ -4344,6 +4449,7 @@ int main(void) {
     test_tls13_record();
     test_ip_tcp();
     test_tcp_state();
+    test_tcp_zero_window();
     test_buffer_pool();
     test_pem();
     test_cert_store();

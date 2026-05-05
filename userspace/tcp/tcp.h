@@ -52,7 +52,18 @@ typedef struct {
     uint32_t snd_nxt;       /* next seq to send */
     uint32_t snd_una;       /* oldest unacked seq */
     uint32_t rcv_nxt;       /* next seq we expect to receive */
-    uint16_t rcv_wnd;       /* advertised window */
+    uint16_t rcv_wnd;       /* last advertised window (cached for emit) */
+
+    /* Receive-buffer accounting for zero-window flow control.
+     * The application increments rcv_buf_used as it accepts bytes
+     * into its own buffer (e.g. TLS engine RX), and decrements via
+     * tcp_rcv_consumed() as those bytes are drained. The advertised
+     * window is rcv_buf_cap - rcv_buf_used, clamped to 65535 (no
+     * window scaling in this stack). cap=0 means "use legacy fixed
+     * 65535 window" (back-compat default for callers that haven't
+     * opted into flow control). */
+    uint32_t rcv_buf_cap;
+    uint32_t rcv_buf_used;
 
     /* Dispatch-mode plumbing. NULL when the legacy single-port API
      * (tcp_listen + tcp_input(on_data,...)) is in use. */
@@ -120,5 +131,26 @@ int tcp_send(tcp_conn_t* c,
 int tcp_sendv(tcp_conn_t* c,
               const pw_iov_t* iov, unsigned n,
               tcp_emit_fn emit, void* emit_user);
+
+/* ------------------------------------------------------------------
+ * Receive-buffer flow control (zero-window + persist probe).
+ *
+ * Set the receive-buffer capacity for a connection. The advertised
+ * window in outbound ACKs is clamped to (cap - used). Pass cap=0 to
+ * disable flow control (legacy behaviour, fixed 65535 advertised).
+ * Typically called from on_open. */
+void tcp_set_rcv_buf_cap(tcp_conn_t* c, uint32_t cap);
+
+/* Notify the stack that `n` bytes previously delivered to the
+ * application have been drained from its buffer. May open the
+ * advertised window from 0 to non-zero; if so, an immediate ACK
+ * with the new window is emitted to unstick a peer that has
+ * stopped sending. Safe to call with n=0 (no-op). */
+void tcp_rcv_consumed(tcp_conn_t* c, uint32_t n,
+                      tcp_emit_fn emit, void* emit_user);
+
+/* Compute the window we would advertise right now (cap - used,
+ * clamped to 65535; or 65535 if cap == 0). Useful for tests. */
+uint16_t tcp_advertised_wnd(const tcp_conn_t* c);
 
 #endif
