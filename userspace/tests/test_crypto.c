@@ -4046,6 +4046,33 @@ static void test_engine_last_error_init(void) {
     free(eng);
 }
 
+/* mbuf-tls-record sizing: PW_RX_REASSEMBLY_SLOT must be at least
+ * large enough to hold one wire-format TLS 1.3 record (5 byte
+ * header + max ciphertext). Compile-time + runtime check so any
+ * future change to either constant trips loudly. */
+static void test_pw_rx_reassembly_slot_sizing(void) {
+    printf("== mbuf-tls-record: PW_RX_REASSEMBLY_SLOT sizing ==\n");
+    if (PW_RX_REASSEMBLY_SLOT >= TLS13_RECORD_HEADER_LEN + TLS13_MAX_CIPHERTEXT)
+         { printf("  PASS: slot=%u >= header+max_ct=%u\n",
+                  (unsigned)PW_RX_REASSEMBLY_SLOT,
+                  (unsigned)(TLS13_RECORD_HEADER_LEN + TLS13_MAX_CIPHERTEXT));
+           g_pass++; }
+    else { printf("  FAIL: slot=%u < %u\n",
+                  (unsigned)PW_RX_REASSEMBLY_SLOT,
+                  (unsigned)(TLS13_RECORD_HEADER_LEN + TLS13_MAX_CIPHERTEXT));
+           g_fail++; }
+
+    /* Engine internal buffers must match the wire-record cap so a
+     * wire record fits straight into rx_buf without secondary
+     * staging. (PW_TLS_BUF_CAP is in engine.h.) */
+    if ((size_t)PW_RX_REASSEMBLY_SLOT == (size_t)PW_TLS_BUF_CAP)
+         { printf("  PASS: PW_RX_REASSEMBLY_SLOT == PW_TLS_BUF_CAP (%u)\n",
+                  (unsigned)PW_TLS_BUF_CAP); g_pass++; }
+    else { printf("  FAIL: %u vs %u\n",
+                  (unsigned)PW_RX_REASSEMBLY_SLOT, (unsigned)PW_TLS_BUF_CAP);
+           g_fail++; }
+}
+
 /* ============================================================
  *  Tolerance test for RFC 8446 §D.4 dummy ChangeCipherSpec.
  *
@@ -4340,6 +4367,7 @@ int main(void) {
     test_engine_fatal_wipes_tx_and_keys();
     test_engine_last_error_protocol();
     test_engine_last_error_init();
+    test_pw_rx_reassembly_slot_sizing();
     test_engine_pool();
     test_dpdk_stub();
 

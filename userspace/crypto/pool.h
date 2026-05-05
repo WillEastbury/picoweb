@@ -18,6 +18,9 @@
  *
  *   - LARGE slots: full TLS record buffers (header + max-plaintext +
  *     padding + tag). One per active connection plus a few extra.
+ *     Use `PW_RX_REASSEMBLY_SLOT` (from `tls/record.h`) as the
+ *     slot_size so the pool can hold one wire-format TLS record
+ *     without truncation.
  *
  * The pool tracks usage and high-water mark so operators can size
  * the slot count from observation rather than guesswork.

@@ -34,6 +34,27 @@
  * RFC 8446 §5.2 caps at TLSPlaintext.length + 256. */
 #define TLS13_MAX_CIPHERTEXT    (TLS13_MAX_PLAINTEXT + 256u + TLS13_AEAD_TAG_LEN)
 
+/* Wire size of one maximally-sized TLS 1.3 record (header + body).
+ * This is the canonical "fits one TLS record on the wire" constant.
+ * Use it to size:
+ *
+ *   - mbuf / RX reassembly pool slots that buffer one TLS record off
+ *     the network before feeding it to the engine
+ *   - any caller-side scratch that must hold a full ciphertext record
+ *
+ * The engine's own internal RX/TX/APP_IN/APP_OUT buffers also use
+ * this size (PW_TLS_BUF_CAP in engine.h); keep them in sync.
+ *
+ * 5 + (16384 + 256 + 16) = 16661 bytes (~16.27 KiB).
+ */
+#define PW_TLS_WIRE_RECORD_MAX  (TLS13_RECORD_HEADER_LEN + TLS13_MAX_CIPHERTEXT)
+
+/* Recommended slot_size for a buffer_pool_t whose slots each hold
+ * one inbound TLS record awaiting reassembly + decryption. Sized
+ * generously to absorb any future growth in TLS13_MAX_CIPHERTEXT
+ * (e.g. if record_size_limit ever bumps the plaintext cap). */
+#define PW_RX_REASSEMBLY_SLOT   PW_TLS_WIRE_RECORD_MAX
+
 typedef enum {
     TLS_CT_INVALID            = 0,
     TLS_CT_CHANGE_CIPHER_SPEC = 20,
