@@ -310,7 +310,13 @@ bytes flow bottom-up, no copy required.
 
 ### Run-to-completion connection runtime (`userspace/conn.{c,h}`)
 
-The `pw_conn_t` ties the layers together as a single function call:
+The `pw_conn_t` is a thin wrapper around `pw_tls_engine_t` for
+callers that prefer the legacy "give me bytes, get sealed bytes
+back" function-call shape over the engine's port-based state
+machine. It embeds an engine and uses
+`pw_tls_engine_install_app_keys` to skip the handshake (callers
+that want a real TLS 1.3 handshake should drive the engine
+directly via `pw_tls_engine_configure_server`).
 
 ```
 pw_conn_rx(conn, in_bytes, in_len,
@@ -321,18 +327,20 @@ pw_conn_rx(conn, in_bytes, in_len,
 walks the diagram:
 
 ```
-in bytes  -> rx_buf reassembly
-          -> tls13_open_record (in-place AEAD)
-          -> response_fn(request_bytes) -> pw_response_t (iov chain)
-          -> tls13_seal_record_iov (scatter-gather AEAD)
-          -> sealed wire bytes ready for TCP segmentation
+in bytes  -> pw_tls_rx_buf + ack
+          -> pw_tls_step (engine opens at most ONE record into APP_IN)
+          -> response_fn(APP_IN bytes) -> pw_response_t (iov chain)
+          -> pw_tls_app_seal_iov (zero-copy scatter-gather AEAD into TX)
+          -> drain TX -> sealed wire bytes for TCP segmentation
 ```
 
 Status returns: `OK` (sealed bytes ready), `NEED_MORE` (record not
 yet complete; feed more bytes), `AUTH_FAIL` (bad tag — close conn),
 `PROTOCOL_ERR`, `RESPONSE_FAIL`, `OUT_OVERFLOW`. Tested end-to-end
 with chunked arrival (2x NEED_MORE then OK), tampered ciphertext
-(rejected with AUTH_FAIL), and roundtrip plaintext equivalence.
+(rejected with AUTH_FAIL), back-to-back records concatenated in a
+single call (engine opens at most one per step; the second is
+processed on the next call), and roundtrip plaintext equivalence.
 
 The webserver-as-module decoupling is now real: `pw_response_fn` is
 the only thing the runtime knows about the application. picoweb's
@@ -702,13 +710,13 @@ future verify path for mTLS) can construct it directly.
 
 This is the running TODO for what's blocking real-traffic readiness.
 
-- **Migrate `pw_conn` to the engine**. The legacy run-to-completion
-  path in `pw_conn.c` (RX → tls13_open_record → handler → tls13_seal_record
-  → TX) duplicates engine logic; switch it to a thin user of `pw_tls_step`
-  and delete the duplicate seal/open glue.
-- **Delete or test-only-flag `pw_tls_engine_install_app_keys`**. It
-  was a spike shortcut; with the full handshake driver landed it is
-  unused except by the early `test_tls_engine` bootstrap test.
+- **Engine error code**: today `pw_tls_step` returns -1 on any fatal
+  error and goes to `PW_TLS_ST_FAILED` without a per-class enum.
+  `pw_conn` therefore collapses tag failures, oversize records, and
+  unknown content types all into `PW_CONN_AUTH_FAIL`. Adding an
+  `pw_tls_last_error` accessor with an enum
+  (PROTOCOL/AUTH/INTERNAL) would let `pw_conn` preserve the
+  pre-migration distinction.
 - **Receive-window-driven backpressure** on the TCP layer
   (rubber-duck'd: "no ACK = backpressure" was wrong; the right answer
   is to advertise zero `rcv_wnd` and support persist).

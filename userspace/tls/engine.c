@@ -180,7 +180,16 @@ const uint8_t* pw_tls_app_in_buf(pw_tls_engine_t* eng, size_t* len) {
 
 int pw_tls_app_in_ack(pw_tls_engine_t* eng, size_t n) {
     if (!eng || n > eng->app_in_len) return -1;
+    /* Zero the consumed plaintext bytes before sliding so the engine
+     * doesn't retain old request bodies in memory after the caller
+     * has drained them. (Rubber-duck blocker on pw_conn migration.)
+     * After buf_shift the surviving bytes live in [0, app_in_len-n);
+     * the bytes we just consumed are at the original [0, n) position.
+     * Easiest correct approach: shift first, then zero the vacated
+     * tail [new_len, old_len). */
+    size_t old_len = eng->app_in_len;
     buf_shift(eng->app_in_buf, &eng->app_in_len, n);
+    secure_zero(eng->app_in_buf + eng->app_in_len, old_len - eng->app_in_len);
     return 0;
 }
 
@@ -201,6 +210,30 @@ int pw_tls_app_out_push(pw_tls_engine_t* eng,
         off += iov[i].len;
     }
     eng->app_out_len = off;
+    return 0;
+}
+
+int pw_tls_app_seal_iov(pw_tls_engine_t* eng,
+                        const pw_iov_t* iov, unsigned n) {
+    if (!eng) return -1;
+    if (eng->state != PW_TLS_ST_APP) return -1;
+
+    size_t total = 0;
+    for (unsigned i = 0; i < n; i++) total += iov[i].len;
+    if (total > TLS13_MAX_PLAINTEXT) return -1;
+
+    size_t need = TLS13_RECORD_HEADER_LEN + total + 1 + TLS13_AEAD_TAG_LEN;
+    if (need > PW_TLS_BUF_CAP - eng->tx_len) return -1;
+
+    size_t wrote = tls13_seal_record_iov(&eng->write,
+                                         TLS_CT_APPLICATION_DATA,
+                                         TLS_CT_APPLICATION_DATA,
+                                         iov, n, total,
+                                         eng->tx_buf + eng->tx_len,
+                                         PW_TLS_BUF_CAP - eng->tx_len);
+    if (wrote == 0) return -1;
+    eng->tx_len += wrote;
+    eng->records_out++;
     return 0;
 }
 
@@ -764,9 +797,15 @@ int pw_tls_step(pw_tls_engine_t* eng) {
         return -1;
     }
 
-    /* Drain RX -> APP_IN, one record at a time, until empty / blocked. */
+    /* Drain RX -> APP_IN, AT MOST ONE record per step in APP state.
+     * Coalescing multiple records' plaintext into APP_IN would force
+     * callers to either (a) be aware of TLS record boundaries
+     * (defeating the abstraction) or (b) merge requests/responses
+     * silently. Stream consumers like pw_conn want one record's
+     * worth of plaintext per drain cycle. */
     int rc;
     do {
+        if (eng->app_in_len > 0) break;   /* caller must drain first */
         rc = try_open_one(eng);
         if (rc < 0) { eng->state = PW_TLS_ST_FAILED; return -1; }
     } while (rc == 1 && eng->state == PW_TLS_ST_APP);

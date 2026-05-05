@@ -1756,6 +1756,52 @@ static void test_pw_conn(void) {
     if (st_bad == PW_CONN_AUTH_FAIL)
          { printf("  PASS: tampered tag -> AUTH_FAIL\n"); g_pass++; }
     else { printf("  FAIL: tampered st=%d\n", (int)st_bad); g_fail++; }
+
+    /* --- Two valid records concatenated in one pw_conn_rx call must
+     *     NOT be merged or dropped. The first call processes ONE
+     *     request, leaving the second request buffered in the
+     *     engine's RX. A follow-up call (with no new bytes) processes
+     *     the second. --- */
+    {
+        pw_conn_t s3;
+        pw_conn_init(&s3, &c2s, &s2c);
+        tls_record_dir_t cli_tx2 = c2s; cli_tx2.seq = 0;
+        uint8_t recA[512], recB[512];
+        size_t  recA_len = tls13_seal_record(&cli_tx2,
+                                             TLS_CT_APPLICATION_DATA,
+                                             TLS_CT_APPLICATION_DATA,
+                                             request, sizeof(request) - 1,
+                                             recA, sizeof(recA));
+        size_t  recB_len = tls13_seal_record(&cli_tx2,
+                                             TLS_CT_APPLICATION_DATA,
+                                             TLS_CT_APPLICATION_DATA,
+                                             request, sizeof(request) - 1,
+                                             recB, sizeof(recB));
+        uint8_t both[1024];
+        memcpy(both,            recA, recA_len);
+        memcpy(both + recA_len, recB, recB_len);
+
+        size_t outlen_1 = 0;
+        pw_conn_status_t s_1 = pw_conn_rx(&s3, both, recA_len + recB_len,
+                                          test_response_fn, NULL,
+                                          resp_record, sizeof(resp_record),
+                                          &outlen_1);
+        if (s_1 == PW_CONN_OK && outlen_1 > 0 && s3.records_in == 1)
+             { printf("  PASS: 1st record of concatenated pair processed\n"); g_pass++; }
+        else { printf("  FAIL: concat call1 st=%d records_in=%llu\n",
+                      (int)s_1, (unsigned long long)s3.records_in); g_fail++; }
+
+        /* Now drain the second record via a no-bytes call. */
+        size_t outlen_2 = 0;
+        pw_conn_status_t s_2 = pw_conn_rx(&s3, NULL, 0,
+                                          test_response_fn, NULL,
+                                          resp_record, sizeof(resp_record),
+                                          &outlen_2);
+        if (s_2 == PW_CONN_OK && outlen_2 > 0 && s3.records_in == 2)
+             { printf("  PASS: 2nd record of concatenated pair processed on follow-up\n"); g_pass++; }
+        else { printf("  FAIL: concat call2 st=%d records_in=%llu\n",
+                      (int)s_2, (unsigned long long)s3.records_in); g_fail++; }
+    }
 }
 
 /* ---------------- TLS 1.3 Finished (RFC 8446 §4.4.4) ---------------- */

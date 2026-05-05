@@ -228,6 +228,21 @@ int            pw_tls_app_in_ack(pw_tls_engine_t* eng, size_t n);
 int pw_tls_app_out_push(pw_tls_engine_t* eng,
                         const pw_iov_t* iov, unsigned n);
 
+/* Zero-copy variant: seal the iov chain directly into a single TLS
+ * application_data record and append the record bytes to TX. This
+ * BYPASSES the app_out buffer copy, preserving the iov property end
+ * to end. Used by `pw_conn` (and any future hot-path service) that
+ * already has its response fragments laid out in immutable storage.
+ *
+ * Constraints:
+ *   - engine state must be PW_TLS_ST_APP (handshake is complete)
+ *   - sum(iov[i].len) <= TLS13_MAX_PLAINTEXT
+ *   - TX must have room for header + plaintext + 1 (type) + AEAD tag
+ *
+ * Returns 0 on success, -1 on bad state / overflow / seal failure. */
+int pw_tls_app_seal_iov(pw_tls_engine_t* eng,
+                        const pw_iov_t* iov, unsigned n);
+
 /* ---------- step ---------- */
 
 /* Drive the engine forward: open any pending records in RX (write to

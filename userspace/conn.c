@@ -4,27 +4,25 @@
  *
  * The pipeline inside `pw_conn_rx`:
  *
- *   1) Append the new bytes to rx_buf, growing rx_len.
+ *   1) Push the new bytes into the engine's RX port.
  *
- *   2) Inspect the first 5 bytes (TLS record header) to learn the
- *      ciphertext length. If we don't yet have the full record's
- *      worth of bytes, return NEED_MORE — the caller will feed us
- *      more bytes when TCP delivers them.
+ *   2) `pw_tls_step` opens any complete records into APP_IN. If
+ *      no full record is available yet, APP_IN stays empty —
+ *      return NEED_MORE.
  *
- *   3) AEAD-open the record in place. If the tag is wrong, return
- *      AUTH_FAIL and abandon the buffer (caller closes the conn).
+ *   3) The recovered plaintext (one record's worth) is handed
+ *      to `response_fn`. The callee fills a `pw_response_t` of
+ *      iov fragments pointing at long-lived storage.
  *
- *   4) Hand the recovered inner plaintext to response_fn. The
- *      callee produces a `pw_response_t` of fragment descriptors.
+ *   4) `pw_tls_app_seal_iov` seals those fragments straight from
+ *      the iov chain into a single outbound record (zero-copy —
+ *      no intermediate plaintext buffer between the response_fn's
+ *      output and the AEAD).
  *
- *   5) Seal one outbound record over the response fragments via
- *      `tls13_seal_record_iov`. The sealed bytes are written to
- *      `out` and `*out_len` is set.
+ *   5) Drain the engine's TX into the caller's `out` buffer.
  *
- *   6) Reset rx_buf for the next request (HTTP/1.1 single-shot;
- *      pipelining is handled by re-entry from the caller).
- *
- * No allocation. All paths are deterministic.
+ * No allocation. All paths are deterministic. Engine handles all
+ * AEAD state and buffer bookkeeping; this layer is plumbing.
  */
 
 #include "conn.h"
@@ -32,13 +30,21 @@
 #include <string.h>
 
 #include "crypto/util.h"
+#include "tls/engine.h"
 
 void pw_conn_init(pw_conn_t* c,
                   const tls_record_dir_t* rx_dir,
                   const tls_record_dir_t* tx_dir) {
     memset(c, 0, sizeof(*c));
-    c->rx = *rx_dir;
-    c->tx = *tx_dir;
+    pw_tls_engine_init(&c->engine);
+    /* Skip the handshake: install pre-derived application-traffic
+     * record dirs and jump straight to ST_APP. This shortcut is
+     * spike-mode only — production callers should drive the engine
+     * through a real handshake via pw_tls_engine_configure_server. */
+    pw_tls_engine_install_app_keys(&c->engine,
+                                   rx_dir->key, rx_dir->static_iv,
+                                   tx_dir->key, tx_dir->static_iv,
+                                   1 /*we_are_server*/);
 }
 
 pw_conn_status_t pw_conn_rx(pw_conn_t* c,
@@ -47,86 +53,75 @@ pw_conn_status_t pw_conn_rx(pw_conn_t* c,
                             uint8_t* out, size_t out_cap, size_t* out_len) {
     if (out_len) *out_len = 0;
 
-    /* 1) Append. Bound the rx buffer; oversize records are a
-     *    protocol error (record exceeds 2^14 + slop). */
-    if (c->rx_len + in_len > sizeof(c->rx_buf)) {
-        return PW_CONN_PROTOCOL_ERR;
+    /* 1) Push inbound bytes into the engine's RX. The engine's RX
+     *    capacity equals PW_CONN_MAX_RECORD so the bound is the same
+     *    as the legacy implementation. Oversize is a protocol error. */
+    if (in_len) {
+        size_t cap = 0;
+        uint8_t* rxp = pw_tls_rx_buf(&c->engine, &cap);
+        if (in_len > cap) return PW_CONN_PROTOCOL_ERR;
+        memcpy(rxp, in, in_len);
+        if (pw_tls_rx_ack(&c->engine, in_len) != 0) return PW_CONN_PROTOCOL_ERR;
     }
-    if (in_len) memcpy(c->rx_buf + c->rx_len, in, in_len);
-    c->rx_len += in_len;
     c->bytes_in += in_len;
 
-    /* 2) Need at least a record header to know the cipher_len. */
-    if (c->rx_len < TLS13_RECORD_HEADER_LEN) return PW_CONN_NEED_MORE;
-    size_t cipher_len = ((size_t)c->rx_buf[3] << 8) | c->rx_buf[4];
-    /* RFC 8446 §5.2: ciphertext length must fit in u16 and be
-     * <= TLSCiphertext.length cap. */
-    if (cipher_len > TLS13_MAX_CIPHERTEXT) return PW_CONN_PROTOCOL_ERR;
-    size_t record_len = TLS13_RECORD_HEADER_LEN + cipher_len;
-    if (c->rx_len < record_len) return PW_CONN_NEED_MORE;
+    /* 2) Drive the engine: open any complete record into APP_IN. */
+    int w = pw_tls_step(&c->engine);
+    if (w < 0) return PW_CONN_AUTH_FAIL;
 
-    /* 3) Decrypt in place. */
-    tls_content_type_t inner = TLS_CT_INVALID;
-    uint8_t* pt_in = NULL;
-    size_t   pt_in_len = 0;
-    int orc = tls13_open_record(&c->rx, c->rx_buf, record_len,
-                                &inner, &pt_in, &pt_in_len);
-    if (orc != 0) return PW_CONN_AUTH_FAIL;
-    if (inner != TLS_CT_APPLICATION_DATA) {
-        /* Spike: only application_data on this path. Handshake /
-         * alert / change_cipher_spec records would be steered to a
-         * separate handler in a real implementation. */
-        return PW_CONN_PROTOCOL_ERR;
-    }
-    c->records_in++;
+    size_t app_in_len = 0;
+    const uint8_t* app_in = pw_tls_app_in_buf(&c->engine, &app_in_len);
+    if (app_in_len == 0) return PW_CONN_NEED_MORE;
+    if (app_in_len > TLS13_MAX_PLAINTEXT) return PW_CONN_PROTOCOL_ERR;
 
-    /* Copy the recovered plaintext out of rx_buf into pt_buf so that
-     * (a) the response_fn sees a stable input slice that doesn't
-     * mutate when we reset rx_buf, and (b) the rx_buf is freed up
-     * for the next inbound record before we do any sealing work. */
-    if (pt_in_len > sizeof(c->pt_buf)) return PW_CONN_PROTOCOL_ERR;
-    if (pt_in_len) memcpy(c->pt_buf, pt_in, pt_in_len);
-    size_t request_len = pt_in_len;
+    /* The engine guarantees app_in is one record's worth of plaintext
+     * after a single step (try_open_one only opens one at a time and
+     * the loop bails when APP_IN is non-empty before a second open).
+     * Track records_in by inspecting the engine's counter. */
+    c->records_in = c->engine.records_in;
 
-    /* Reset rx_buf for the next record. (A future iteration could
-     * memmove any tail bytes belonging to a pipelined record — but
-     * HTTP/1.1 pipelining is rare in practice and we'd rather have
-     * the simpler invariant for now.) */
-    secure_zero(c->rx_buf, c->rx_len);
-    c->rx_len = 0;
+    /* Copy the plaintext request into a stack-stable view BEFORE we
+     * ack APP_IN — once ack'd, the engine may reuse those bytes. We
+     * use the engine's app_in_buf directly though, snapshotting the
+     * pointer/length, then ack at the very end of this function once
+     * all consumers have run. (response_fn must not retain the
+     * pointer past this call.) */
+    const uint8_t* req     = app_in;
+    size_t         req_len = app_in_len;
 
-    /* 4) Webserver-as-module: fill response. */
+    /* 3) Webserver-as-module: fill response. */
     pw_response_t resp = {0};
-    int rrc = response_fn(c->pt_buf, request_len, &resp, response_user);
-    if (rrc != 0)               return PW_CONN_RESPONSE_FAIL;
-    if (resp.n > PW_IOV_MAX_FRAGS) return PW_CONN_RESPONSE_FAIL;
+    int rrc = response_fn(req, req_len, &resp, response_user);
+    if (rrc != 0)                      { pw_tls_app_in_ack(&c->engine, app_in_len); return PW_CONN_RESPONSE_FAIL; }
+    if (resp.n > PW_IOV_MAX_FRAGS)     { pw_tls_app_in_ack(&c->engine, app_in_len); return PW_CONN_RESPONSE_FAIL; }
 
-    /* Recompute total_len defensively — the response_fn may have set
-     * it but we don't trust the input. */
+    /* Recompute total_len defensively. */
     size_t total = 0;
     for (unsigned i = 0; i < resp.n; i++) total += resp.parts[i].len;
-    if (total > TLS13_MAX_PLAINTEXT) return PW_CONN_RESPONSE_FAIL;
+    if (total > TLS13_MAX_PLAINTEXT)   { pw_tls_app_in_ack(&c->engine, app_in_len); return PW_CONN_RESPONSE_FAIL; }
 
-    /* 5) Seal one outbound record straight from the iov chain. The
-     * total length is known up front so the record header is written
-     * before any encrypt work happens — exactly the property we want
-     * from the iov path. */
+    /* Done with the inbound plaintext — release it back to the
+     * engine so the next request can be parsed. */
+    pw_tls_app_in_ack(&c->engine, app_in_len);
+
+    /* 4) Zero-copy seal from the iov chain straight into engine TX. */
     if (out_cap < TLS13_RECORD_HEADER_LEN + total + TLS13_AEAD_TAG_LEN + 1) {
         return PW_CONN_OUT_OVERFLOW;
     }
-    size_t sealed = tls13_seal_record_iov(&c->tx,
-                                          TLS_CT_APPLICATION_DATA,
-                                          TLS_CT_APPLICATION_DATA,
-                                          resp.parts, resp.n, total,
-                                          out, out_cap);
-    if (sealed == 0) return PW_CONN_OUT_OVERFLOW;
+    if (pw_tls_app_seal_iov(&c->engine, resp.parts, resp.n) != 0) {
+        return PW_CONN_OUT_OVERFLOW;
+    }
 
-    /* Wipe the plaintext request buffer — no secrets should linger
-     * across requests on the same connection. */
-    if (request_len) secure_zero(c->pt_buf, request_len);
+    /* 5) Drain TX into caller's `out` buffer. */
+    size_t tx_len = 0;
+    const uint8_t* tx = pw_tls_tx_buf(&c->engine, &tx_len);
+    if (tx_len == 0)        return PW_CONN_OUT_OVERFLOW;   /* defensive */
+    if (tx_len > out_cap)   return PW_CONN_OUT_OVERFLOW;
+    memcpy(out, tx, tx_len);
+    pw_tls_tx_ack(&c->engine, tx_len);
 
-    if (out_len) *out_len = sealed;
-    c->bytes_out += sealed;
-    c->records_out++;
+    if (out_len) *out_len = tx_len;
+    c->bytes_out   += tx_len;
+    c->records_out  = c->engine.records_out;
     return PW_CONN_OK;
 }
