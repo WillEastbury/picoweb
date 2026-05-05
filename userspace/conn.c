@@ -67,7 +67,16 @@ pw_conn_status_t pw_conn_rx(pw_conn_t* c,
 
     /* 2) Drive the engine: open any complete record into APP_IN. */
     int w = pw_tls_step(&c->engine);
-    if (w < 0) return PW_CONN_AUTH_FAIL;
+    if (w < 0) {
+        /* Fan out the engine's specific failure class:
+         *   AUTH    -> bad AEAD tag / bad client Finished : AUTH_FAIL
+         *   anything else (PROTOCOL / OVERFLOW / INTERNAL) : PROTOCOL_ERR
+         * Callers can distinguish "they sent us garbage / wrong key"
+         * from "they sent us malformed wire bytes". */
+        return (pw_tls_last_error(&c->engine) == PW_TLS_ERR_AUTH)
+                 ? PW_CONN_AUTH_FAIL
+                 : PW_CONN_PROTOCOL_ERR;
+    }
 
     size_t app_in_len = 0;
     const uint8_t* app_in = pw_tls_app_in_buf(&c->engine, &app_in_len);

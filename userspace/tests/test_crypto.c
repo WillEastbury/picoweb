@@ -3969,6 +3969,11 @@ static void test_engine_fatal_wipes_tx_and_keys(void) {
          { printf("  PASS: bad cFin moves engine to FAILED\n"); g_pass++; }
     else { printf("  FAIL: rc=%d state=%d\n", rc, pw_tls_state(eng)); g_fail++; free(eng); return; }
 
+    if (pw_tls_last_error(eng) == PW_TLS_ERR_AUTH)
+         { printf("  PASS: last_error == AUTH for bad cFin\n"); g_pass++; }
+    else { printf("  FAIL: last_error=%d (want AUTH=%d)\n",
+                  pw_tls_last_error(eng), PW_TLS_ERR_AUTH); g_fail++; }
+
     size_t tx2; (void)pw_tls_tx_buf(eng, &tx2);
     if (tx2 == 0)
          { printf("  PASS: TX cleared after fatal handshake failure\n"); g_pass++; }
@@ -3985,6 +3990,59 @@ static void test_engine_fatal_wipes_tx_and_keys(void) {
         else       { printf("  FAIL: keys_installed=%d\n", eng->keys_installed); g_fail++; }
     }
 
+    free(eng);
+}
+
+/* PROTOCOL-class error: feed the engine a record with a bogus
+ * legacy_record_version high byte (must be 0x03). The CH parser
+ * rejects it before any cipher work. last_error must be PROTOCOL,
+ * not AUTH (no AEAD ran), and not INTERNAL. */
+static void test_engine_last_error_protocol(void) {
+    printf("== TLS engine: malformed record -> PROTOCOL error ==\n");
+
+    uint8_t srv_seed[32]; for (int i = 0; i < 32; i++) srv_seed[i] = 0x33 + (uint8_t)i;
+    const uint8_t fake_cert[16] = { 0x30, 0x0e, 0x05, 0x00 };
+    const uint8_t* cert_chain = fake_cert;
+    size_t cert_lens[1] = { sizeof(fake_cert) };
+
+    pw_tls_engine_t* eng = malloc(sizeof(*eng));
+    pw_tls_engine_init(eng);
+    test_rng_state_t rng_st = { .next = 0 };
+    pw_tls_engine_configure_server(eng, test_rng, &rng_st, srv_seed,
+                                   cert_chain, cert_lens, 1);
+
+    /* Minimum-length malformed record: type=22 OK, version high byte
+     * = 0xFF (invalid), length=4, garbage body. */
+    uint8_t bad_rec[5 + 4] = { 0x16, 0xFF, 0x03, 0x00, 0x04, 0,0,0,0 };
+    size_t cap; uint8_t* rxb = pw_tls_rx_buf(eng, &cap);
+    memcpy(rxb, bad_rec, sizeof(bad_rec));
+    pw_tls_rx_ack(eng, sizeof(bad_rec));
+    int rc = pw_tls_step(eng);
+
+    if (rc < 0 && pw_tls_state(eng) == PW_TLS_ST_FAILED)
+         { printf("  PASS: malformed CH moves engine to FAILED\n"); g_pass++; }
+    else { printf("  FAIL: rc=%d state=%d\n", rc, pw_tls_state(eng)); g_fail++; free(eng); return; }
+
+    if (pw_tls_last_error(eng) == PW_TLS_ERR_PROTOCOL)
+         { printf("  PASS: last_error == PROTOCOL for malformed record\n"); g_pass++; }
+    else { printf("  FAIL: last_error=%d (want PROTOCOL=%d)\n",
+                  pw_tls_last_error(eng), PW_TLS_ERR_PROTOCOL); g_fail++; }
+
+    free(eng);
+}
+
+/* Init-time invariant: a freshly initialised engine reports
+ * PW_TLS_ERR_NONE. NULL engine reports INTERNAL (defensive). */
+static void test_engine_last_error_init(void) {
+    printf("== TLS engine: last_error init invariants ==\n");
+    pw_tls_engine_t* eng = malloc(sizeof(*eng));
+    pw_tls_engine_init(eng);
+    if (pw_tls_last_error(eng) == PW_TLS_ERR_NONE)
+         { printf("  PASS: fresh engine -> ERR_NONE\n"); g_pass++; }
+    else { printf("  FAIL: %d\n", pw_tls_last_error(eng)); g_fail++; }
+    if (pw_tls_last_error(NULL) == PW_TLS_ERR_INTERNAL)
+         { printf("  PASS: NULL engine -> ERR_INTERNAL\n"); g_pass++; }
+    else { printf("  FAIL: NULL gave %d\n", pw_tls_last_error(NULL)); g_fail++; }
     free(eng);
 }
 
@@ -4280,6 +4338,8 @@ int main(void) {
     test_engine_tolerates_dummy_ccs();
     test_engine_tolerates_dummy_ccs_split();
     test_engine_fatal_wipes_tx_and_keys();
+    test_engine_last_error_protocol();
+    test_engine_last_error_init();
     test_engine_pool();
     test_dpdk_stub();
 

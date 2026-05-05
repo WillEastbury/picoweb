@@ -122,6 +122,10 @@ pw_tls_hs_phase_t pw_tls_hs_phase(const pw_tls_engine_t* eng) {
     return eng ? eng->hs_phase : PW_TLS_HS_WAIT_CH;
 }
 
+pw_tls_err_t pw_tls_last_error(const pw_tls_engine_t* eng) {
+    return eng ? eng->last_err : PW_TLS_ERR_INTERNAL;
+}
+
 unsigned pw_tls_want(const pw_tls_engine_t* eng) {
     if (!eng) return 0;
     if (eng->state == PW_TLS_ST_CLOSED || eng->state == PW_TLS_ST_FAILED) {
@@ -142,6 +146,10 @@ unsigned pw_tls_want(const pw_tls_engine_t* eng) {
 }
 
 /* ----------------------- RX port ----------------------- */
+
+/* Forward decl: mark a pending fatal error class. Definition appears
+ * with the rest of the failure helpers below. */
+static inline void engine_mark_err(pw_tls_engine_t* eng, pw_tls_err_t e);
 
 uint8_t* pw_tls_rx_buf(pw_tls_engine_t* eng, size_t* cap) {
     if (!eng) { if (cap) *cap = 0; return NULL; }
@@ -261,7 +269,12 @@ static int try_open_one(pw_tls_engine_t* eng) {
     int rc = tls13_open_record(&eng->read,
                                eng->rx_buf, total,
                                &inner, &pt, &pt_len);
-    if (rc < 0) return -1;
+    if (rc < 0) {
+        /* AEAD authentication failed (bad tag / wrong key / tampered
+         * ciphertext). This is the canonical AUTH-class failure. */
+        engine_mark_err(eng, PW_TLS_ERR_AUTH);
+        return -1;
+    }
 
     /* tls13_open_record already advances eng->read.seq on success
      * (record.c line 109). We MUST NOT bump again here — doing so
@@ -278,6 +291,7 @@ static int try_open_one(pw_tls_engine_t* eng) {
              * and consumed the record though, so we can't actually
              * leave it - this is a logic bug in the spike. For now,
              * if APP_IN is full we drop and signal protocol error. */
+            engine_mark_err(eng, PW_TLS_ERR_OVERFLOW);
             return -1;
         }
         memcpy(eng->app_in_buf + eng->app_in_len, pt, pt_len);
@@ -360,6 +374,17 @@ static void wipe_all_key_material(pw_tls_engine_t* eng) {
     eng->keys_installed = 0;
 }
 
+/* Mark the engine as having a specific class of pending fatal error.
+ * Does NOT change state — the centralised fatal handlers in
+ * pw_tls_step transition to PW_TLS_ST_FAILED and consult last_err.
+ * If a sub-function sets a more-specific err (AUTH/INTERNAL/OVERFLOW)
+ * the centralised handler honours it; otherwise it defaults to
+ * PROTOCOL. Idempotent on the more-specific class. */
+static inline void engine_mark_err(pw_tls_engine_t* eng, pw_tls_err_t e) {
+    /* Do NOT downgrade an already-set specific error. */
+    if (eng->last_err == PW_TLS_ERR_NONE) eng->last_err = e;
+}
+
 /* Drive the server-side handshake: parse one inbound ClientHello,
  * compute the server's ECDHE keypair + handshake secrets, install
  * handshake-traffic keys for both directions, emit a plaintext
@@ -409,9 +434,13 @@ static int try_drive_handshake_server(pw_tls_engine_t* eng) {
     if (!ch.offers_ed25519)      return -1;
 
     /* Generate server randomness and X25519 ephemeral keypair. */
-    if (eng->rng_fn(eng->rng_user, eng->server_random, 32) != 0) return -1;
+    if (eng->rng_fn(eng->rng_user, eng->server_random, 32) != 0) {
+        engine_mark_err(eng, PW_TLS_ERR_INTERNAL);
+        return -1;
+    }
     if (eng->rng_fn(eng->rng_user, eng->eph_priv,      32) != 0) {
         secure_zero(eng->eph_priv, sizeof(eng->eph_priv));
+        engine_mark_err(eng, PW_TLS_ERR_INTERNAL);
         return -1;
     }
     /* RFC 7748 §5 clamping. */
@@ -700,7 +729,10 @@ static int try_recv_client_finished(pw_tls_engine_t* eng) {
     uint8_t* pt = NULL;
     size_t   pt_len = 0;
     if (tls13_open_record(&eng->read, eng->rx_buf, total,
-                          &inner, &pt, &pt_len) != 0) return -1;
+                          &inner, &pt, &pt_len) != 0) {
+        engine_mark_err(eng, PW_TLS_ERR_AUTH);
+        return -1;
+    }
 
     if (inner != TLS_CT_HANDSHAKE)            return -1;
     /* Finished message header: 0x14 + 24-bit length = 32. */
@@ -716,6 +748,7 @@ static int try_recv_client_finished(pw_tls_engine_t* eng) {
                               th_through_sf,
                               pt + 4) != 0) {
         secure_zero(th_through_sf, sizeof(th_through_sf));
+        engine_mark_err(eng, PW_TLS_ERR_AUTH);
         return -1;
     }
     secure_zero(th_through_sf, sizeof(th_through_sf));
@@ -794,6 +827,8 @@ int pw_tls_step(pw_tls_engine_t* eng) {
         eng->tx_len     = 0;
         eng->app_in_len = 0;
         eng->state      = PW_TLS_ST_FAILED;
+        if (eng->last_err == PW_TLS_ERR_NONE)
+            eng->last_err = PW_TLS_ERR_PROTOCOL;
         return -1;
     }
 
@@ -807,13 +842,23 @@ int pw_tls_step(pw_tls_engine_t* eng) {
     do {
         if (eng->app_in_len > 0) break;   /* caller must drain first */
         rc = try_open_one(eng);
-        if (rc < 0) { eng->state = PW_TLS_ST_FAILED; return -1; }
+        if (rc < 0) {
+            eng->state = PW_TLS_ST_FAILED;
+            if (eng->last_err == PW_TLS_ERR_NONE)
+                eng->last_err = PW_TLS_ERR_PROTOCOL;
+            return -1;
+        }
     } while (rc == 1 && eng->state == PW_TLS_ST_APP);
 
     /* Drain APP_OUT -> TX, one record at a time, until empty / TX full. */
     do {
         rc = try_seal_one(eng);
-        if (rc < 0) { eng->state = PW_TLS_ST_FAILED; return -1; }
+        if (rc < 0) {
+            eng->state = PW_TLS_ST_FAILED;
+            if (eng->last_err == PW_TLS_ERR_NONE)
+                eng->last_err = PW_TLS_ERR_INTERNAL;
+            return -1;
+        }
     } while (rc == 1);
 
     return (int)pw_tls_want(eng);

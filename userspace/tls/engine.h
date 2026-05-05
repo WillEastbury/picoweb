@@ -60,6 +60,31 @@ typedef enum {
     PW_TLS_ST_FAILED    = 3,   /* fatal protocol error - engine inert      */
 } pw_tls_state_t;
 
+/* Reason the engine entered PW_TLS_ST_FAILED. Set by the engine
+ * before transitioning to FAILED; readable via pw_tls_last_error.
+ *
+ *   NONE      no fatal error has occurred (engine is healthy or
+ *             deliberately CLOSED rather than FAILED)
+ *   AUTH      cryptographic authentication failed: AEAD tag
+ *             rejected or peer Finished verify_data mismatch.
+ *             This is the only class that strongly suggests a
+ *             tampered or wrong-keyed peer.
+ *   PROTOCOL  malformed wire format, unexpected content type,
+ *             oversize record, unsupported version/cipher, etc.
+ *             Default for any fatal that isn't explicitly tagged.
+ *   OVERFLOW  caller exceeded a buffer cap (pushed plaintext too
+ *             large to seal in one record, etc.)
+ *   INTERNAL  an internal subsystem failed (RNG, build helper).
+ *             Almost certainly a bug in the engine or its host.
+ */
+typedef enum {
+    PW_TLS_ERR_NONE     = 0,
+    PW_TLS_ERR_AUTH     = 1,
+    PW_TLS_ERR_PROTOCOL = 2,
+    PW_TLS_ERR_OVERFLOW = 3,
+    PW_TLS_ERR_INTERNAL = 4,
+} pw_tls_err_t;
+
 /* Sub-state inside HANDSHAKE — tracks where we are in the handshake
  * flight. Only meaningful while state == PW_TLS_ST_HANDSHAKE. */
 typedef enum {
@@ -84,6 +109,7 @@ typedef int (*pw_tls_rng_fn)(void* user, uint8_t* dst, size_t n);
 typedef struct pw_tls_engine {
     pw_tls_state_t    state;
     pw_tls_hs_phase_t hs_phase;
+    pw_tls_err_t      last_err;     /* set on transition to FAILED        */
 
     /* Inbound ciphertext (post-TCP, pre-AEAD). */
     uint8_t  rx_buf[PW_TLS_BUF_CAP];
@@ -197,6 +223,11 @@ void pw_tls_close(pw_tls_engine_t* eng);
 pw_tls_state_t    pw_tls_state(const pw_tls_engine_t* eng);
 pw_tls_hs_phase_t pw_tls_hs_phase(const pw_tls_engine_t* eng);
 unsigned          pw_tls_want(const pw_tls_engine_t* eng);
+
+/* Reason for the most recent transition to PW_TLS_ST_FAILED. Returns
+ * PW_TLS_ERR_NONE if the engine has not failed (including when it is
+ * deliberately CLOSED). Stable until the engine is re-init'd. */
+pw_tls_err_t      pw_tls_last_error(const pw_tls_engine_t* eng);
 
 /* ---------- RX port (caller writes ciphertext into engine) ---------- */
 
