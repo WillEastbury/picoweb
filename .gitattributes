@@ -1,0 +1,14 @@
+# picoweb is Linux-only; force LF on every file regardless of host OS.
+* text=auto eol=lf
+
+# Binary file types that must not be touched.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.webp binary
+*.woff binary
+*.woff2 binary
+*.ttf binary
+*.eot binary
