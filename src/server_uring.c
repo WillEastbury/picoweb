@@ -4,7 +4,7 @@
  *   Selected at build time via `make uring` which produces the binary
  *   `picoweb_uring`. The epoll worker (server.c) is excluded from that
  *   build via a Makefile filter; only one backend is linked at a time
- *   so server_worker_main has a single definition.
+ *   so uring_worker_main has a single definition.
  *
  *   No third-party libraries: this file talks to io_uring via raw
  *   syscalls (io_uring_setup / io_uring_enter), the kernel-provided
@@ -408,7 +408,7 @@ static bool dispatch_one(conn_t* c, const jumptable_t* jt, uint32_t max_req) {
 /* Worker entry point — symbol shared with the epoll backend.     */
 /* ============================================================== */
 
-void* server_worker_main(void* arg) {
+void* uring_worker_main(void* arg) {
     server_cfg_t* cfg = (server_cfg_t*)arg;
 
     if (g_metrics && cfg->worker_index >= 0 && cfg->worker_index < g_n_workers) {

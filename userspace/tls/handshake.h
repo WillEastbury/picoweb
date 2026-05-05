@@ -1,0 +1,109 @@
+/*
+ * TLS 1.3 handshake message parsing + building (RFC 8446 §4).
+ *
+ * Spike scope:
+ *   - Parse ClientHello: extract random, cipher_suites scan,
+ *     extensions: server_name (RFC 6066), supported_groups,
+ *     key_share (X25519), supported_versions (must offer 0x0304).
+ *
+ *   - Build ServerHello: random, fixed cipher_suite=TLS_CHACHA20_
+ *     POLY1305_SHA256 (0x1303), extensions: supported_versions=
+ *     0x0304, key_share (our X25519 pubkey echo).
+ *
+ *   - Compute the TLS 1.3 handshake-secrets layer: derive
+ *     handshake_secret from (early_secret, ECDHE_shared, transcript)
+ *     and from there the per-direction handshake traffic secrets.
+ *
+ * NOT in scope here (deferred): EncryptedExtensions, Certificate,
+ * CertificateVerify (needs Ed25519/ECDSA signing), Finished, post-
+ * handshake key updates. The parser/builder are sufficient to bring
+ * the skeleton up to the point where openssl s_client could be
+ * pointed at it and observe a valid ServerHello reply.
+ *
+ * Memory model:
+ *   - Parser writes into a caller-provided `tls13_client_hello_t`.
+ *     No allocations. SNI hostname is copied into a fixed buffer.
+ *   - Builder writes wire bytes into a caller-provided buffer with
+ *     bounds checking; returns the written length or -1 on overflow.
+ */
+#ifndef PICOWEB_USERSPACE_TLS_HANDSHAKE_H
+#define PICOWEB_USERSPACE_TLS_HANDSHAKE_H
+
+#include <stddef.h>
+#include <stdint.h>
+
+#define TLS13_RANDOM_LEN          32u
+#define TLS13_CHACHA20_POLY1305_SHA256  0x1303u
+#define TLS13_SUPPORTED_VERSION   0x0304u
+#define TLS13_NAMED_GROUP_X25519  0x001du
+
+/* Maximum hostname extracted from SNI; oversized SNI rejected. */
+#define TLS13_MAX_SNI_LEN  253u
+
+/* Parsed ClientHello — only fields we actually need to make decisions. */
+typedef struct {
+    uint8_t  random[TLS13_RANDOM_LEN];
+
+    /* Whether the client offered TLS_CHACHA20_POLY1305_SHA256. */
+    int      offers_chacha_poly;
+
+    /* Whether the client advertised supported_versions=TLS 1.3. */
+    int      offers_tls13;
+
+    /* Whether the client offered the X25519 named group AND a
+     * key_share for it. If yes, ecdhe_pubkey is populated. */
+    int      offers_x25519;
+    uint8_t  ecdhe_pubkey[32];
+
+    /* Server name (lowercased, ASCII; empty if no SNI). */
+    char     sni[TLS13_MAX_SNI_LEN + 1];
+    size_t   sni_len;
+
+    /* Pointer to the original ClientHello bytes (handshake-msg
+     * including the 4-byte handshake header). Used to feed the
+     * transcript hash. */
+    const uint8_t* raw;
+    size_t         raw_len;
+} tls13_client_hello_t;
+
+/* Parse a ClientHello from the wire. `msg` points at the first byte
+ * of the handshake message header (0x01 client_hello, then 24-bit
+ * length). `msg_len` is the total length of msg.
+ *
+ * Returns 0 on success, -1 on parse error or unsupported field. */
+int tls13_parse_client_hello(const uint8_t* msg, size_t msg_len,
+                             tls13_client_hello_t* out);
+
+/* Build a ServerHello in `out[0..out_cap)`. The handshake header
+ * (0x02 server_hello + 24-bit length) is included.
+ *
+ * Inputs:
+ *   server_random[32]    — fresh server random
+ *   our_pubkey[32]       — our X25519 ephemeral pubkey to echo back
+ *
+ * Returns the number of bytes written, or -1 on overflow. */
+int tls13_build_server_hello(uint8_t* out, size_t out_cap,
+                             const uint8_t server_random[TLS13_RANDOM_LEN],
+                             const uint8_t our_pubkey[32]);
+
+/* Compute the TLS 1.3 handshake-phase secrets per RFC 8446 §7.1.
+ *
+ * Inputs:
+ *   ecdhe_shared[32]     — output of X25519(our_priv, peer_pub)
+ *   transcript_hash[32]  — SHA-256 of (ClientHello || ServerHello),
+ *                          AS THEY APPEAR ON THE WIRE (handshake
+ *                          headers included).
+ *
+ * Outputs (all 32 bytes):
+ *   handshake_secret               — RFC 8446 §7.1
+ *   client_handshake_traffic_secret
+ *   server_handshake_traffic_secret
+ *
+ * Returns 0 on success, -1 on internal error. */
+int tls13_compute_handshake_secrets(const uint8_t ecdhe_shared[32],
+                                    const uint8_t transcript_hash[32],
+                                    uint8_t handshake_secret[32],
+                                    uint8_t client_hs_traffic_secret[32],
+                                    uint8_t server_hs_traffic_secret[32]);
+
+#endif

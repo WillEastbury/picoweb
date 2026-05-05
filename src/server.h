@@ -5,6 +5,12 @@
 
 #include "jumptable.h"
 
+typedef enum {
+    PICOWEB_BACKEND_EPOLL = 0,
+    PICOWEB_BACKEND_URING,
+    PICOWEB_BACKEND_DPDK,
+} picoweb_backend_t;
+
 typedef struct {
     const jumptable_t* jt;
     int      port;
@@ -21,8 +27,11 @@ typedef struct {
     size_t   zerocopy_threshold;
 } server_cfg_t;
 
-/* Run a worker thread loop. Never returns under normal operation; on
- * fatal error logs and exits the process. */
-void* server_worker_main(void* arg);
+/* Backend worker entrypoints. Each takes a server_cfg_t* and runs
+ * the per-worker loop. Picked at runtime by main.c based on the
+ * --io_uring / --dpdk flags. Default is epoll. */
+void* epoll_worker_main(void* arg);
+void* uring_worker_main(void* arg);
+void* dpdk_worker_main(void* arg);
 
 #endif

@@ -10,6 +10,8 @@
 #include <string.h>
 
 #include "../crypto/chacha20_poly1305.h"
+#include "../crypto/util.h"
+#include "../iov.h"
 
 void tls13_build_nonce(const tls_record_dir_t* dir, uint8_t nonce[12]) {
     /* Per RFC 8446 §5.3: nonce = static_iv XOR (seq padded with leading zeros). */
@@ -53,7 +55,57 @@ size_t tls13_seal_record(tls_record_dir_t* dir,
                                 out, TLS13_RECORD_HEADER_LEN,
                                 body, inner_len,
                                 body, body + inner_len);
-    memset(nonce, 0, sizeof(nonce));
+    secure_zero(nonce, sizeof(nonce));
+    dir->seq++;
+    return wire_len;
+}
+
+size_t tls13_seal_record_iov(tls_record_dir_t* dir,
+                             tls_content_type_t inner_type,
+                             tls_content_type_t outer_type,
+                             const struct pw_iov* pt_iov, unsigned pt_iov_n,
+                             size_t total_plaintext_len,
+                             uint8_t* out, size_t out_cap) {
+    /* Same length math as the contiguous path; we can pre-write the
+     * record header (which is also the AEAD AAD) before any encrypt
+     * work happens. This is exactly what the user wanted from the
+     * "calculate length before TLS is hit" property: the wire
+     * preamble is determined the moment the iov chain is handed to
+     * us. */
+    size_t inner_len  = total_plaintext_len + 1;
+    size_t cipher_len = inner_len + TLS13_AEAD_TAG_LEN;
+    size_t wire_len   = TLS13_RECORD_HEADER_LEN + cipher_len;
+
+    if (cipher_len > 0xffff)                     return 0;
+    if (wire_len   > out_cap)                    return 0;
+    if (total_plaintext_len > TLS13_MAX_PLAINTEXT) return 0;
+
+    out[0] = (uint8_t)outer_type;
+    out[1] = 0x03; out[2] = 0x03;
+    out[3] = (uint8_t)(cipher_len >> 8);
+    out[4] = (uint8_t)cipher_len;
+
+    uint8_t* body     = out + TLS13_RECORD_HEADER_LEN;
+    uint8_t* tag_dst  = body + inner_len;
+
+    /* Append the inner type trailer as a single 1-byte fragment so
+     * the AEAD seals (plaintext_iov || type_byte) without any other
+     * code path needing to know about the trailer convention. */
+    pw_iov_t local[PW_IOV_MAX_FRAGS + 1];
+    if (pt_iov_n + 1 > sizeof(local) / sizeof(local[0])) return 0;
+    for (unsigned i = 0; i < pt_iov_n; i++) local[i] = pt_iov[i];
+    uint8_t type_byte = (uint8_t)inner_type;
+    local[pt_iov_n].base = &type_byte;
+    local[pt_iov_n].len  = 1;
+
+    uint8_t nonce[12];
+    tls13_build_nonce(dir, nonce);
+    aead_chacha20_poly1305_seal_iov(dir->key, nonce,
+                                    out, TLS13_RECORD_HEADER_LEN,
+                                    local, pt_iov_n + 1,
+                                    inner_len,
+                                    body, tag_dst);
+    secure_zero(nonce, sizeof(nonce));
     dir->seq++;
     return wire_len;
 }
@@ -76,7 +128,7 @@ int tls13_open_record(tls_record_dir_t* dir,
                                          inner_len,
                                          record + TLS13_RECORD_HEADER_LEN + inner_len,
                                          record + TLS13_RECORD_HEADER_LEN);
-    memset(nonce, 0, sizeof(nonce));
+    secure_zero(nonce, sizeof(nonce));
     if (rc != 0) return -1;
 
     /* Strip trailing zero padding from the inner plaintext to find

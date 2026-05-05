@@ -535,7 +535,7 @@ static void sweep_idle(pool_t* pool, int ep, int64_t now_ms, int64_t idle_ms) {
 /* Worker main                                                    */
 /* ============================================================== */
 
-void* server_worker_main(void* arg) {
+void* epoll_worker_main(void* arg) {
     server_cfg_t* cfg = (server_cfg_t*)arg;
 
     /* Bind this thread to its own per-worker metrics_t. The hot path

@@ -68,6 +68,18 @@ size_t tls13_seal_record(tls_record_dir_t* dir,
                          const uint8_t* plaintext, size_t plaintext_len,
                          uint8_t* out, size_t out_cap);
 
+/* Scatter-gather variant. The plaintext is the concatenation of
+ * `pt_iov[0..pt_iov_n-1]` (total = `total_plaintext_len`); the type
+ * trailer is appended internally. Output and bounds rules match the
+ * contiguous variant. */
+struct pw_iov;
+size_t tls13_seal_record_iov(tls_record_dir_t* dir,
+                             tls_content_type_t inner_type,
+                             tls_content_type_t outer_type,
+                             const struct pw_iov* pt_iov, unsigned pt_iov_n,
+                             size_t total_plaintext_len,
+                             uint8_t* out, size_t out_cap);
+
 /* Decrypt a record in place. `record` points at the wire bytes
  * starting with the 5-byte header. On success returns the inner
  * plaintext length and writes the recovered TLSInnerPlaintext.type

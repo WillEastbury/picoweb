@@ -1,21 +1,27 @@
 /*
- * SHA-256 (FIPS 180-4) — pure C reference implementation.
+ * SHA-256 (FIPS 180-4) — pure C reference implementation, plus
+ * runtime dispatch to a hardware-accelerated path when available.
  *
- * The compression function `sha256_compress` is the core; everything
- * else is buffering and length encoding. Verified against the four
- * well-known short-message NIST CAVP test vectors and against the
- * RFC 6234 sample vectors in tests/test_sha256.c.
+ * The compression core is `sha256_compress_scalar`; HW alternatives
+ * live in sibling translation units (sha256_shani.c on x86,
+ * sha256_armv8.c on aarch64) so each can be compiled with its own
+ * `-mtarget`/intrinsic baseline without polluting this TU.
+ *
+ * The dispatch pointer `sha256_compress_fn` is selected on first
+ * use via `sha256_select_impl()`. The scalar default makes the
+ * unselected case still safe.
  *
  * Memory:
  *   - All state is on the caller-provided sha256_ctx (no allocations).
- *   - The compression function copies the message block into 64
- *     32-bit words on the stack (256 bytes) plus the 8 working
- *     registers a..h.
+ *   - Scalar compression copies blocks into 64 32-bit words on the
+ *     stack (256 bytes) plus the 8 working registers a..h.
  */
 
 #include "sha256.h"
 
 #include <string.h>
+
+#include "cpuid.h"
 
 /* FIPS 180-4 §4.2.2 — first 32 bits of the fractional parts of the
  * cube roots of the first 64 primes (2..311). */
@@ -71,7 +77,7 @@ static inline void store_be32(uint8_t* p, uint32_t v) {
     p[2] = (uint8_t)(v >> 8);  p[3] = (uint8_t)v;
 }
 
-static void sha256_compress(uint32_t state[8], const uint8_t block[64]) {
+static void compress_one(uint32_t state[8], const uint8_t block[64]) {
     uint32_t w[64];
     for (int i = 0; i < 16; i++) {
         w[i] = load_be32(block + i * 4);
@@ -92,6 +98,41 @@ static void sha256_compress(uint32_t state[8], const uint8_t block[64]) {
 
     state[0] += a; state[1] += b; state[2] += c; state[3] += d;
     state[4] += e; state[5] += f; state[6] += g; state[7] += h;
+}
+
+void sha256_compress_scalar(uint32_t state[8], const uint8_t* blocks, size_t nblocks) {
+    for (size_t i = 0; i < nblocks; i++) {
+        compress_one(state, blocks + i * SHA256_BLOCK_LEN);
+    }
+}
+
+/* Default to scalar; sha256_select_impl() may switch to a HW path. */
+sha256_compress_fn_t sha256_compress_fn = sha256_compress_scalar;
+static const char*   sha256_impl_label  = "scalar";
+
+void sha256_select_impl(void) {
+    const cpu_features_t* f = cpu_features_init();
+#if defined(__x86_64__) || defined(__i386__)
+    if (f->x86_sha && f->x86_sse41) {
+        sha256_compress_fn = sha256_compress_shani;
+        sha256_impl_label  = "sha-ni";
+        return;
+    }
+#endif
+#if defined(__aarch64__)
+    if (f->arm_sha2) {
+        sha256_compress_fn = sha256_compress_armv8;
+        sha256_impl_label  = "armv8-sha2";
+        return;
+    }
+#endif
+    (void)f;
+    sha256_compress_fn = sha256_compress_scalar;
+    sha256_impl_label  = "scalar";
+}
+
+const char* sha256_impl_name(void) {
+    return sha256_impl_label;
 }
 
 /* FIPS 180-4 §5.3.3 — initial hash values for SHA-256:
@@ -123,17 +164,19 @@ void sha256_update(sha256_ctx* c, const void* data, size_t len) {
             return;
         }
         memcpy(c->buf + c->buf_len, p, need);
-        sha256_compress(c->state, c->buf);
+        sha256_compress_fn(c->state, c->buf, 1);
         c->buf_len = 0;
         p   += need;
         len -= need;
     }
 
     /* Consume full blocks straight from the caller's buffer. */
-    while (len >= SHA256_BLOCK_LEN) {
-        sha256_compress(c->state, p);
-        p   += SHA256_BLOCK_LEN;
-        len -= SHA256_BLOCK_LEN;
+    if (len >= SHA256_BLOCK_LEN) {
+        size_t nblocks = len / SHA256_BLOCK_LEN;
+        sha256_compress_fn(c->state, p, nblocks);
+        size_t consumed = nblocks * SHA256_BLOCK_LEN;
+        p   += consumed;
+        len -= consumed;
     }
 
     /* Stash the remainder. */
@@ -149,7 +192,7 @@ void sha256_final(sha256_ctx* c, uint8_t out[SHA256_DIGEST_LEN]) {
     c->buf[c->buf_len++] = 0x80;
     if (c->buf_len > 56) {
         memset(c->buf + c->buf_len, 0, SHA256_BLOCK_LEN - c->buf_len);
-        sha256_compress(c->state, c->buf);
+        sha256_compress_fn(c->state, c->buf, 1);
         c->buf_len = 0;
     }
     memset(c->buf + c->buf_len, 0, 56 - c->buf_len);
@@ -157,7 +200,7 @@ void sha256_final(sha256_ctx* c, uint8_t out[SHA256_DIGEST_LEN]) {
     for (int i = 0; i < 8; i++) {
         c->buf[56 + i] = (uint8_t)(c->bitlen >> (56 - i * 8));
     }
-    sha256_compress(c->state, c->buf);
+    sha256_compress_fn(c->state, c->buf, 1);
 
     for (int i = 0; i < 8; i++) {
         store_be32(out + i * 4, c->state[i]);

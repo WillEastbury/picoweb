@@ -18,10 +18,17 @@
 #include "../crypto/poly1305.h"
 #include "../crypto/chacha20_poly1305.h"
 #include "../crypto/x25519.h"
+#include "../crypto/cpuid.h"
+#include "../crypto/pool.h"
 #include "../tls/keysched.h"
 #include "../tls/record.h"
+#include "../tls/pem.h"
+#include "../tls/cert.h"
+#include "../tls/handshake.h"
+#include "../crypto/x25519.h"
 #include "../tcp/ip.h"
 #include "../tcp/tcp.h"
+#include "../iov.h"
 
 static int g_pass = 0;
 static int g_fail = 0;
@@ -634,11 +641,732 @@ static void test_tcp_state(void) {
     else                          { printf("  FAIL: state=%d not CLOSED\n", srv->state); g_fail++; }
 }
 
+/* ============================================================== */
+/* SHA-256 dispatch — verify scalar and HW path agree on vectors. */
+/* ============================================================== */
+static void test_sha256_dispatch(void) {
+    printf("== SHA-256 dispatch (scalar vs HW) ==\n");
+
+    /* Same input as RFC 6234 §8.5 vector 2. */
+    const char* msg = "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq";
+    const size_t msg_len = 56;
+    const uint8_t expected[32] = {
+        0x24,0x8d,0x6a,0x61,0xd2,0x06,0x38,0xb8,0xe5,0xc0,0x26,0x93,0x0c,0x3e,0x60,0x39,
+        0xa3,0x3c,0xe4,0x59,0x64,0xff,0x21,0x67,0xf6,0xec,0xed,0xd4,0x19,0xdb,0x06,0xc1
+    };
+
+    /* Force the scalar path. */
+    sha256_compress_fn_t saved = sha256_compress_fn;
+    sha256_compress_fn = sha256_compress_scalar;
+    uint8_t scalar_out[32];
+    sha256(msg, msg_len, scalar_out);
+    check_eq("scalar matches RFC 6234 vec 2", scalar_out, expected, 32);
+
+#if defined(__x86_64__) || defined(__i386__)
+    if (cpu_features()->x86_sha && cpu_features()->x86_sse41) {
+        sha256_compress_fn = sha256_compress_shani;
+        uint8_t hw_out[32];
+        sha256(msg, msg_len, hw_out);
+        check_eq("sha-ni matches RFC 6234 vec 2", hw_out, expected, 32);
+
+        /* Multi-block stress: 8 blocks of 'a'*64. */
+        sha256_ctx c;
+        uint8_t blk[64]; memset(blk, 'a', sizeof(blk));
+        sha256_compress_fn = sha256_compress_scalar;
+        sha256_init(&c);
+        for (int i = 0; i < 8; i++) sha256_update(&c, blk, sizeof(blk));
+        uint8_t scalar_multi[32]; sha256_final(&c, scalar_multi);
+
+        sha256_compress_fn = sha256_compress_shani;
+        sha256_init(&c);
+        for (int i = 0; i < 8; i++) sha256_update(&c, blk, sizeof(blk));
+        uint8_t hw_multi[32]; sha256_final(&c, hw_multi);
+        check_eq("sha-ni 8-block matches scalar", hw_multi, scalar_multi, 32);
+
+        /* Large run-through: 1 MiB of zeros, scalar vs HW. */
+        sha256_compress_fn = sha256_compress_scalar;
+        sha256_init(&c);
+        uint8_t zero[1024]; memset(zero, 0, sizeof(zero));
+        for (int i = 0; i < 1024; i++) sha256_update(&c, zero, sizeof(zero));
+        uint8_t scalar_big[32]; sha256_final(&c, scalar_big);
+
+        sha256_compress_fn = sha256_compress_shani;
+        sha256_init(&c);
+        for (int i = 0; i < 1024; i++) sha256_update(&c, zero, sizeof(zero));
+        uint8_t hw_big[32]; sha256_final(&c, hw_big);
+        check_eq("sha-ni 1MiB-zeros matches scalar", hw_big, scalar_big, 32);
+    } else {
+        printf("  SKIP: SHA-NI not available on this CPU\n");
+    }
+#endif
+
+    sha256_compress_fn = saved;
+}
+
+/* ============================================================== */
+/* Buffer pool — rent/release behaviour, exhaustion, no-alloc path */
+/* ============================================================== */
+static void test_buffer_pool(void) {
+    printf("== Buffer pool ==\n");
+
+    /* 4 slots of 64 bytes each. */
+    static uint8_t storage[64 * 4] __attribute__((aligned(8)));
+    buffer_pool_t pool;
+    int rc = pool_init(&pool, storage, 64, 4);
+    if (rc == 0) { printf("  PASS: pool_init succeeded\n"); g_pass++; }
+    else         { printf("  FAIL: pool_init rc=%d\n", rc); g_fail++; }
+
+    void* a = pool_rent(&pool);
+    void* b = pool_rent(&pool);
+    void* c = pool_rent(&pool);
+    void* d = pool_rent(&pool);
+    void* e = pool_rent(&pool);            /* should fail — exhausted */
+
+    if (a && b && c && d && !e) {
+        printf("  PASS: rented 4 slots, 5th returns NULL\n"); g_pass++;
+    } else {
+        printf("  FAIL: rent sequence wrong: a=%p b=%p c=%p d=%p e=%p\n",
+               a, b, c, d, e); g_fail++;
+    }
+
+    if (pool.exhaustion_count == 1) {
+        printf("  PASS: exhaustion counter == 1\n"); g_pass++;
+    } else {
+        printf("  FAIL: exhaustion counter = %llu\n",
+               (unsigned long long)pool.exhaustion_count); g_fail++;
+    }
+    if (pool.high_water == 4) {
+        printf("  PASS: high water == 4\n"); g_pass++;
+    } else {
+        printf("  FAIL: high_water = %u\n", pool.high_water); g_fail++;
+    }
+
+    /* Release in non-LIFO order; subsequent rents should succeed. */
+    pool_release(&pool, b);
+    pool_release(&pool, d);
+    void* x = pool_rent(&pool);
+    void* y = pool_rent(&pool);
+    void* z = pool_rent(&pool);            /* exhausted again */
+
+    if (x && y && !z) {
+        printf("  PASS: release+rerent works\n"); g_pass++;
+    } else {
+        printf("  FAIL: x=%p y=%p z=%p\n", x, y, z); g_fail++;
+    }
+
+    /* Bounds: returned pointers all sit inside storage. */
+    int all_in_range = 1;
+    void* slots[] = {a, c, x, y};
+    for (size_t i = 0; i < sizeof(slots)/sizeof(slots[0]); i++) {
+        uint8_t* p = (uint8_t*)slots[i];
+        if (p < storage || p >= storage + sizeof(storage)) all_in_range = 0;
+    }
+    if (all_in_range) { printf("  PASS: slots within storage bounds\n"); g_pass++; }
+    else              { printf("  FAIL: slot out of bounds\n"); g_fail++; }
+}
+
+/* ============================================================== */
+/* ChaCha20 dispatch — scalar vs SSE2 agreement across lengths.   */
+/* ============================================================== */
+static void test_chacha20_dispatch(void) {
+    printf("== ChaCha20 dispatch (scalar vs SSE2) ==\n");
+
+#if defined(__x86_64__) || defined(__i386__)
+    if (!cpu_features()->x86_sse2) {
+        printf("  SKIP: SSE2 not available\n");
+        return;
+    }
+
+    /* Random-looking but deterministic key + nonce. */
+    uint8_t key[32], nonce[12];
+    for (int i = 0; i < 32; i++) key[i]   = (uint8_t)(i * 7 + 3);
+    for (int i = 0; i < 12; i++) nonce[i] = (uint8_t)(i * 11 + 5);
+
+    /* Lengths chosen to exercise: <64 (sub-block), 64, 128, 192, 256
+     * (exact 4-block boundary), 257 (4-block + 1), 511 (just under
+     * 8 blocks), 1024 (16 blocks), 4096 (64 blocks — many SIMD
+     * iterations). Plus a counter wrap-ish test at high counter. */
+    size_t lens[] = {0, 1, 7, 31, 63, 64, 65, 127, 128, 191, 192,
+                     255, 256, 257, 320, 511, 512, 1023, 1024, 4096};
+    int all_match = 1;
+    for (size_t li = 0; li < sizeof(lens)/sizeof(lens[0]); li++) {
+        size_t L = lens[li];
+        uint8_t* src     = (uint8_t*)malloc(L + 16);
+        uint8_t* out_s   = (uint8_t*)malloc(L + 16);
+        uint8_t* out_h   = (uint8_t*)malloc(L + 16);
+        for (size_t i = 0; i < L; i++) src[i] = (uint8_t)(i ^ 0x55);
+
+        chacha20_xor_scalar(key, 1, nonce, src, out_s, L);
+        chacha20_xor_sse2  (key, 1, nonce, src, out_h, L);
+        if (memcmp(out_s, out_h, L) != 0) {
+            printf("  FAIL: mismatch at len=%zu\n", L);
+            all_match = 0;
+        }
+        free(src); free(out_s); free(out_h);
+    }
+    if (all_match) {
+        printf("  PASS: scalar == SSE2 across 20 lengths up to 4096\n");
+        g_pass++;
+    } else {
+        g_fail++;
+    }
+
+    /* Sanity: SSE2 round-trip (encrypt then decrypt restores plaintext). */
+    uint8_t buf[300], orig[300];
+    for (size_t i = 0; i < sizeof(buf); i++) orig[i] = buf[i] = (uint8_t)i;
+    chacha20_xor_sse2(key, 7, nonce, buf, buf, sizeof(buf));
+    chacha20_xor_sse2(key, 7, nonce, buf, buf, sizeof(buf));
+    if (memcmp(buf, orig, sizeof(buf)) == 0) {
+        printf("  PASS: SSE2 round-trip restores plaintext\n"); g_pass++;
+    } else {
+        printf("  FAIL: SSE2 round-trip\n"); g_fail++;
+    }
+#else
+    printf("  SKIP: not x86\n");
+#endif
+}
+
+/* ============================================================== */
+/* PEM decoder + cert loader.                                     */
+/* ============================================================== */
+
+/* Base64 encoder used ONLY in tests, to construct synthetic PEMs
+ * from raw bytes. Production code never needs to encode PEM. */
+static const char b64alpha[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+static size_t b64_encode_test(const uint8_t* in, size_t in_len,
+                              char* out, size_t out_cap) {
+    size_t o = 0;
+    for (size_t i = 0; i < in_len; i += 3) {
+        size_t r = in_len - i;
+        uint32_t v = (uint32_t)in[i] << 16;
+        if (r > 1) v |= (uint32_t)in[i + 1] << 8;
+        if (r > 2) v |= (uint32_t)in[i + 2];
+        if (o + 4 > out_cap) return 0;
+        out[o++] = b64alpha[(v >> 18) & 0x3F];
+        out[o++] = b64alpha[(v >> 12) & 0x3F];
+        out[o++] = (r > 1) ? b64alpha[(v >> 6) & 0x3F] : '=';
+        out[o++] = (r > 2) ? b64alpha[v & 0x3F]       : '=';
+    }
+    return o;
+}
+
+static void test_pem(void) {
+    printf("== PEM decoder ==\n");
+
+    /* Round-trip: encode 32 bytes of known content to PEM, decode,
+     * verify equality. */
+    uint8_t in[32];
+    for (int i = 0; i < 32; i++) in[i] = (uint8_t)(i + 0x10);
+    char b64[64]; size_t b64_len = b64_encode_test(in, sizeof(in), b64, sizeof(b64));
+    if (b64_len == 0) { printf("  FAIL: b64 encode\n"); g_fail++; return; }
+
+    char pem[256];
+    int n = snprintf(pem, sizeof(pem),
+                     "-----BEGIN CERTIFICATE-----\n%.*s\n-----END CERTIFICATE-----\n",
+                     (int)b64_len, b64);
+
+    uint8_t out[64];
+    int dlen = pem_decode(pem, (size_t)n, "CERTIFICATE", out, sizeof(out));
+    if (dlen == 32 && memcmp(out, in, 32) == 0) {
+        printf("  PASS: 32-byte CERTIFICATE round-trip\n"); g_pass++;
+    } else {
+        printf("  FAIL: round-trip dlen=%d\n", dlen); g_fail++;
+    }
+
+    /* Wrong label rejected. */
+    int rc = pem_decode(pem, (size_t)n, "PRIVATE KEY", out, sizeof(out));
+    if (rc < 0) { printf("  PASS: label mismatch rejected\n"); g_pass++; }
+    else        { printf("  FAIL: label mismatch accepted (%d)\n", rc); g_fail++; }
+
+    /* Truncated body rejected (no END marker). */
+    char truncated[256];
+    int tn = snprintf(truncated, sizeof(truncated),
+                      "-----BEGIN CERTIFICATE-----\n%.*s\n", (int)b64_len, b64);
+    rc = pem_decode(truncated, (size_t)tn, "CERTIFICATE", out, sizeof(out));
+    if (rc < 0) { printf("  PASS: missing END marker rejected\n"); g_pass++; }
+    else        { printf("  FAIL: truncated PEM accepted (%d)\n", rc); g_fail++; }
+
+    /* Chain decode: 2 concatenated CERTIFICATE blocks. */
+    char chain_pem[512];
+    int cn = snprintf(chain_pem, sizeof(chain_pem),
+                      "-----BEGIN CERTIFICATE-----\n%.*s\n-----END CERTIFICATE-----\n"
+                      "-----BEGIN CERTIFICATE-----\n%.*s\n-----END CERTIFICATE-----\n",
+                      (int)b64_len, b64, (int)b64_len, b64);
+    int count = 0;
+    int chain_len = pem_decode_chain(chain_pem, (size_t)cn, "CERTIFICATE",
+                                     out, sizeof(out), &count);
+    if (chain_len == 64 && count == 2) {
+        printf("  PASS: chain decode (2x32 = 64 bytes, count=2)\n"); g_pass++;
+    } else {
+        printf("  FAIL: chain decode len=%d count=%d\n", chain_len, count); g_fail++;
+    }
+}
+
+/* Build a synthetic minimal-but-valid cert + Ed25519 key PEM in
+ * the caller's buffers. The cert is an empty DER SEQUENCE (0x30 0x00)
+ * — just enough to satisfy the loader's structural walk. */
+static void build_synthetic_cert_pem(char* cert_pem, size_t cert_cap,
+                                     char* key_pem,  size_t key_cap) {
+    /* Empty SEQUENCE = 0x30 0x00 (2 bytes). */
+    uint8_t cert_der[2] = {0x30, 0x00};
+    char cb[8];
+    size_t cb_len = b64_encode_test(cert_der, 2, cb, sizeof(cb));
+    snprintf(cert_pem, cert_cap,
+             "-----BEGIN CERTIFICATE-----\n%.*s\n-----END CERTIFICATE-----\n",
+             (int)cb_len, cb);
+
+    /* Ed25519 PKCS#8 PrivateKeyInfo:
+     *   30 2e 02 01 00 30 05 06 03 2b 65 70 04 22 04 20
+     *   <32-byte seed>
+     * Total 48 bytes; base64 = 64 chars. */
+    uint8_t key_der[48] = {
+        0x30, 0x2e, 0x02, 0x01, 0x00,
+        0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70,
+        0x04, 0x22, 0x04, 0x20
+    };
+    for (int i = 0; i < 32; i++) key_der[16 + i] = (uint8_t)(0xC0 + i);
+    char kb[88];
+    size_t kb_len = b64_encode_test(key_der, sizeof(key_der), kb, sizeof(kb));
+    snprintf(key_pem, key_cap,
+             "-----BEGIN PRIVATE KEY-----\n%.*s\n-----END PRIVATE KEY-----\n",
+             (int)kb_len, kb);
+}
+
+static void test_cert_store(void) {
+    printf("== Cert store (env mode) ==\n");
+
+    char cert_pem[1024], key_pem[1024];
+    build_synthetic_cert_pem(cert_pem, sizeof(cert_pem),
+                             key_pem,  sizeof(key_pem));
+
+    setenv("PICOWEB_TLS_CERT_PEM", cert_pem, 1);
+    setenv("PICOWEB_TLS_KEY_PEM",  key_pem,  1);
+    /* Make sure these don't collide. */
+    unsetenv("PICOWEB_TLS_CERT_PATH");
+    unsetenv("PICOWEB_TLS_KEY_PATH");
+
+    static uint8_t arena[8192];
+    cert_store_t store;
+    int rc = cert_store_init(&store, arena, sizeof(arena));
+    if (rc != 0) { printf("  FAIL: store_init rc=%d\n", rc); g_fail++; return; }
+
+    int loaded = cert_store_load(&store, NULL);
+    if (loaded == 1 && store.n_entries == 1) {
+        printf("  PASS: env loader added 1 entry\n"); g_pass++;
+    } else {
+        printf("  FAIL: loaded=%d entries=%d\n", loaded, store.n_entries);
+        g_fail++; return;
+    }
+
+    /* The default entry should be present and Ed25519. */
+    const cert_entry_t* def = cert_store_lookup(&store, NULL, 0);
+    if (def && def->key_type == CERT_KEY_ED25519 && def->cert_count == 1) {
+        printf("  PASS: default entry is Ed25519, 1 cert in chain\n"); g_pass++;
+    } else {
+        printf("  FAIL: default lookup: %p type=%d count=%d\n",
+               (const void*)def,
+               def ? (int)def->key_type : -1,
+               def ? def->cert_count : -1);
+        g_fail++;
+    }
+
+    /* Lookup by random hostname falls back to default. */
+    const cert_entry_t* fb = cert_store_lookup(&store, "example.com", 11);
+    if (fb == def) {
+        printf("  PASS: SNI miss falls back to default\n"); g_pass++;
+    } else {
+        printf("  FAIL: SNI miss didn't fall back\n"); g_fail++;
+    }
+
+    /* Hostname normalization. */
+    char h[64] = "Example.COM";
+    size_t hl = strlen(h);
+    if (cert_normalize_hostname(h, &hl) == 0 &&
+        strcmp(h, "example.com") == 0) {
+        printf("  PASS: hostname lowercased\n"); g_pass++;
+    } else {
+        printf("  FAIL: normalize -> '%s'\n", h); g_fail++;
+    }
+
+    /* Reject bad chars. */
+    char bad[64] = "evil'; DROP TABLE";
+    size_t bl = strlen(bad);
+    if (cert_normalize_hostname(bad, &bl) != 0) {
+        printf("  PASS: bad hostname rejected\n"); g_pass++;
+    } else {
+        printf("  FAIL: bad hostname accepted\n"); g_fail++;
+    }
+
+    unsetenv("PICOWEB_TLS_CERT_PEM");
+    unsetenv("PICOWEB_TLS_KEY_PEM");
+}
+
+/* ---------------- TLS 1.3 handshake (parser + builder + secrets) ----- */
+
+/* Helpers for building a synthetic ClientHello on the wire. */
+static void w8 (uint8_t** p, uint8_t v)  { (*p)[0] = v; *p += 1; }
+static void w16(uint8_t** p, uint16_t v) { (*p)[0] = v >> 8; (*p)[1] = (uint8_t)v; *p += 2; }
+static void w24(uint8_t** p, uint32_t v) { (*p)[0] = v >> 16; (*p)[1] = v >> 8; (*p)[2] = (uint8_t)v; *p += 3; }
+static void wb (uint8_t** p, const void* s, size_t n) { memcpy(*p, s, n); *p += n; }
+
+static void test_tls13_handshake(void) {
+    printf("== TLS 1.3 handshake (CH parse + SH build + secrets) ==\n");
+
+    /* Build a minimal valid ClientHello offering:
+     *   - cipher TLS_CHACHA20_POLY1305_SHA256
+     *   - SNI: "Example.COM"  (must be lowercased to "example.com")
+     *   - supported_versions: 0x0304
+     *   - supported_groups: x25519
+     *   - key_share: x25519 with a 32-byte pubkey (we compute one)
+     */
+    uint8_t client_priv[32];
+    for (int i = 0; i < 32; i++) client_priv[i] = (uint8_t)(i * 7 + 1);
+    /* Clamp per RFC 7748 §5 — x25519() handles internal clamping but
+     * the wire pubkey is whatever we send; for the test the value
+     * just needs to be 32 bytes the parser accepts. */
+    uint8_t client_pub[32];
+    x25519(client_pub, client_priv, X25519_BASE_POINT);
+
+    uint8_t buf[2048] = {0};
+    uint8_t* p = buf;
+    /* Handshake header: type=0x01, len placeholder */
+    w8(&p, 0x01);
+    uint8_t* hs_len_at = p; w24(&p, 0);
+    uint8_t* hs_body = p;
+
+    w16(&p, 0x0303);                                    /* legacy_version */
+    for (int i = 0; i < 32; i++) w8(&p, (uint8_t)i);    /* random */
+    w8(&p, 0);                                          /* legacy_session_id len */
+    /* cipher_suites */
+    w16(&p, 2);
+    w16(&p, TLS13_CHACHA20_POLY1305_SHA256);
+    /* compression_methods */
+    w8(&p, 1); w8(&p, 0);
+
+    /* Build extensions block, length backfilled. */
+    uint8_t* ext_len_at = p; w16(&p, 0);
+    uint8_t* ext_start = p;
+
+    /* SNI: "Example.COM" */
+    {
+        const char* host = "Example.COM";
+        uint16_t host_len = (uint16_t)strlen(host);
+        w16(&p, 0x0000);                /* type = server_name */
+        w16(&p, 2 + 1 + 2 + host_len);  /* ext_size = list_len(2) + entry */
+        w16(&p, 1 + 2 + host_len);      /* server_name_list length */
+        w8 (&p, 0);                     /* name_type = host_name */
+        w16(&p, host_len);
+        wb (&p, host, host_len);
+    }
+    /* supported_groups: x25519 */
+    {
+        w16(&p, 0x000a);
+        w16(&p, 4);                     /* list_len(2) + 1 group(2) */
+        w16(&p, 2);
+        w16(&p, TLS13_NAMED_GROUP_X25519);
+    }
+    /* key_share: x25519 with our pubkey */
+    {
+        w16(&p, 0x0033);
+        w16(&p, 2 + 4 + 32);            /* list_len(2) + entry(4+32) */
+        w16(&p, 4 + 32);                /* list_len */
+        w16(&p, TLS13_NAMED_GROUP_X25519);
+        w16(&p, 32);
+        wb (&p, client_pub, 32);
+    }
+    /* supported_versions: 0x0304 */
+    {
+        w16(&p, 0x002b);
+        w16(&p, 1 + 2);                 /* vlist_len(1) + 1 ver(2) */
+        w8 (&p, 2);
+        w16(&p, TLS13_SUPPORTED_VERSION);
+    }
+
+    uint16_t ext_len = (uint16_t)(p - ext_start);
+    ext_len_at[0] = ext_len >> 8; ext_len_at[1] = (uint8_t)ext_len;
+    uint32_t hs_len = (uint32_t)(p - hs_body);
+    hs_len_at[0] = (uint8_t)(hs_len >> 16);
+    hs_len_at[1] = (uint8_t)(hs_len >> 8);
+    hs_len_at[2] = (uint8_t)hs_len;
+
+    size_t ch_total = (size_t)(p - buf);
+
+    tls13_client_hello_t ch;
+    int rc = tls13_parse_client_hello(buf, ch_total, &ch);
+    if (rc == 0) { printf("  PASS: ClientHello parsed\n"); g_pass++; }
+    else         { printf("  FAIL: ClientHello parse rc=%d\n", rc); g_fail++; return; }
+
+    if (ch.offers_chacha_poly && ch.offers_tls13 && ch.offers_x25519)
+         { printf("  PASS: client offered chacha/tls13/x25519\n"); g_pass++; }
+    else { printf("  FAIL: missing offers c=%d v=%d g=%d\n",
+                  ch.offers_chacha_poly, ch.offers_tls13, ch.offers_x25519); g_fail++; }
+
+    if (ch.sni_len == 11 && memcmp(ch.sni, "example.com", 11) == 0)
+         { printf("  PASS: SNI lowercased to 'example.com'\n"); g_pass++; }
+    else { printf("  FAIL: SNI len=%zu '%s'\n", ch.sni_len, ch.sni); g_fail++; }
+
+    if (memcmp(ch.ecdhe_pubkey, client_pub, 32) == 0)
+         { printf("  PASS: x25519 key_share extracted\n"); g_pass++; }
+    else { printf("  FAIL: x25519 key_share mismatch\n"); g_fail++; }
+
+    /* Build a ServerHello — server picks its own ephemeral keypair. */
+    uint8_t server_priv[32];
+    for (int i = 0; i < 32; i++) server_priv[i] = (uint8_t)(i * 13 + 7);
+    uint8_t server_pub[32];
+    x25519(server_pub, server_priv, X25519_BASE_POINT);
+    uint8_t server_random[32];
+    for (int i = 0; i < 32; i++) server_random[i] = (uint8_t)(0xA0 + i);
+
+    uint8_t sh_buf[256];
+    int sh_len = tls13_build_server_hello(sh_buf, sizeof(sh_buf),
+                                          server_random, server_pub);
+    if (sh_len > 0) { printf("  PASS: ServerHello built (%d bytes)\n", sh_len); g_pass++; }
+    else            { printf("  FAIL: ServerHello build rc=%d\n", sh_len); g_fail++; return; }
+
+    /* Sanity: SH starts with 0x02 + 24-bit length matching body. */
+    if (sh_buf[0] == 0x02) { printf("  PASS: SH handshake type = 0x02\n"); g_pass++; }
+    else                   { printf("  FAIL: SH type 0x%02x\n", sh_buf[0]); g_fail++; }
+    {
+        uint32_t body_len = ((uint32_t)sh_buf[1] << 16) |
+                            ((uint32_t)sh_buf[2] << 8)  |
+                             (uint32_t)sh_buf[3];
+        if ((int)body_len + 4 == sh_len) { printf("  PASS: SH body length matches\n"); g_pass++; }
+        else                              { printf("  FAIL: SH body=%u total=%d\n",
+                                                  body_len, sh_len); g_fail++; }
+    }
+
+    /* Compute handshake secrets. */
+    uint8_t shared[32];
+    x25519(shared, server_priv, ch.ecdhe_pubkey);
+    /* shared on server side must equal X25519(client_priv, server_pub) */
+    {
+        uint8_t shared_c[32];
+        x25519(shared_c, client_priv, server_pub);
+        if (memcmp(shared, shared_c, 32) == 0)
+             { printf("  PASS: ECDHE shared secret matches both sides\n"); g_pass++; }
+        else { printf("  FAIL: ECDHE asymmetric\n"); g_fail++; }
+    }
+
+    /* Transcript = SHA-256(CH || SH). */
+    uint8_t transcript[32];
+    {
+        sha256_ctx ctx;
+        sha256_init(&ctx);
+        sha256_update(&ctx, ch.raw, ch.raw_len);
+        sha256_update(&ctx, sh_buf, (size_t)sh_len);
+        sha256_final(&ctx, transcript);
+    }
+
+    uint8_t hs_secret[32], c_hs[32], s_hs[32];
+    int sec_rc = tls13_compute_handshake_secrets(shared, transcript,
+                                                 hs_secret, c_hs, s_hs);
+    if (sec_rc == 0) { printf("  PASS: handshake secrets derived\n"); g_pass++; }
+    else             { printf("  FAIL: handshake secrets rc=%d\n", sec_rc); g_fail++; }
+
+    /* Determinism: re-run with same inputs must produce same outputs. */
+    {
+        uint8_t hs2[32], c2[32], s2[32];
+        tls13_compute_handshake_secrets(shared, transcript, hs2, c2, s2);
+        if (memcmp(hs2, hs_secret, 32) == 0 &&
+            memcmp(c2, c_hs, 32)      == 0 &&
+            memcmp(s2, s_hs, 32)      == 0)
+             { printf("  PASS: secrets deterministic\n"); g_pass++; }
+        else { printf("  FAIL: secrets non-deterministic\n"); g_fail++; }
+    }
+
+    /* c_hs and s_hs must differ. */
+    if (memcmp(c_hs, s_hs, 32) != 0)
+         { printf("  PASS: c_hs_traffic != s_hs_traffic\n"); g_pass++; }
+    else { printf("  FAIL: client/server hs traffic secrets equal\n"); g_fail++; }
+}
+
+/* ---------------- scatter-gather (iov) seal ---------------- */
+
+static void test_chacha20_stream_iov(void) {
+    printf("== ChaCha20 streaming (fragment-equivalence) ==\n");
+    /* Bit-identity: any chunked stream_xor sequence == one-shot xor
+     * over the concatenation. Test against a deliberately awkward
+     * fragmentation pattern that crosses many 64-byte boundaries. */
+    uint8_t key[32];
+    uint8_t nonce[12];
+    for (int i = 0; i < 32; i++) key[i] = (uint8_t)(0xC0 + i);
+    for (int i = 0; i < 12; i++) nonce[i] = (uint8_t)(0x40 + i);
+
+    enum { N = 4096 };
+    uint8_t pt[N], ref[N], got[N];
+    for (int i = 0; i < N; i++) pt[i] = (uint8_t)(i * 31 + 7);
+
+    chacha20_xor(key, 1, nonce, pt, ref, N);
+
+    /* Fragment sizes intentionally chosen to land mid-block in
+     * different ways: 1, 7, 13, 64, 65, 100, 256, ... */
+    const size_t frag_sizes[] = {1, 7, 13, 64, 65, 100, 256, 511, 513, 1024, 1003};
+    const size_t nf = sizeof(frag_sizes) / sizeof(frag_sizes[0]);
+
+    chacha20_stream_t cs;
+    chacha20_stream_init(&cs, key, nonce, 1);
+    size_t off = 0, fi = 0;
+    while (off < N) {
+        size_t take = frag_sizes[fi++ % nf];
+        if (off + take > N) take = N - off;
+        chacha20_stream_xor(&cs, pt + off, got + off, take);
+        off += take;
+    }
+    if (memcmp(ref, got, N) == 0)
+         { printf("  PASS: stream(uneven frags) == one-shot (4096 B)\n"); g_pass++; }
+    else { printf("  FAIL: stream != one-shot at first byte that differs\n"); g_fail++; }
+
+    /* Edge: zero-length first fragment must be a no-op. */
+    chacha20_stream_init(&cs, key, nonce, 1);
+    chacha20_stream_xor(&cs, NULL, NULL, 0);
+    chacha20_stream_xor(&cs, pt, got, 200);
+    chacha20_xor(key, 1, nonce, pt, ref, 200);
+    if (memcmp(ref, got, 200) == 0)
+         { printf("  PASS: zero-length frag is no-op\n"); g_pass++; }
+    else { printf("  FAIL: zero-length frag corrupted state\n"); g_fail++; }
+
+    /* Edge: 65-byte fragment crossing exactly one block boundary. */
+    chacha20_stream_init(&cs, key, nonce, 1);
+    chacha20_stream_xor(&cs, pt, got, 65);
+    chacha20_xor(key, 1, nonce, pt, ref, 65);
+    if (memcmp(ref, got, 65) == 0)
+         { printf("  PASS: 65 B single-call matches\n"); g_pass++; }
+    else { printf("  FAIL: 65 B single-call mismatch\n"); g_fail++; }
+}
+
+static void test_aead_seal_iov(void) {
+    printf("== AEAD seal_iov (fragment-equivalence) ==\n");
+    uint8_t key[32];
+    uint8_t nonce[12];
+    uint8_t aad[13];
+    for (int i = 0; i < 32; i++) key[i] = (uint8_t)i;
+    for (int i = 0; i < 12; i++) nonce[i] = (uint8_t)(i + 64);
+    for (int i = 0; i < 13; i++) aad[i] = (uint8_t)(0x80 | i);
+
+    /* Build a non-trivial plaintext: 3 fragments that are NOT block-
+     * aligned individually and total length is not block-aligned. */
+    static const uint8_t f0[] = "<!DOCTYPE html><html><head>";
+    static const uint8_t f1[] = "<title>picoweb</title></head><body><h1>Hello, ";
+    static const uint8_t f2[] = "iov-sealed world!</h1></body></html>";
+    pw_iov_t iov[3] = {
+        { f0, sizeof(f0) - 1 },
+        { f1, sizeof(f1) - 1 },
+        { f2, sizeof(f2) - 1 },
+    };
+    size_t total = pw_iov_total(iov, 3);
+
+    /* Reference: contiguous seal. */
+    uint8_t pt[256], ref_ct[256], ref_tag[16];
+    size_t off = 0;
+    for (unsigned i = 0; i < 3; i++) { memcpy(pt + off, iov[i].base, iov[i].len); off += iov[i].len; }
+    aead_chacha20_poly1305_seal(key, nonce, aad, sizeof(aad), pt, total, ref_ct, ref_tag);
+
+    /* Under test: scatter-gather seal. */
+    uint8_t got_ct[256], got_tag[16];
+    aead_chacha20_poly1305_seal_iov(key, nonce, aad, sizeof(aad),
+                                    iov, 3, total, got_ct, got_tag);
+
+    if (memcmp(ref_ct, got_ct, total) == 0)
+         { printf("  PASS: ciphertext matches contiguous seal\n"); g_pass++; }
+    else { printf("  FAIL: ciphertext differs\n"); g_fail++; }
+    if (memcmp(ref_tag, got_tag, 16) == 0)
+         { printf("  PASS: tag matches contiguous seal\n"); g_pass++; }
+    else { printf("  FAIL: tag differs\n"); g_fail++; }
+
+    /* Round-trip: contiguous open of scatter-sealed ciphertext. */
+    uint8_t pt_back[256];
+    int rc = aead_chacha20_poly1305_open(key, nonce, aad, sizeof(aad),
+                                         got_ct, total, got_tag, pt_back);
+    if (rc == 0 && memcmp(pt, pt_back, total) == 0)
+         { printf("  PASS: open recovers iov plaintext\n"); g_pass++; }
+    else { printf("  FAIL: open(iov-sealed) failed rc=%d\n", rc); g_fail++; }
+
+    /* Edge: zero-fragment chain == empty plaintext. */
+    uint8_t empty_tag1[16], empty_tag2[16];
+    aead_chacha20_poly1305_seal(key, nonce, aad, sizeof(aad), NULL, 0, NULL, empty_tag1);
+    aead_chacha20_poly1305_seal_iov(key, nonce, aad, sizeof(aad),
+                                    NULL, 0, 0, NULL, empty_tag2);
+    if (memcmp(empty_tag1, empty_tag2, 16) == 0)
+         { printf("  PASS: empty-plaintext tag matches\n"); g_pass++; }
+    else { printf("  FAIL: empty-plaintext tag differs\n"); g_fail++; }
+}
+
+static void test_tls13_record_iov(void) {
+    printf("== TLS 1.3 seal_record_iov (fragment-equivalence) ==\n");
+    /* Two record_dirs with the same key/iv/seq=0 will produce
+     * bit-identical records over equal plaintext. We seal the same
+     * bytes once contiguously, once via 3-fragment iov, and compare. */
+    tls_record_dir_t a = {0}, b = {0};
+    for (int i = 0; i < 32; i++) a.key[i] = b.key[i] = (uint8_t)(0x10 + i);
+    for (int i = 0; i < 12; i++) a.static_iv[i] = b.static_iv[i] = (uint8_t)(0x90 + i);
+
+    static const uint8_t f0[] = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n";
+    static const uint8_t f1[] = "Content-Length: 42\r\nServer: picoweb\r\n\r\n";
+    static const uint8_t f2[] = "<html><body>iov scatter-gather works</body></html>";
+    pw_iov_t iov[3] = {
+        { f0, sizeof(f0) - 1 },
+        { f1, sizeof(f1) - 1 },
+        { f2, sizeof(f2) - 1 },
+    };
+    size_t total = pw_iov_total(iov, 3);
+
+    uint8_t flat[256];
+    size_t off = 0;
+    for (unsigned i = 0; i < 3; i++) { memcpy(flat + off, iov[i].base, iov[i].len); off += iov[i].len; }
+
+    uint8_t rec_a[512], rec_b[512];
+    size_t la = tls13_seal_record(&a, TLS_CT_APPLICATION_DATA, TLS_CT_APPLICATION_DATA,
+                                  flat, total, rec_a, sizeof(rec_a));
+    size_t lb = tls13_seal_record_iov(&b, TLS_CT_APPLICATION_DATA, TLS_CT_APPLICATION_DATA,
+                                      iov, 3, total, rec_b, sizeof(rec_b));
+
+    if (la > 0 && la == lb)
+         { printf("  PASS: same wire length (%zu)\n", la); g_pass++; }
+    else { printf("  FAIL: wire length la=%zu lb=%zu\n", la, lb); g_fail++; return; }
+
+    if (memcmp(rec_a, rec_b, la) == 0)
+         { printf("  PASS: contiguous and iov records are byte-identical\n"); g_pass++; }
+    else { printf("  FAIL: records differ\n"); g_fail++; }
+
+    if (a.seq == 1 && b.seq == 1)
+         { printf("  PASS: both record_dirs advanced seq to 1\n"); g_pass++; }
+    else { printf("  FAIL: seq a=%llu b=%llu\n",
+                  (unsigned long long)a.seq, (unsigned long long)b.seq); g_fail++; }
+
+    /* The whole point: round-trip via tls13_open_record. */
+    tls_record_dir_t r = {0};
+    for (int i = 0; i < 32; i++) r.key[i] = (uint8_t)(0x10 + i);
+    for (int i = 0; i < 12; i++) r.static_iv[i] = (uint8_t)(0x90 + i);
+    tls_content_type_t inner = TLS_CT_INVALID;
+    uint8_t* pt_out = NULL;
+    size_t   pt_len = 0;
+    int rc = tls13_open_record(&r, rec_b, lb, &inner, &pt_out, &pt_len);
+    if (rc == 0 && inner == TLS_CT_APPLICATION_DATA && pt_len == total &&
+        memcmp(pt_out, flat, total) == 0)
+         { printf("  PASS: open(iov-sealed) recovers plaintext\n"); g_pass++; }
+    else { printf("  FAIL: open rc=%d inner=%d pt_len=%zu/%zu\n",
+                  rc, (int)inner, pt_len, total); g_fail++; }
+}
+
 int main(void) {
+    /* Pick the best SHA-256 + ChaCha20 impls available; tests below
+     * run through the public entry points so they exercise whichever
+     * path is selected. */
+    sha256_select_impl();
+    chacha20_select_impl();
+    printf("[info] cpu_features sse2=%u ssse3=%u sse41=%u sha=%u neon=%u arm_sha2=%u\n",
+           cpu_features()->x86_sse2,  cpu_features()->x86_ssse3,
+           cpu_features()->x86_sse41, cpu_features()->x86_sha,
+           cpu_features()->arm_neon,  cpu_features()->arm_sha2);
+    printf("[info] sha256 impl   = %s\n", sha256_impl_name());
+    printf("[info] chacha20 impl = %s\n", chacha20_impl_name());
+
     test_sha256();
+    test_sha256_dispatch();
     test_hmac_sha256();
     test_hkdf();
     test_chacha20();
+    test_chacha20_dispatch();
     test_poly1305();
     test_aead_chacha20_poly1305();
     test_x25519();
@@ -646,6 +1374,13 @@ int main(void) {
     test_tls13_record();
     test_ip_tcp();
     test_tcp_state();
+    test_buffer_pool();
+    test_pem();
+    test_cert_store();
+    test_tls13_handshake();
+    test_chacha20_stream_iov();
+    test_aead_seal_iov();
+    test_tls13_record_iov();
 
     printf("\n=== RESULTS: PASS=%d FAIL=%d ===\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;

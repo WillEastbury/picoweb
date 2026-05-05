@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Smoke test for the io_uring backend (picoweb_uring).
+# Smoke test for the io_uring backend (./picoweb --io_uring).
 set -uo pipefail
 cd "$(dirname "$0")"
-for p in $(pgrep -x picoweb_uring 2>/dev/null) $(pgrep -x picoweb 2>/dev/null); do
+for p in $(pgrep -x picoweb 2>/dev/null); do
     kill -9 "$p" 2>/dev/null || true
 done
 sleep 1
@@ -11,17 +11,17 @@ PASS=0; FAIL=0
 ok()   { echo "  PASS: $1"; PASS=$((PASS+1)); }
 fail() { echo "  FAIL: $1"; FAIL=$((FAIL+1)); }
 
-nohup ./picoweb_uring 8080 wwwroot 2 100 0 > /tmp/picoweb_uring.log 2>&1 < /dev/null &
+nohup ./picoweb --io_uring 8080 wwwroot 2 100 0 > /tmp/picoweb_uring.log 2>&1 < /dev/null &
 pid=$!
 sleep 1.5
 
 if ! kill -0 $pid 2>/dev/null; then
-    echo "FATAL: picoweb_uring exited before smoke test could start"
+    echo "FATAL: picoweb --io_uring exited before smoke test could start"
     cat /tmp/picoweb_uring.log
     exit 1
 fi
 echo "io_uring backend started, pid=$pid"
-grep 'io_uring' /tmp/picoweb_uring.log || fail "no 'io_uring' in startup banner"
+grep 'backend=io_uring' /tmp/picoweb_uring.log || fail "no 'backend=io_uring' in startup banner"
 
 # === TEST 1: simple GET / ===
 echo "=== TEST 1: GET / via io_uring ==="
@@ -73,7 +73,7 @@ code=$(curl -sS --max-time 5 -o /dev/null -w '%{http_code}' -H 'Host: localhost'
 # === Cleanup ===
 kill -INT $pid 2>/dev/null
 sleep 0.5
-for p in $(pgrep -x picoweb_uring 2>/dev/null); do kill -9 "$p" 2>/dev/null || true; done
+for p in $(pgrep -x picoweb 2>/dev/null); do kill -9 "$p" 2>/dev/null || true; done
 
 echo
 echo "=== Server log tail ==="

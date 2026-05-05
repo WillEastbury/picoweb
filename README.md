@@ -229,22 +229,23 @@ These come up a lot. Here's the honest read on each:
 
 | Option            | Status        | Why |
 |-------------------|---------------|-----|
-| **`io_uring`**    | Build target  | Available as `make uring`, produces a separate `picoweb_uring` binary that swaps the epoll worker for an io_uring worker (raw syscalls, no liburing). Same business logic — see *io_uring backend* below. |
+| **`io_uring`**    | Runtime flag  | `./picoweb --io_uring` selects the io_uring worker (raw syscalls, no liburing). Same business logic as the default epoll worker. See *io_uring backend* below. |
+| **`--dpdk`**      | Reserved flag | `./picoweb --dpdk` is wired in but errors out at startup — the DPDK + userspace TCP/TLS path lives under `userspace/` as a foundation, not a runnable backend. See `userspace/DESIGN.md`. |
 | **`sendfile()`**  | Won't ship    | We back resources with anonymous mmap (one arena per worker), not file fds. `sendfile()` requires per-resource fds and would force a `read`+`sendfile` pair per request — a regression vs the current single `sendmsg`. The arena model is already zero-copy in userspace; the only kernel-side win left is `MSG_ZEROCOPY`. |
-| **DPDK / AF_XDP** | Spike branch  | These bypass the kernel network stack entirely. The whole TCP state machine, congestion control, retransmit, **and TLS** would have to live in userspace. Months of work, not a flag. There's a feasibility branch tracked. |
 
-### `io_uring` backend (`make uring` → `picoweb_uring`)
+### `io_uring` backend (`./picoweb --io_uring`)
 
 A second worker implementation lives in `src/server_uring.c` and is
-selected at build time:
+linked into the same `picoweb` binary as the default epoll worker.
+At runtime, `--io_uring` makes `main.c` spawn `uring_worker_main`
+threads instead of `epoll_worker_main`:
 
 ```
-make uring                # produces ./picoweb_uring
-./picoweb_uring 8080 wwwroot 4 100
+./picoweb 8080 wwwroot 4 100              # default (epoll)
+./picoweb --io_uring 8080 wwwroot 4 100   # io_uring
 ```
 
-The Makefile excludes `src/server.c` from this build so there's exactly
-one `server_worker_main` symbol — the runtime shape, the parser, the
+Mutually exclusive with `--dpdk`. The runtime shape, the parser, the
 jumptable lookup, the `picoweb-compress` variant swap, and the
 keep-alive bookkeeping are unchanged. What's different:
 
@@ -278,6 +279,28 @@ straightforward extensions, just not in the spike):
 - Idle-timer eviction. The epoll backend's per-conn idle-timer is
   not yet ported; under abusive slow-loris-style clients you'll want
   the epoll backend.
+
+### `--dpdk` flag
+
+The `--dpdk` flag is **reserved**: it's parsed and validated, but
+running with it produces a clear error and exits. The intent is to
+wire it through to a DPDK-driven userspace TCP+TLS stack, the
+foundation for which lives under `userspace/`:
+
+```
+$ ./picoweb --dpdk 8080 wwwroot
+picoweb: --dpdk backend is not built into this binary.
+         See userspace/DESIGN.md for the integration plan.
+         The flag is reserved; running with it now is a
+         hard fail rather than a silent fallback.
+```
+
+The reasons we haven't lit it up: DPDK requires librte_eal et al.,
+hugepages reserved, a NIC bound to vfio-pci, **and** the userspace
+TCP retransmit / RTO / SACK / CC code that `userspace/tcp/tcp.c` only
+sketches. WSL has no NIC bindable for vfio-pci either, so it cannot
+even be smoke-tested in dev. See `userspace/DESIGN.md` for the
+honest scope and the months-long roadmap.
 
 ---
 
@@ -556,26 +579,29 @@ Helper scripts at the repo root:
 
 ---
 
-## Experimental branches
+## Userspace TCP+TLS foundation (`userspace/`)
 
-These live off `main` and intentionally don't merge in. They're kept
-for reference and as a launching pad for future work.
+A pure-C TLS 1.3 + TCP/IP + AF_PACKET foundation lives under
+`userspace/`. It's the intended substrate for a future real `--dpdk`
+backend, but is **not wired into the picoweb binary today**.
 
-- **`spike/io_uring`** — second build target (`make uring`) that
-  swaps the per-worker epoll loop for raw `io_uring` syscalls (no
-  liburing). Same test suite passes (26 tests). See the "io_uring
-  backend" section above.
+What's real (38 RFC-vector tests pass — `cd userspace/tests && make test`):
 
-- **`spike/userspace-tcp-tls`** — pure-C TLS 1.3 + TCP/IP +
-  AF_PACKET foundation. No third-party crypto (SHA-256, HMAC,
-  HKDF, ChaCha20, Poly1305, ChaCha20-Poly1305 AEAD, X25519, all
-  validated against RFC vectors). TLS 1.3 record layer + key
-  schedule (RFC 8448 §3 vectors green). TCP passive-open state
-  machine. AF_PACKET I/O skeleton. DPDK loop pattern documented
-  but not built. `cd userspace/tests && make test` runs the full
-  38-test RFC-vector suite. See [`userspace/DESIGN.md`](./userspace/DESIGN.md)
-  for honest scope; this is a foundation for a months-long effort,
-  not a shippable stack.
+- Crypto: SHA-256, HMAC-SHA256, HKDF-SHA256, ChaCha20, Poly1305,
+  ChaCha20-Poly1305 AEAD, X25519 — all from-scratch, no third-party
+  crypto, validated against RFC vectors.
+- TLS 1.3 key schedule (RFC 8448 §3 vectors green) and record layer
+  (seal / open with sequence-number nonce, tamper detection).
+- IPv4 + TCP build/parse with full checksums.
+- TCP passive-open state machine: `LISTEN → SYN-RECEIVED →
+  ESTABLISHED → CLOSE-WAIT → LAST-ACK → CLOSED`.
+- AF_PACKET RX/TX skeleton (Linux only, compile-clean).
+
+What's deliberately **not** in scope: AES-GCM, RSA / ECDSA signing,
+TLS handshake message parsing (ClientHello / ServerHello), TCP
+retransmit / RTO / congestion control / SACK, SYN cookies, parser
+fuzzing, real DPDK binding. See [`userspace/DESIGN.md`](./userspace/DESIGN.md)
+for the honest scope and roadmap.
 
 ---
 

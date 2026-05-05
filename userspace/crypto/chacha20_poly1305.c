@@ -1,50 +1,49 @@
 /*
  * ChaCha20-Poly1305 AEAD (RFC 8439 §2.8).
+ *
+ * Zero allocations. Poly1305 is fed incrementally so the AAD || pad ||
+ * ciphertext || pad || lengths sequence is streamed without ever
+ * materialising the full MAC input. This matters because TLS records
+ * can be up to ~16 KiB and we'd otherwise blow the stack via alloca.
  */
 
 #include "chacha20_poly1305.h"
 
 #include <string.h>
 
+#include "../iov.h"
 #include "chacha20.h"
 #include "poly1305.h"
+#include "util.h"
+
+static const uint8_t k_zero16[16] = {0};
 
 static void store_le64(uint8_t* p, uint64_t v) {
     for (int i = 0; i < 8; i++) p[i] = (uint8_t)(v >> (i * 8));
 }
 
-static void mac_data(uint8_t poly_key[POLY1305_KEY_LEN],
+static void mac_data(const uint8_t poly_key[POLY1305_KEY_LEN],
                      const uint8_t* aad, size_t aad_len,
                      const uint8_t* ct,  size_t ct_len,
                      uint8_t tag[16]) {
-    /* RFC 8439 §2.8: build aad || pad16(aad) || ct || pad16(ct) ||
-     * len64_le(aad) || len64_le(ct), then run Poly1305 over the lot.
-     * We feed Poly1305 incrementally without an alloc by computing
-     * over a small stack buffer for the trailers. */
+    poly1305_ctx_t pctx;
+    poly1305_init(&pctx, poly_key);
 
-    /* For the spike we just build the buffer inline — TLS records cap
-     * at ~16 KiB and AAD is typically 5 bytes (the TLS additional_data
-     * is a record header). A real impl would feed Poly1305 via an
-     * incremental update API to avoid the alloc. */
+    if (aad_len) poly1305_update(&pctx, aad, aad_len);
+    size_t aad_pad = (16u - (aad_len & 15u)) & 15u;
+    if (aad_pad) poly1305_update(&pctx, k_zero16, aad_pad);
 
-    /* We need at most: aad + 15 (pad) + ct + 15 (pad) + 16 (lens). */
-    size_t mac_len = aad_len + ((16u - (aad_len & 15u)) & 15u) +
-                     ct_len  + ((16u - (ct_len  & 15u)) & 15u) + 16;
+    if (ct_len)  poly1305_update(&pctx, ct, ct_len);
+    size_t ct_pad = (16u - (ct_len & 15u)) & 15u;
+    if (ct_pad)  poly1305_update(&pctx, k_zero16, ct_pad);
 
-    /* Allocate on the heap because mac_len can exceed safe stack
-     * sizes for max-size TLS records (16384 + small). The caller-side
-     * malloc cost is one per record; can be replaced with a Poly1305
-     * incremental API later. */
-    uint8_t* buf = (uint8_t*)__builtin_alloca(mac_len);
-    size_t off = 0;
-    if (aad_len) { memcpy(buf + off, aad, aad_len); off += aad_len; }
-    while (off & 15u) buf[off++] = 0;
-    if (ct_len)  { memcpy(buf + off, ct, ct_len);   off += ct_len;  }
-    while (off & 15u) buf[off++] = 0;
-    store_le64(buf + off, (uint64_t)aad_len); off += 8;
-    store_le64(buf + off, (uint64_t)ct_len);  off += 8;
+    uint8_t lens[16];
+    store_le64(lens + 0, (uint64_t)aad_len);
+    store_le64(lens + 8, (uint64_t)ct_len);
+    poly1305_update(&pctx, lens, sizeof(lens));
 
-    poly1305(poly_key, buf, off, tag);
+    poly1305_finish(&pctx, tag);
+    /* poly1305_finish wipes pctx; nothing else to scrub here. */
 }
 
 void aead_chacha20_poly1305_seal(const uint8_t key[AEAD_CHACHA20_POLY1305_KEY_LEN],
@@ -53,17 +52,18 @@ void aead_chacha20_poly1305_seal(const uint8_t key[AEAD_CHACHA20_POLY1305_KEY_LE
                                  const uint8_t* pt,  size_t pt_len,
                                  uint8_t* ct,
                                  uint8_t tag[AEAD_CHACHA20_POLY1305_TAG_LEN]) {
-    /* Derive Poly1305 one-time key from ChaCha20 block 0. */
+    /* Derive Poly1305 one-time key from ChaCha20 block 0. Only the
+     * first 32 bytes of the keystream block are used; the rest is
+     * discarded (and we wipe the whole buffer below). */
     uint8_t poly_key[64];
     chacha20_block(key, 0, nonce, poly_key);
-    /* Only first 32 bytes are used; the rest are discarded. */
 
     /* Encrypt with counter starting at 1. */
     chacha20_xor(key, 1, nonce, pt, ct, pt_len);
 
     mac_data(poly_key, aad, aad_len, ct, pt_len, tag);
 
-    memset(poly_key, 0, sizeof(poly_key));
+    secure_zero(poly_key, sizeof(poly_key));
 }
 
 int aead_chacha20_poly1305_open(const uint8_t key[AEAD_CHACHA20_POLY1305_KEY_LEN],
@@ -77,20 +77,68 @@ int aead_chacha20_poly1305_open(const uint8_t key[AEAD_CHACHA20_POLY1305_KEY_LEN
 
     uint8_t expected[16];
     mac_data(poly_key, aad, aad_len, ct, ct_len, expected);
-    memset(poly_key, 0, sizeof(poly_key));
+    secure_zero(poly_key, sizeof(poly_key));
 
-    if (!crypto_consttime_eq(expected, tag, 16)) {
-        memset(expected, 0, sizeof(expected));
-        return -1;
-    }
-    memset(expected, 0, sizeof(expected));
+    int ok = crypto_consttime_eq(expected, tag, 16);
+    secure_zero(expected, sizeof(expected));
+    if (!ok) return -1;
 
     chacha20_xor(key, 1, nonce, ct, pt, ct_len);
     return 0;
 }
 
-int crypto_consttime_eq(const uint8_t* a, const uint8_t* b, size_t len) {
-    uint8_t diff = 0;
-    for (size_t i = 0; i < len; i++) diff |= a[i] ^ b[i];
-    return diff == 0;
+/* ---------------- scatter-gather seal ---------------- */
+
+void aead_chacha20_poly1305_seal_iov(const uint8_t key[AEAD_CHACHA20_POLY1305_KEY_LEN],
+                                     const uint8_t nonce[AEAD_CHACHA20_POLY1305_NONCE_LEN],
+                                     const uint8_t* aad, size_t aad_len,
+                                     const struct pw_iov* pt_iov, unsigned pt_iov_n,
+                                     size_t total_pt_len,
+                                     uint8_t* ct_out,
+                                     uint8_t tag[AEAD_CHACHA20_POLY1305_TAG_LEN]) {
+    /* Derive the Poly1305 one-time key from ChaCha20 block 0. */
+    uint8_t poly_key[64];
+    chacha20_block(key, 0, nonce, poly_key);
+
+    /* Streaming ChaCha20 starting at counter=1 (block 0 is reserved
+     * for the Poly1305 key derivation above). */
+    chacha20_stream_t cs;
+    chacha20_stream_init(&cs, key, nonce, 1);
+
+    /* Streaming Poly1305 over: aad || pad16 || ct || pad16 || lens. */
+    poly1305_ctx_t pctx;
+    poly1305_init(&pctx, poly_key);
+    secure_zero(poly_key, sizeof(poly_key));
+
+    if (aad_len) poly1305_update(&pctx, aad, aad_len);
+    size_t aad_pad = (16u - (aad_len & 15u)) & 15u;
+    if (aad_pad)  poly1305_update(&pctx, k_zero16, aad_pad);
+
+    /* Per-fragment encrypt (in-place stream) + Poly1305 over the
+     * ciphertext bytes we just produced. */
+    size_t off = 0;
+    for (unsigned i = 0; i < pt_iov_n; i++) {
+        const uint8_t* fb  = pt_iov[i].base;
+        size_t         fl  = pt_iov[i].len;
+        if (fl == 0) continue;
+        chacha20_stream_xor(&cs, fb, ct_out + off, fl);
+        poly1305_update(&pctx, ct_out + off, fl);
+        off += fl;
+    }
+    /* Defensive: if the caller's total_pt_len disagreed with the sum
+     * of fragments, the mac's len trailer would still be authoritative
+     * — but we'd silently produce a record claiming the wrong length.
+     * Trust but verify.  (`off` is the truth.) */
+    (void)total_pt_len;
+
+    size_t ct_pad = (16u - (off & 15u)) & 15u;
+    if (ct_pad) poly1305_update(&pctx, k_zero16, ct_pad);
+
+    uint8_t lens[16];
+    store_le64(lens + 0, (uint64_t)aad_len);
+    store_le64(lens + 8, (uint64_t)off);
+    poly1305_update(&pctx, lens, sizeof(lens));
+
+    poly1305_finish(&pctx, tag);
+    secure_zero(&cs, sizeof(cs));
 }

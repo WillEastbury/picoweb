@@ -37,7 +37,28 @@ int aead_chacha20_poly1305_open(const uint8_t key[AEAD_CHACHA20_POLY1305_KEY_LEN
                                 const uint8_t tag[AEAD_CHACHA20_POLY1305_TAG_LEN],
                                 uint8_t* pt);
 
-/* Constant-time tag comparison helper. Returns 1 on match, 0 on mismatch. */
-int crypto_consttime_eq(const uint8_t* a, const uint8_t* b, size_t len);
+/* Scatter-gather seal: encrypts a chain of plaintext fragments into a
+ * single contiguous ciphertext buffer + tag. Bit-identical to
+ * `aead_chacha20_poly1305_seal` over the concatenated plaintext.
+ *
+ * `total_pt_len` MUST equal the sum of `pt_iov[].len`; the caller
+ * normally precomputes this so the TLS record header length field can
+ * be written before any encryption work is done.
+ *
+ * `ct_out` must have room for `total_pt_len` bytes.
+ *
+ * The fragments MUST point at distinct, non-overlapping memory; they
+ * are also not aliased with `ct_out`. (Both restrictions could be
+ * relaxed but are not needed for the picoweb use case where fragments
+ * come from the immutable static arena and ct goes into a per-worker
+ * pool slot.) */
+struct pw_iov;     /* fwd: real def in userspace/iov.h */
+void aead_chacha20_poly1305_seal_iov(const uint8_t key[AEAD_CHACHA20_POLY1305_KEY_LEN],
+                                     const uint8_t nonce[AEAD_CHACHA20_POLY1305_NONCE_LEN],
+                                     const uint8_t* aad, size_t aad_len,
+                                     const struct pw_iov* pt_iov, unsigned pt_iov_n,
+                                     size_t total_pt_len,
+                                     uint8_t* ct_out,
+                                     uint8_t tag[AEAD_CHACHA20_POLY1305_TAG_LEN]);
 
 #endif

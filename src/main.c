@@ -13,13 +13,21 @@
 
 static void usage(const char* argv0) {
     fprintf(stderr,
-        "usage: %s [PORT] [WWWROOT] [WORKERS] [MAXREQS] [ZC_MIN]\n"
+        "usage: %s [--io_uring | --dpdk] [PORT] [WWWROOT] [WORKERS] [MAXREQS] [ZC_MIN]\n"
+        "\n"
+        "  --io_uring   use the io_uring worker backend (Linux 5.6+, no liburing)\n"
+        "  --dpdk       use the DPDK userspace backend (NOT BUILT — see\n"
+        "               userspace/DESIGN.md; the flag is reserved and will\n"
+        "               error out at startup until the integration ships)\n"
+        "\n"
         "  PORT     listen port (default 8080)\n"
         "  WWWROOT  content root (default ./wwwroot)\n"
         "  WORKERS  worker threads (default = nproc)\n"
         "  MAXREQS  max requests per connection (default 100; 0 = unlimited)\n"
         "  ZC_MIN   MSG_ZEROCOPY threshold in bytes (default 0 = off;\n"
-        "           recommended 16384 if enabled — small payloads regress)\n",
+        "           recommended 16384 if enabled — small payloads regress)\n"
+        "\n"
+        "Default backend is epoll. --io_uring and --dpdk are mutually exclusive.\n",
         argv0);
 }
 
@@ -30,42 +38,96 @@ int main(int argc, char** argv) {
     if (workers < 1) workers = 1;
     long max_reqs = 100;
     long zc_min = 0;
+    picoweb_backend_t backend = PICOWEB_BACKEND_EPOLL;
 
-    if (argc > 1) {
-        if (strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "--help") == 0) {
+    /* Two-pass parse: lift flags out of argv first, then handle the
+     * remaining positional args exactly as before. This keeps the
+     * existing positional CLI 100% backwards compatible. */
+    char* pos[16];
+    int   npos = 0;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             usage(argv[0]); return 0;
         }
+        if (strcmp(argv[i], "--io_uring") == 0 ||
+            strcmp(argv[i], "--io-uring") == 0) {
+            if (backend != PICOWEB_BACKEND_EPOLL) {
+                fprintf(stderr, "picoweb: --io_uring and --dpdk are mutually exclusive\n");
+                return 1;
+            }
+            backend = PICOWEB_BACKEND_URING;
+            continue;
+        }
+        if (strcmp(argv[i], "--dpdk") == 0) {
+            if (backend != PICOWEB_BACKEND_EPOLL) {
+                fprintf(stderr, "picoweb: --io_uring and --dpdk are mutually exclusive\n");
+                return 1;
+            }
+            backend = PICOWEB_BACKEND_DPDK;
+            continue;
+        }
+        if (npos < (int)(sizeof(pos)/sizeof(pos[0]))) {
+            pos[npos++] = argv[i];
+        } else {
+            fprintf(stderr, "picoweb: too many positional arguments\n");
+            usage(argv[0]); return 1;
+        }
+    }
+
+    if (npos > 0) {
         char* end = NULL;
-        long p = strtol(argv[1], &end, 10);
-        if (end == argv[1] || *end != '\0' || p < 1 || p > 65535) {
+        long p = strtol(pos[0], &end, 10);
+        if (end == pos[0] || *end != '\0' || p < 1 || p > 65535) {
             usage(argv[0]); return 1;
         }
         port = (int)p;
     }
-    if (argc > 2) wwwroot = argv[2];
-    if (argc > 3) {
+    if (npos > 1) wwwroot = pos[1];
+    if (npos > 2) {
         char* end = NULL;
-        long w = strtol(argv[3], &end, 10);
-        if (end == argv[3] || *end != '\0' || w < 1 || w > 1024) {
+        long w = strtol(pos[2], &end, 10);
+        if (end == pos[2] || *end != '\0' || w < 1 || w > 1024) {
             usage(argv[0]); return 1;
         }
         workers = w;
     }
-    if (argc > 4) {
+    if (npos > 3) {
         char* end = NULL;
-        long m = strtol(argv[4], &end, 10);
-        if (end == argv[4] || *end != '\0' || m < 0 || m > 1000000) {
+        long m = strtol(pos[3], &end, 10);
+        if (end == pos[3] || *end != '\0' || m < 0 || m > 1000000) {
             usage(argv[0]); return 1;
         }
         max_reqs = m;
     }
-    if (argc > 5) {
+    if (npos > 4) {
         char* end = NULL;
-        long z = strtol(argv[5], &end, 10);
-        if (end == argv[5] || *end != '\0' || z < 0 || z > (long)(64*1024*1024)) {
+        long z = strtol(pos[4], &end, 10);
+        if (end == pos[4] || *end != '\0' || z < 0 || z > (long)(64*1024*1024)) {
             usage(argv[0]); return 1;
         }
         zc_min = z;
+    }
+
+    /* Reject --dpdk early — before spawning workers and binding ports
+     * — so operators get a clean error instead of partially-started
+     * workers all printing the stub message. */
+    if (backend == PICOWEB_BACKEND_DPDK) {
+        fprintf(stderr,
+            "picoweb: --dpdk backend is not built into this binary.\n"
+            "         See userspace/DESIGN.md for the integration plan.\n"
+            "         The flag is reserved; running with it now is a\n"
+            "         hard fail rather than a silent fallback.\n");
+        return 2;
+    }
+
+    /* Pick the worker entrypoint up-front so each worker is launched
+     * with the right loop. */
+    void* (*worker_fn)(void*) = NULL;
+    const char* backend_name = NULL;
+    switch (backend) {
+    case PICOWEB_BACKEND_EPOLL: worker_fn = epoll_worker_main; backend_name = "epoll"; break;
+    case PICOWEB_BACKEND_URING: worker_fn = uring_worker_main; backend_name = "io_uring"; break;
+    case PICOWEB_BACKEND_DPDK:  worker_fn = dpdk_worker_main;  backend_name = "dpdk";  break;
     }
 
     /* SIGPIPE: ignore so writes to a peer-closed socket return EPIPE
@@ -96,7 +158,7 @@ int main(int argc, char** argv) {
         cfgs[i].max_requests_per_conn = (uint32_t)max_reqs;
         cfgs[i].worker_index          = (int)i;
         cfgs[i].zerocopy_threshold    = (size_t)zc_min;
-        if (pthread_create(&threads[i], NULL, server_worker_main, &cfgs[i]) != 0) {
+        if (pthread_create(&threads[i], NULL, worker_fn, &cfgs[i]) != 0) {
             metal_die("pthread_create #%ld", i);
         }
     }
@@ -105,8 +167,8 @@ int main(int argc, char** argv) {
     metrics_start_updater();
 
     metal_log("picoweb: %ld worker(s) on :%d, root=%s, maxreqs=%ld, "
-              "zerocopy=%s, simd=%s",
-              workers, port, wwwroot, max_reqs,
+              "backend=%s, zerocopy=%s, simd=%s",
+              workers, port, wwwroot, max_reqs, backend_name,
               zc_min > 0 ? "on" : "off", metal_simd_describe());
     if (zc_min > 0) {
         metal_log("picoweb: MSG_ZEROCOPY threshold = %ld bytes", zc_min);

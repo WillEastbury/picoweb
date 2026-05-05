@@ -7,13 +7,20 @@
 > primitives, sketch the handshake and TCP state machines, and be
 > honest about what is and isn't done.
 >
-> **What is real, here, and green (38 RFC-vector tests passing):**
-> SHA-256, HMAC-SHA256, HKDF-SHA256, ChaCha20, Poly1305,
-> ChaCha20-Poly1305 AEAD, X25519 ECDH, TLS 1.3 HKDF-Expand-Label and
-> Derive-Secret (RFC 8448 §3 vectors), TLS 1.3 record seal/open with
-> sequence-number nonce, IPv4 + TCP header build/parse with both
-> IPv4 and TCP checksums, TCP passive-open state machine
-> (LISTEN → SYN-RECEIVED → ESTABLISHED → CLOSE-WAIT → LAST-ACK).
+> **What is real, here, and green (81 RFC-vector + integration tests passing):**
+> SHA-256 (with runtime-dispatched **SHA-NI** HW acceleration on x86),
+> HMAC-SHA256, HKDF-SHA256, ChaCha20 (with runtime-dispatched **SSE2
+> 4-way** SIMD), Poly1305, ChaCha20-Poly1305 AEAD with both contiguous
+> and **scatter-gather (`*_iov`)** seal paths, X25519 ECDH, TLS 1.3
+> HKDF-Expand-Label and Derive-Secret (RFC 8448 §3 vectors), TLS 1.3
+> record seal/open with sequence-number nonce **and** scatter-gather
+> seal (`tls13_seal_record_iov` proven byte-identical to the
+> contiguous path), TLS 1.3 ClientHello parser + ServerHello builder
+> + handshake-secret derivation, IPv4 + TCP header build/parse with
+> both IPv4 and TCP checksums, TCP passive-open state machine
+> (LISTEN → SYN-RECEIVED → ESTABLISHED → CLOSE-WAIT → LAST-ACK),
+> SNI-aware in-memory cert store (env + disk, PEM decoder), per-worker
+> zero-allocation buffer pool, runtime CPU feature detection.
 >
 > **What is sketched but not wired:** AF_PACKET I/O (compiles on
 > Linux, no E2E test), DPDK loop pattern (commented sketch only).
@@ -174,3 +181,120 @@ sketched but not wired to a live link.
    AES-NI, session resumption.
 
 Do not ship any of this without third-party security review.
+
+## Layered architecture: webserver as a module on a userspace stack
+
+The long-term shape (still being built out):
+
+```
+[ NIC RX ] -> [ driver: epoll | io_uring | DPDK | AF_XDP ]
+            -> [ TCP reassembly  (per-flow, fixed flow table) ]
+            -> [ TLS decrypt     (in-place over reassembled record) ]
+            -> [ HTTP request slice + jumptable lookup ]
+            -> [ response: array of pw_iov_t pointing at static arena ]
+            -> [ TLS encrypt     (scatter-gather seal, ONE ciphertext blob) ]
+            -> [ TCP segmentation (slices into MSS-sized descriptors) ]
+            -> [ NIC TX ]
+```
+
+Each box is **deterministic** and performs **no allocation** after
+startup. Buffers are rented from per-worker pools (`crypto/pool.c`).
+
+### Canonical descriptor: `pw_iov_t`
+
+`userspace/iov.h` defines:
+
+```c
+typedef struct pw_iov {
+    const uint8_t* base;
+    size_t         len;
+} pw_iov_t;
+```
+
+This is intentionally identical in shape to POSIX `struct iovec` so it
+maps 1:1 onto:
+
+- `writev(2)` / `sendmsg(2)` / `sendmsg(MSG_ZEROCOPY)`
+- `io_uring` SQE iov entries
+- DPDK `rte_mbuf` chained payloads (next pointer + segment length)
+- AF_XDP TX descriptor batches
+
+The webserver **stops owning bytes and starts owning plans**. A
+response is an `pw_iov_t[]` of 3–6 fragments pointing into the
+immutable `mprotect(PROT_READ)` arena: status line, headers, chrome
+header, page body, chrome footer. Nothing is ever copied out of the
+arena — it flows straight through TLS into the TX path.
+
+### Streaming ChaCha20 + scatter-gather AEAD
+
+To make the `_iov` path bit-identical to a contiguous seal we needed
+ChaCha20 to handle fragments that don't end on 64-byte block
+boundaries. `crypto/chacha20.{c,h}` exposes:
+
+```c
+chacha20_stream_init(&cs, key, nonce, initial_counter);
+chacha20_stream_xor(&cs, in, out, len);  /* call repeatedly */
+```
+
+The context carries any unused tail of the last keystream block
+forward, so a fragment ending mid-block does not waste keystream
+bytes. Bulk middle blocks still go through the SIMD-dispatched path
+(`chacha20_xor_fn`). The streaming primitive tests prove identity
+against the one-shot path across an awkward fragmentation pattern
+(fragments of 1, 7, 13, 64, 65, 100, 256, 511, 513, 1024, 1003).
+
+`crypto/chacha20_poly1305.c` exposes:
+
+```c
+aead_chacha20_poly1305_seal_iov(key, nonce, aad, aad_len,
+                                pt_iov, pt_iov_n, total_pt_len,
+                                ct_out, tag);
+```
+
+It walks the iov chain, encrypting fragments via `chacha20_stream_xor`
+into a contiguous ciphertext buffer, while feeding Poly1305
+incrementally over the AAD || pad || ciphertext || pad || lens
+sequence. The contiguous output is what the TX path then segments.
+
+`tls/record.c` exposes:
+
+```c
+tls13_seal_record_iov(dir, inner_type, outer_type,
+                      pt_iov, pt_iov_n, total_plaintext_len,
+                      out, out_cap);
+```
+
+The total length is **known up front** (sum of `iov[].len`), so the
+record header (5 bytes: type / version / length) is written before any
+encryption work happens. This is the property the user wanted: "I want
+to be able to pass an array of pointers and a feature to calculate the
+length into the tcp layer before tls is hit." Length flows top-down,
+bytes flow bottom-up, no copy required.
+
+### Test coverage of the iov path
+
+`userspace/tests/test_crypto.c` proves that:
+
+1. `chacha20_stream_xor` over arbitrary fragmentation == one-shot
+   `chacha20_xor` over the concatenation (4096 B random + edge cases).
+2. `aead_chacha20_poly1305_seal_iov` produces byte-identical
+   ciphertext + tag to `aead_chacha20_poly1305_seal` over the same
+   plaintext, and `aead_chacha20_poly1305_open` recovers the original.
+3. `tls13_seal_record_iov` produces a byte-identical wire record to
+   `tls13_seal_record`, and `tls13_open_record` of the iov-sealed
+   record recovers the original plaintext.
+
+### What still needs to land
+
+- TLS 1.3 Certificate / CertificateVerify (Ed25519 sign) / Finished —
+  without these no real client completes a handshake.
+- Receive-window-based backpressure on the TCP layer (rubber-duck'd:
+  "no ACK = backpressure" was wrong; the right answer is to advertise
+  zero rcv_wnd and support persist).
+- TCP retransmit + RTO. This is where the months go.
+- An mbuf class for reassembly large enough to hold a full TLS record
+  (~16.4 KiB on the wire); the per-worker pool slot size is currently
+  configurable but not yet sized for this.
+- Real driver integration: the `pw_iov_t` array on TX is ready to feed
+  `writev` / `io_uring_prep_writev` / `rte_mbuf` chains; the abstraction
+  is sketched but not wired to a live link.
