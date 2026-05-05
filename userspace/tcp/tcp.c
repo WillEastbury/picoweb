@@ -15,6 +15,8 @@
 
 #include <string.h>
 
+static void rtx_on_ack(tcp_conn_t* c, uint32_t ack_no, uint64_t now_ms);
+
 static tcp_conn_t* find_conn(tcp_stack_t* s, const tcp_seg_t* seg) {
     for (uint32_t i = 0; i < TCP_TABLE_SIZE; i++) {
         tcp_conn_t* c = &s->conns[i];
@@ -224,6 +226,13 @@ static int drive_service_data(tcp_conn_t* c,
 void tcp_input(tcp_stack_t* s, const tcp_seg_t* seg,
                tcp_on_data_fn on_data, void* on_data_user,
                tcp_emit_fn emit, void* emit_user) {
+    tcp_input_at(s, seg, 0, on_data, on_data_user, emit, emit_user);
+}
+
+void tcp_input_at(tcp_stack_t* s, const tcp_seg_t* seg,
+                  uint64_t now_ms,
+                  tcp_on_data_fn on_data, void* on_data_user,
+                  tcp_emit_fn emit, void* emit_user) {
     /* Reject if not addressed to our local IP. */
     if (seg->dst_ip != s->local_ip) {
         emit_rst(seg, emit, emit_user);
@@ -277,6 +286,7 @@ void tcp_input(tcp_stack_t* s, const tcp_seg_t* seg,
     case TCP_SYN_RECEIVED:
         if ((seg->flags & TCPF_ACK) && seg->ack == c->snd_nxt) {
             c->snd_una = seg->ack;
+            rtx_on_ack(c, seg->ack, now_ms);
             c->state = TCP_ESTABLISHED;
 
             /* Fire on_open EXACTLY at ESTABLISHED, not at SYN. This
@@ -304,7 +314,10 @@ void tcp_input(tcp_stack_t* s, const tcp_seg_t* seg,
             emit_ctrl(c, TCPF_ACK, emit, emit_user);
             return;
         }
-        if (seg->flags & TCPF_ACK) c->snd_una = seg->ack;
+        if (seg->flags & TCPF_ACK) {
+            c->snd_una = seg->ack;
+            rtx_on_ack(c, seg->ack, now_ms);
+        }
         if (seg->payload_len) {
             /* Zero-window flow control: if we have advertised a zero
              * window, we MUST NOT consume the bytes. Any segment
@@ -366,7 +379,83 @@ void tcp_input(tcp_stack_t* s, const tcp_seg_t* seg,
 int tcp_send(tcp_conn_t* c,
              const uint8_t* data, size_t len,
              tcp_emit_fn emit, void* emit_user) {
+    return tcp_send_at(c, data, len, 0, emit, emit_user);
+}
+
+/* Append an entry to the retransmit queue. Returns 0 on success,
+ * -1 if the queue is full (caller treats as a backpressure signal). */
+static int rtx_enqueue(tcp_conn_t* c, uint32_t seq, uint32_t len,
+                       const uint8_t* payload, uint8_t flags,
+                       uint64_t tx_time_ms) {
+    if (c->rtx_n >= TCP_RTX_QUEUE_MAX) return -1;
+    tcp_rtx_entry_t* e = &c->rtx[c->rtx_n++];
+    e->seq        = seq;
+    e->len        = len;
+    e->payload    = payload;
+    e->flags      = flags;
+    e->retrans    = 0;
+    e->tx_time_ms = tx_time_ms;
+    return 0;
+}
+
+/* Drop all entries whose (seq + len) is fully covered by ack_no.
+ * For each non-retransmitted entry, take an RTT sample (RFC 6298 §3,
+ * Karn's algorithm: skip retransmitted segments). */
+static void rtx_on_ack(tcp_conn_t* c, uint32_t ack_no, uint64_t now_ms) {
+    uint32_t w = 0;
+    for (uint32_t r = 0; r < c->rtx_n; r++) {
+        tcp_rtx_entry_t* e = &c->rtx[r];
+        uint32_t end = e->seq + e->len;
+        /* Partial-ack handling: if ack covers only part of a segment
+         * we keep the entry (the spike never produces partial acks
+         * because we don't segment, but be defensive). */
+        if ((int32_t)(ack_no - end) < 0) {
+            c->rtx[w++] = *e;
+            continue;
+        }
+        /* Fully-acked. Maybe sample RTT. */
+        if (!e->retrans && now_ms != 0 && now_ms >= e->tx_time_ms) {
+            uint32_t r_ms = (uint32_t)(now_ms - e->tx_time_ms);
+            if (c->srtt_ms == 0) {
+                /* RFC 6298 §2.2: first measurement.
+                 *   SRTT   = R
+                 *   RTTVAR = R/2
+                 *   RTO    = SRTT + max(G, K*RTTVAR), K=4, G=clock granularity
+                 * G is taken as 1 ms here (we work in ms). */
+                c->srtt_ms   = r_ms;
+                c->rttvar_ms = r_ms / 2;
+            } else {
+                /* RFC 6298 §2.3: subsequent measurements.
+                 *   RTTVAR = (1 - beta) * RTTVAR + beta * |SRTT - R'|
+                 *   SRTT   = (1 - alpha) * SRTT + alpha * R'
+                 * alpha = 1/8, beta = 1/4. */
+                uint32_t diff = (c->srtt_ms > r_ms)
+                                ? (c->srtt_ms - r_ms) : (r_ms - c->srtt_ms);
+                c->rttvar_ms = (3u * c->rttvar_ms + diff) / 4u;
+                c->srtt_ms   = (7u * c->srtt_ms   + r_ms) / 8u;
+            }
+            uint32_t kvar = 4u * c->rttvar_ms;
+            if (kvar < 1u) kvar = 1u;       /* G = 1 ms */
+            uint32_t rto  = c->srtt_ms + kvar;
+            if (rto < TCP_RTO_MIN_MS) rto = TCP_RTO_MIN_MS;
+            if (rto > TCP_RTO_MAX_MS) rto = TCP_RTO_MAX_MS;
+            c->rto_ms = rto;
+        }
+    }
+    c->rtx_n = w;
+}
+
+int tcp_send_at(tcp_conn_t* c,
+                const uint8_t* data, size_t len,
+                uint64_t now_ms,
+                tcp_emit_fn emit, void* emit_user) {
     if (c->state != TCP_ESTABLISHED) return -1;
+    /* If the caller opted into RTX (now_ms != 0) and the queue is
+     * full, refuse the send so they can back off. */
+    if (now_ms != 0 && c->rtx_n >= TCP_RTX_QUEUE_MAX) return -1;
+    if (c->rto_ms == 0) c->rto_ms = TCP_RTO_INIT_MS;
+    /* Refresh advertised window for the outbound. */
+    c->rcv_wnd = tcp_advertised_wnd(c);
     tcp_seg_t s = {0};
     s.src_ip   = c->local_ip;
     s.dst_ip   = c->remote_ip;
@@ -379,8 +468,45 @@ int tcp_send(tcp_conn_t* c,
     s.payload  = data;
     s.payload_len = len;
     emit(&s, emit_user);
+    if (now_ms != 0 && len > 0) {
+        rtx_enqueue(c, c->snd_nxt, (uint32_t)len, data,
+                    TCPF_ACK | TCPF_PSH, now_ms);
+    }
     c->snd_nxt += (uint32_t)len;
     return (int)len;
+}
+
+void tcp_tick(tcp_stack_t* s, uint64_t now_ms,
+              tcp_emit_fn emit, void* emit_user) {
+    if (!s) return;
+    for (uint32_t i = 0; i < TCP_TABLE_SIZE; i++) {
+        tcp_conn_t* c = &s->conns[i];
+        if (c->state != TCP_ESTABLISHED && c->state != TCP_CLOSE_WAIT) continue;
+        if (c->rtx_n == 0) continue;
+        tcp_rtx_entry_t* e = &c->rtx[0];     /* oldest unacked */
+        uint64_t age = (now_ms >= e->tx_time_ms) ? (now_ms - e->tx_time_ms) : 0;
+        if (age < c->rto_ms) continue;
+        /* Retransmit. Refresh window (peer may have opened RX). */
+        c->rcv_wnd = tcp_advertised_wnd(c);
+        tcp_seg_t seg = {0};
+        seg.src_ip   = c->local_ip;
+        seg.dst_ip   = c->remote_ip;
+        seg.src_port = c->local_port;
+        seg.dst_port = c->remote_port;
+        seg.seq      = e->seq;
+        seg.ack      = c->rcv_nxt;
+        seg.flags    = e->flags;
+        seg.window   = c->rcv_wnd;
+        seg.payload  = e->payload;
+        seg.payload_len = e->len;
+        emit(&seg, emit_user);
+        e->retrans    = 1;
+        e->tx_time_ms = now_ms;
+        /* RFC 6298 §5.5: double RTO on timeout, cap at RTO_MAX. */
+        uint64_t doubled = (uint64_t)c->rto_ms * 2u;
+        if (doubled > TCP_RTO_MAX_MS) doubled = TCP_RTO_MAX_MS;
+        c->rto_ms = (uint32_t)doubled;
+    }
 }
 
 int tcp_sendv(tcp_conn_t* c,

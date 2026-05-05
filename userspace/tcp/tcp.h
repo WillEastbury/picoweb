@@ -34,6 +34,19 @@
 
 #define TCP_TABLE_SIZE 8u
 
+/* Maximum number of unacked outbound segments tracked per conn for
+ * retransmit. Spike-sized; production stacks track many more. The
+ * caller MUST keep each segment's payload buffer valid until it is
+ * either ACKed or the connection is closed (zero-copy contract). */
+#define TCP_RTX_QUEUE_MAX 4u
+
+/* RTO bounds (RFC 6298 §2 + §2.4). RFC mandates RTO_MIN >= 1s for
+ * Internet paths; we use 200 ms for the spike so test latency is
+ * tolerable. RTO_MAX is the RFC's recommended ceiling. */
+#define TCP_RTO_INIT_MS 1000u
+#define TCP_RTO_MIN_MS  200u
+#define TCP_RTO_MAX_MS  60000u
+
 typedef enum {
     TCP_CLOSED = 0,
     TCP_LISTEN,
@@ -42,6 +55,17 @@ typedef enum {
     TCP_CLOSE_WAIT,
     TCP_LAST_ACK,
 } tcp_state_t;
+
+/* One unacked segment pending retransmit. Payload pointer must
+ * remain valid until the segment is ACKed (zero-copy contract). */
+typedef struct {
+    uint32_t       seq;          /* first seq of payload                  */
+    uint32_t       len;          /* payload length                         */
+    const uint8_t* payload;      /* caller-owned, stable until ACK         */
+    uint8_t        flags;        /* TCP flags used on original tx          */
+    uint8_t        retrans;      /* 1 if at least one retransmit fired     */
+    uint64_t       tx_time_ms;   /* when last (re)transmitted              */
+} tcp_rtx_entry_t;
 
 typedef struct {
     tcp_state_t state;
@@ -64,6 +88,15 @@ typedef struct {
      * opted into flow control). */
     uint32_t rcv_buf_cap;
     uint32_t rcv_buf_used;
+
+    /* Retransmit queue + RFC 6298 RTO estimator. All times in ms.
+     * srtt_ms == 0 means "no RTT sample taken yet"; first sample
+     * sets srtt_ms / rttvar_ms via the RFC initialisation step. */
+    tcp_rtx_entry_t rtx[TCP_RTX_QUEUE_MAX];
+    uint32_t        rtx_n;
+    uint32_t        srtt_ms;
+    uint32_t        rttvar_ms;
+    uint32_t        rto_ms;
 
     /* Dispatch-mode plumbing. NULL when the legacy single-port API
      * (tcp_listen + tcp_input(on_data,...)) is in use. */
@@ -152,5 +185,50 @@ void tcp_rcv_consumed(tcp_conn_t* c, uint32_t n,
 /* Compute the window we would advertise right now (cap - used,
  * clamped to 65535; or 65535 if cap == 0). Useful for tests. */
 uint16_t tcp_advertised_wnd(const tcp_conn_t* c);
+
+/* ------------------------------------------------------------------
+ * Retransmit + RFC 6298 RTO timer.
+ *
+ * The stack does NOT have its own clock or timer thread. Callers
+ * drive the RTO machinery by passing a monotonic millisecond
+ * timestamp into tcp_send / tcp_input / tcp_tick. tcp_tick walks
+ * all conns and retransmits the oldest unacked segment per conn
+ * whose (now - tx_time_ms) >= rto_ms. Karn's algorithm: a
+ * retransmitted segment never contributes to the RTT estimator.
+ *
+ * Bounds: rto_ms is clamped to [TCP_RTO_MIN_MS, TCP_RTO_MAX_MS].
+ * Initial RTO is TCP_RTO_INIT_MS until the first RTT sample.
+ *
+ * The retransmit queue is bounded at TCP_RTX_QUEUE_MAX entries per
+ * conn. tcp_send_at returns -1 (queue full) if the cap is hit.
+ * Caller-provided payload pointers MUST remain valid until ACKed.
+ * ------------------------------------------------------------------ */
+
+/* Time-aware variant of tcp_send. Records the segment in the RTX
+ * queue tagged with `now_ms` so RTO + RTT estimator can run. The
+ * legacy tcp_send below is equivalent to tcp_send_at(..., now_ms=0)
+ * which disables RTX tracking (back-compat). Returns bytes sent or
+ * -1 on error / queue full. */
+int tcp_send_at(tcp_conn_t* c,
+                const uint8_t* data, size_t len,
+                uint64_t now_ms,
+                tcp_emit_fn emit, void* emit_user);
+
+/* Walk all conns: for each, if there is an unacked segment whose
+ * (now_ms - tx_time_ms) >= rto_ms, retransmit it, mark it as
+ * retransmitted, double rto_ms (capped at TCP_RTO_MAX_MS), and
+ * update tx_time_ms. Time-driven; safe to call frequently. */
+void tcp_tick(tcp_stack_t* s, uint64_t now_ms,
+              tcp_emit_fn emit, void* emit_user);
+
+/* Time-aware variant of tcp_input. now_ms is used to (a) measure
+ * RTT for newly-acked segments (RFC 6298 §3 / Karn's algo) and
+ * (b) timestamp the SYN+ACK in the RTX queue. tcp_input is
+ * equivalent to tcp_input_at(..., now_ms=0) which still works but
+ * never measures RTT. */
+void tcp_input_at(tcp_stack_t* s, const tcp_seg_t* seg,
+                  uint64_t now_ms,
+                  tcp_on_data_fn on_data, void* on_data_user,
+                  tcp_emit_fn emit, void* emit_user);
 
 #endif

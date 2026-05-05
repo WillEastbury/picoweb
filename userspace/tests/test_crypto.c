@@ -982,6 +982,115 @@ static void test_tcp_zero_window(void) {
 }
 
 /* ============================================================== */
+/* TCP retransmit + RFC 6298 RTO timer                            */
+/* ============================================================== */
+static void test_tcp_retransmit_rto(void) {
+    printf("== TCP retransmit + RFC 6298 RTO ==\n");
+
+    tcp_stack_t stack;
+    tcp_listen(&stack, 0x0a000002u, 80);
+
+    emit_log_t emit_log = {0};
+    app_buf_t  app = {0};
+
+    /* SYN -> SYN+ACK at t=10. */
+    tcp_seg_t syn = {0};
+    syn.src_ip = 0x0a000001u; syn.dst_ip = 0x0a000002u;
+    syn.src_port = 6060;     syn.dst_port = 80;
+    syn.seq = 5000;          syn.flags = TCPF_SYN;
+    tcp_input_at(&stack, &syn, 10, on_data, &app, log_emit, &emit_log);
+    uint32_t srv_iss = emit_log.segs[0].seq;
+
+    tcp_conn_t* srv = NULL;
+    for (uint32_t i = 0; i < TCP_TABLE_SIZE; i++) {
+        if (stack.conns[i].state == TCP_SYN_RECEIVED) { srv = &stack.conns[i]; break; }
+    }
+    if (!srv) { printf("  FAIL: no SYN_RECEIVED PCB\n"); g_fail++; return; }
+
+    /* Final ACK -> ESTABLISHED. */
+    emit_log.n = 0;
+    tcp_seg_t ack = {0};
+    ack.src_ip = 0x0a000001u; ack.dst_ip = 0x0a000002u;
+    ack.src_port = 6060;     ack.dst_port = 80;
+    ack.seq = 5001;          ack.ack = srv_iss + 1;
+    ack.flags = TCPF_ACK;
+    tcp_input_at(&stack, &ack, 20, NULL, NULL, log_emit, &emit_log);
+
+    /* Send 5 bytes at t=100 with RTX tracking. */
+    emit_log.n = 0;
+    static const uint8_t hello[5] = {'h','e','l','l','o'};
+    int sent = tcp_send_at(srv, hello, 5, 100, log_emit, &emit_log);
+    uint32_t data_seq = emit_log.segs[0].seq;
+    if (sent == 5 && srv->rtx_n == 1 && srv->rtx[0].seq == data_seq
+        && srv->rtx[0].len == 5 && srv->rtx[0].tx_time_ms == 100)
+         { printf("  PASS: tcp_send_at queues RTX entry\n"); g_pass++; }
+    else { printf("  FAIL: sent=%d rtx_n=%u\n", sent, srv->rtx_n); g_fail++; }
+
+    /* Initial RTO is TCP_RTO_INIT_MS == 1000. tcp_tick at t=900
+     * (age=800 < 1000) must NOT retransmit. */
+    emit_log.n = 0;
+    tcp_tick(&stack, 900, log_emit, &emit_log);
+    if (emit_log.n == 0)
+         { printf("  PASS: tick before RTO does not retransmit\n"); g_pass++; }
+    else { printf("  FAIL: spurious retransmit n=%d\n", emit_log.n); g_fail++; }
+
+    /* Tick at t=1100 (age=1000 == rto): retransmit oldest. RTO doubles. */
+    emit_log.n = 0;
+    uint32_t rto_before = srv->rto_ms;
+    tcp_tick(&stack, 1100, log_emit, &emit_log);
+    if (emit_log.n == 1
+        && emit_log.segs[0].seq == data_seq
+        && emit_log.segs[0].payload_len == 5
+        && srv->rtx[0].retrans == 1
+        && srv->rto_ms == rto_before * 2)
+         { printf("  PASS: RTO fired -> retransmit + RTO doubled (%u -> %u)\n",
+                  rto_before, srv->rto_ms); g_pass++; }
+    else { printf("  FAIL: n=%d seq=%u rto=%u (was %u) retrans=%u\n",
+                  emit_log.n,
+                  emit_log.n ? emit_log.segs[0].seq : 0,
+                  srv->rto_ms, rto_before,
+                  srv->rtx_n ? srv->rtx[0].retrans : 99); g_fail++; }
+
+    /* Peer ACKs the data at t=1200. Karn: this ack came after a
+     * retransmit so we must NOT take an RTT sample (srtt stays 0). */
+    emit_log.n = 0;
+    tcp_seg_t ack2 = ack;
+    ack2.seq = 5001;
+    ack2.ack = data_seq + 5;
+    tcp_input_at(&stack, &ack2, 1200, NULL, NULL, log_emit, &emit_log);
+    if (srv->rtx_n == 0 && srv->srtt_ms == 0)
+         { printf("  PASS: ACK drains RTX, Karn skips retransmitted sample\n"); g_pass++; }
+    else { printf("  FAIL: rtx_n=%u srtt=%u\n", srv->rtx_n, srv->srtt_ms); g_fail++; }
+
+    /* Reset RTO so the next send doesn't use the doubled value. */
+    srv->rto_ms = TCP_RTO_INIT_MS;
+
+    /* New send + clean ACK should produce an RTT sample and update
+     * SRTT/RTTVAR/RTO per RFC 6298 §2.2. */
+    emit_log.n = 0;
+    static const uint8_t world[5] = {'w','o','r','l','d'};
+    tcp_send_at(srv, world, 5, 2000, log_emit, &emit_log);
+    uint32_t world_seq = emit_log.segs[0].seq;
+
+    emit_log.n = 0;
+    ack2.ack = world_seq + 5;
+    tcp_input_at(&stack, &ack2, 2050, NULL, NULL, log_emit, &emit_log);
+    /* RTT = 50 ms. First sample: SRTT=50, RTTVAR=25, RTO=SRTT+4*RTTVAR=150,
+     * but clamped to TCP_RTO_MIN_MS (200). */
+    if (srv->srtt_ms == 50 && srv->rttvar_ms == 25 && srv->rto_ms == 200)
+         { printf("  PASS: first RTT sample sets SRTT=50 RTTVAR=25 RTO=200\n"); g_pass++; }
+    else { printf("  FAIL: srtt=%u rttvar=%u rto=%u\n",
+                  srv->srtt_ms, srv->rttvar_ms, srv->rto_ms); g_fail++; }
+
+    /* RTX queue cap: fill it up; an extra send_at must refuse. */
+    srv->rtx_n = TCP_RTX_QUEUE_MAX;
+    int rc = tcp_send_at(srv, hello, 5, 3000, log_emit, &emit_log);
+    if (rc == -1)
+         { printf("  PASS: RTX queue full -> tcp_send_at returns -1\n"); g_pass++; }
+    else { printf("  FAIL: rc=%d (want -1)\n", rc); g_fail++; }
+}
+
+/* ============================================================== */
 /* SHA-256 dispatch — verify scalar and HW path agree on vectors. */
 /* ============================================================== */
 static void test_sha256_dispatch(void) {
@@ -4450,6 +4559,7 @@ int main(void) {
     test_ip_tcp();
     test_tcp_state();
     test_tcp_zero_window();
+    test_tcp_retransmit_rto();
     test_buffer_pool();
     test_pem();
     test_cert_store();

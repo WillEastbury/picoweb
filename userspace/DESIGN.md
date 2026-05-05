@@ -717,20 +717,30 @@ future verify path for mTLS) can construct it directly.
 
 This is the running TODO for what's blocking real-traffic readiness.
 
-- **Engine error code**: today `pw_tls_step` returns -1 on any fatal
-  error and goes to `PW_TLS_ST_FAILED` without a per-class enum.
-  `pw_conn` therefore collapses tag failures, oversize records, and
-  unknown content types all into `PW_CONN_AUTH_FAIL`. Adding an
-  `pw_tls_last_error` accessor with an enum
-  (PROTOCOL/AUTH/INTERNAL) would let `pw_conn` preserve the
-  pre-migration distinction.
-- **Receive-window-driven backpressure** on the TCP layer
-  (rubber-duck'd: "no ACK = backpressure" was wrong; the right answer
-  is to advertise zero `rcv_wnd` and support persist).
-- **TCP retransmit + RTO**. This is where the months go.
-- **mbuf class for reassembly** large enough to hold a full TLS
-  record (~16.4 KiB on the wire); the per-worker pool slot size is
-  currently configurable but not yet sized for this.
+- **Engine error code** ✅ DONE. `pw_tls_engine_t` now carries a
+  `pw_tls_err_t last_err` set on transition to `PW_TLS_ST_FAILED`,
+  exposed via `pw_tls_last_error()`. Five classes:
+  `NONE / AUTH / PROTOCOL / OVERFLOW / INTERNAL`. `pw_conn` fans out:
+  `AUTH` -> `PW_CONN_AUTH_FAIL`, all other classes ->
+  `PW_CONN_PROTOCOL_ERR`, restoring the pre-migration distinction.
+- **Receive-window-driven backpressure** on the TCP layer ✅ DONE.
+  `tcp_conn_t` carries `rcv_buf_cap` / `rcv_buf_used`;
+  `tcp_advertised_wnd()` reports the live window, `emit_ctrl()`
+  recomputes on every outbound. Persist probes are dropped without
+  advancing `rcv_nxt` and re-ACKed with the (still 0) window.
+  `tcp_rcv_consumed()` emits a window-update ACK on 0 -> non-zero.
+- **TCP retransmit + RTO** ✅ DONE. Per-conn `tcp_rtx_entry_t[]`
+  retransmit queue (cap `TCP_RTX_QUEUE_MAX`, zero-copy contract on
+  payload pointers); RFC 6298 SRTT/RTTVAR/RTO estimator (alpha=1/8,
+  beta=1/4, K=4, RTO clamped to `[TCP_RTO_MIN_MS, TCP_RTO_MAX_MS]`,
+  initial `TCP_RTO_INIT_MS=1000`); `tcp_tick(now_ms)` retransmits
+  oldest unacked when `(now - tx_time) >= rto`, doubles RTO; Karn's
+  algorithm skips RTT samples on retransmitted segments. No
+  congestion control yet (no slow-start, cwnd, fast retransmit).
+- **mbuf class for reassembly** ✅ DONE. `PW_TLS_WIRE_RECORD_MAX` /
+  `PW_RX_REASSEMBLY_SLOT` in `tls/record.h` (16661 bytes = header +
+  max ciphertext); recommended pool slab `slot_size` documented in
+  `crypto/pool.h`.
 - **Real driver integration:** the `pw_iov_t` array on TX is ready to
   feed `writev` / `io_uring_prep_writev` / `rte_mbuf` chains; the
   abstraction is sketched but not wired to a live link.
@@ -740,6 +750,6 @@ This is the running TODO for what's blocking real-traffic readiness.
   budget).
 - **Constant-time scalar mult** in Ed25519 (currently variable-time;
   prerequisite for production cert-signing in adversarial latency
-  contexts).
+  contexts). NOT in current scope (mTLS prerequisite, deferred).
 - **Small-order public-key rejection** in `ed25519_verify`
-  (prerequisite for mTLS).
+  (prerequisite for mTLS). NOT in current scope (deferred).
