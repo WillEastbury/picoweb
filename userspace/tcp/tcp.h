@@ -47,6 +47,15 @@
 #define TCP_RTO_MIN_MS  200u
 #define TCP_RTO_MAX_MS  60000u
 
+/* Congestion control (RFC 5681 NewReno + RFC 6928 IW10). MSS is a
+ * compile-time constant for the spike (no MSS option negotiation,
+ * no PMTU discovery). 1460 = standard Ethernet payload minus
+ * 20-byte IPv4 + 20-byte TCP headers. */
+#define TCP_MSS              1460u
+#define TCP_INIT_CWND        (10u * TCP_MSS)   /* RFC 6928 IW10 */
+#define TCP_MIN_CWND         (2u  * TCP_MSS)   /* ssthresh floor */
+#define TCP_DUPACK_THRESHOLD 3u                /* fast retransmit trigger */
+
 typedef enum {
     TCP_CLOSED = 0,
     TCP_LISTEN,
@@ -97,6 +106,26 @@ typedef struct {
     uint32_t        srtt_ms;
     uint32_t        rttvar_ms;
     uint32_t        rto_ms;
+
+    /* RFC 5681 NewReno congestion control state.
+     *   cwnd       - congestion window in bytes (units of TCP_MSS)
+     *   ssthresh   - slow-start threshold; UINT32_MAX = "infinite"
+     *                until the first loss event
+     *   snd_wnd    - peer's advertised receive window (from latest
+     *                ACK). Effective send window is min(cwnd, snd_wnd)
+     *   dupack_n   - consecutive duplicate ACKs seen for snd_una;
+     *                fast retransmit triggers at TCP_DUPACK_THRESHOLD
+     *   in_recovery- 1 while in fast-recovery; cleared when snd_una
+     *                advances past recovery_seq
+     *   recovery_seq - snd_nxt at the moment recovery started; an
+     *                ACK >= this exits recovery (NewReno §3.2)
+     */
+    uint32_t cwnd;
+    uint32_t ssthresh;
+    uint32_t snd_wnd;
+    uint32_t dupack_n;
+    uint32_t recovery_seq;
+    uint8_t  in_recovery;
 
     /* Dispatch-mode plumbing. NULL when the legacy single-port API
      * (tcp_listen + tcp_input(on_data,...)) is in use. */
@@ -230,5 +259,15 @@ void tcp_input_at(tcp_stack_t* s, const tcp_seg_t* seg,
                   uint64_t now_ms,
                   tcp_on_data_fn on_data, void* on_data_user,
                   tcp_emit_fn emit, void* emit_user);
+
+/* ------------------------------------------------------------------
+ * Congestion control inspection (read-only helpers; tests + ops).
+ *
+ * Effective send window is min(cwnd, snd_wnd) - flight_size().
+ * Callers that respect this stay within both congestion and flow
+ * control bounds. tcp_send_at clamps to this internally.
+ * ------------------------------------------------------------------ */
+uint32_t tcp_flight_size(const tcp_conn_t* c);
+uint32_t tcp_send_window(const tcp_conn_t* c);
 
 #endif

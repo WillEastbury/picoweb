@@ -1091,6 +1091,152 @@ static void test_tcp_retransmit_rto(void) {
 }
 
 /* ============================================================== */
+/* TCP NewReno congestion control (RFC 5681)                      */
+/* ============================================================== */
+static void test_tcp_congestion_control(void) {
+    printf("== TCP NewReno congestion control ==\n");
+
+    tcp_stack_t stack;
+    tcp_listen(&stack, 0x0a000002u, 80);
+    emit_log_t emit_log = {0};
+    app_buf_t  app = {0};
+
+    /* Establish. */
+    tcp_seg_t syn = {0};
+    syn.src_ip = 0x0a000001u; syn.dst_ip = 0x0a000002u;
+    syn.src_port = 7070;     syn.dst_port = 80;
+    syn.seq = 9000;          syn.flags = TCPF_SYN;
+    syn.window = 65535;
+    tcp_input_at(&stack, &syn, 10, on_data, &app, log_emit, &emit_log);
+    uint32_t srv_iss = emit_log.segs[0].seq;
+
+    tcp_conn_t* srv = NULL;
+    for (uint32_t i = 0; i < TCP_TABLE_SIZE; i++) {
+        if (stack.conns[i].state == TCP_SYN_RECEIVED) { srv = &stack.conns[i]; break; }
+    }
+    if (!srv) { printf("  FAIL: no PCB\n"); g_fail++; return; }
+
+    /* Initial cwnd is IW10 (10 * MSS) per RFC 6928. */
+    if (srv->cwnd == TCP_INIT_CWND && srv->ssthresh == 0xffffffffu)
+         { printf("  PASS: initial cwnd=IW10=%u ssthresh=infinity\n", srv->cwnd); g_pass++; }
+    else { printf("  FAIL: cwnd=%u ssthresh=%u\n", srv->cwnd, srv->ssthresh); g_fail++; }
+
+    /* Final ACK. */
+    emit_log.n = 0;
+    tcp_seg_t ack = {0};
+    ack.src_ip = 0x0a000001u; ack.dst_ip = 0x0a000002u;
+    ack.src_port = 7070;     ack.dst_port = 80;
+    ack.seq = 9001;          ack.ack = srv_iss + 1;
+    ack.flags = TCPF_ACK;    ack.window = 65535;
+    tcp_input_at(&stack, &ack, 20, NULL, NULL, log_emit, &emit_log);
+
+    /* tcp_send_window should equal min(cwnd, snd_wnd). snd_wnd=65535,
+     * cwnd=14600, flight=0 -> 14600. */
+    uint32_t sw = tcp_send_window(srv);
+    if (sw == TCP_INIT_CWND)
+         { printf("  PASS: send_window=cwnd when snd_wnd is large (%u)\n", sw); g_pass++; }
+    else { printf("  FAIL: send_window=%u\n", sw); g_fail++; }
+
+    /* Slow-start growth: send 100 bytes, ACK it. cwnd grows by min(100,MSS)=100. */
+    static const uint8_t buf100[100] = {0};
+    emit_log.n = 0;
+    tcp_send_at(srv, buf100, 100, 100, log_emit, &emit_log);
+    uint32_t data_seq = emit_log.segs[0].seq;
+    uint32_t cwnd_before = srv->cwnd;
+    emit_log.n = 0;
+    ack.seq = 9001; ack.ack = data_seq + 100;
+    tcp_input_at(&stack, &ack, 150, NULL, NULL, log_emit, &emit_log);
+    if (srv->cwnd == cwnd_before + 100u)
+         { printf("  PASS: slow-start: cwnd %u -> %u (+100)\n", cwnd_before, srv->cwnd); g_pass++; }
+    else { printf("  FAIL: cwnd=%u (want %u)\n", srv->cwnd, cwnd_before + 100u); g_fail++; }
+
+    /* Send-window respects cwnd: try to send more than send_window. */
+    srv->cwnd = TCP_MSS;       /* shrink artificially */
+    srv->snd_wnd = 65535u;
+    /* flight=0, so window = MSS = 1460. Try 1500 bytes -> refused. */
+    static uint8_t big[1500] = {0};
+    emit_log.n = 0;
+    int rc2 = tcp_send_at(srv, big, 1500, 200, log_emit, &emit_log);
+    if (rc2 == -1 && emit_log.n == 0)
+         { printf("  PASS: send > send_window refused\n"); g_pass++; }
+    else { printf("  FAIL: rc=%d emit.n=%d\n", rc2, emit_log.n); g_fail++; }
+
+    /* 1460 (==window) is accepted. */
+    rc2 = tcp_send_at(srv, big, TCP_MSS, 200, log_emit, &emit_log);
+    if (rc2 == (int)TCP_MSS)
+         { printf("  PASS: send == send_window accepted\n"); g_pass++; }
+    else { printf("  FAIL: rc=%d\n", rc2); g_fail++; }
+    /* Drain. */
+    uint32_t mss_seq = srv->snd_una;
+    ack.ack = mss_seq + TCP_MSS;
+    tcp_input_at(&stack, &ack, 250, NULL, NULL, log_emit, &emit_log);
+
+    /* Fast retransmit on 3 duplicate ACKs. Set up: send 3 segments,
+     * have peer ACK only the first, then send 3 dupacks. */
+    srv->cwnd = TCP_INIT_CWND;
+    srv->ssthresh = 0xffffffffu;
+    srv->rtx_n = 0;
+    srv->dupack_n = 0;
+    srv->in_recovery = 0;
+
+    static const uint8_t segA[200] = {0};
+    static const uint8_t segB[200] = {0};
+    static const uint8_t segC[200] = {0};
+    emit_log.n = 0;
+    tcp_send_at(srv, segA, 200, 300, log_emit, &emit_log);
+    uint32_t seqA = srv->snd_una;
+    tcp_send_at(srv, segB, 200, 300, log_emit, &emit_log);
+    tcp_send_at(srv, segC, 200, 300, log_emit, &emit_log);
+    /* Three dup ACKs for seqA (= snd_una). */
+    emit_log.n = 0;
+    ack.ack = seqA;
+    tcp_input_at(&stack, &ack, 310, NULL, NULL, log_emit, &emit_log);   /* dup #1 */
+    tcp_input_at(&stack, &ack, 311, NULL, NULL, log_emit, &emit_log);   /* dup #2 */
+    uint32_t cwnd_pre_fr = srv->cwnd;
+    tcp_input_at(&stack, &ack, 312, NULL, NULL, log_emit, &emit_log);   /* dup #3 -> FR */
+
+    /* After fast retransmit: in_recovery, ssthresh = max(flight/2, 2*MSS),
+     * cwnd = ssthresh + 3*MSS, oldest segment retransmitted. */
+    if (srv->in_recovery == 1
+        && srv->ssthresh == TCP_MIN_CWND      /* flight=600 -> half=300 < 2*MSS */
+        && srv->cwnd     == TCP_MIN_CWND + 3u * TCP_MSS
+        && emit_log.n >= 1
+        && emit_log.segs[emit_log.n - 1].seq == seqA
+        && emit_log.segs[emit_log.n - 1].payload_len == 200)
+         { printf("  PASS: 3 dupacks -> fast retransmit + recovery (cwnd %u -> %u, ssthresh=%u)\n",
+                  cwnd_pre_fr, srv->cwnd, srv->ssthresh); g_pass++; }
+    else { printf("  FAIL: in_rec=%d cwnd=%u ssthresh=%u emit.n=%d last_seq=%u last_len=%zu\n",
+                  srv->in_recovery, srv->cwnd, srv->ssthresh, emit_log.n,
+                  emit_log.n ? emit_log.segs[emit_log.n - 1].seq : 0,
+                  emit_log.n ? emit_log.segs[emit_log.n - 1].payload_len : (size_t)0);
+           g_fail++; }
+
+    /* Recovery exit: cumulative ACK >= recovery_seq deflates cwnd to ssthresh. */
+    emit_log.n = 0;
+    ack.ack = srv->recovery_seq;
+    tcp_input_at(&stack, &ack, 400, NULL, NULL, log_emit, &emit_log);
+    if (srv->in_recovery == 0 && srv->cwnd == srv->ssthresh)
+         { printf("  PASS: recovery exit deflates cwnd -> ssthresh (%u)\n", srv->cwnd); g_pass++; }
+    else { printf("  FAIL: in_rec=%d cwnd=%u ssthresh=%u\n",
+                  srv->in_recovery, srv->cwnd, srv->ssthresh); g_fail++; }
+
+    /* RTO timeout collapses cwnd to MSS. */
+    srv->cwnd = TCP_INIT_CWND;
+    srv->ssthresh = 0xffffffffu;
+    srv->rtx_n = 0;
+    static const uint8_t segR[400] = {0};
+    tcp_send_at(srv, segR, 400, 500, log_emit, &emit_log);
+    emit_log.n = 0;
+    /* Tick well beyond RTO. */
+    tcp_tick(&stack, 500 + TCP_RTO_INIT_MS + 1, log_emit, &emit_log);
+    /* ssthresh = max(400/2, 2*MSS) = 2*MSS = 2920; cwnd = MSS = 1460. */
+    if (srv->cwnd == TCP_MSS && srv->ssthresh == TCP_MIN_CWND)
+         { printf("  PASS: RTO -> cwnd=MSS=%u ssthresh=2*MSS=%u\n",
+                  srv->cwnd, srv->ssthresh); g_pass++; }
+    else { printf("  FAIL: cwnd=%u ssthresh=%u\n", srv->cwnd, srv->ssthresh); g_fail++; }
+}
+
+/* ============================================================== */
 /* SHA-256 dispatch — verify scalar and HW path agree on vectors. */
 /* ============================================================== */
 static void test_sha256_dispatch(void) {
@@ -4560,6 +4706,7 @@ int main(void) {
     test_tcp_state();
     test_tcp_zero_window();
     test_tcp_retransmit_rto();
+    test_tcp_congestion_control();
     test_buffer_pool();
     test_pem();
     test_cert_store();

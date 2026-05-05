@@ -16,6 +16,9 @@
 #include <string.h>
 
 static void rtx_on_ack(tcp_conn_t* c, uint32_t ack_no, uint64_t now_ms);
+static void cc_on_new_ack(tcp_conn_t* c, uint32_t bytes_acked);
+static void cc_on_dupack(tcp_conn_t* c, tcp_emit_fn emit, void* emit_user);
+static void cc_on_rto(tcp_conn_t* c);
 
 static tcp_conn_t* find_conn(tcp_stack_t* s, const tcp_seg_t* seg) {
     for (uint32_t i = 0; i < TCP_TABLE_SIZE; i++) {
@@ -267,6 +270,13 @@ void tcp_input_at(tcp_stack_t* s, const tcp_seg_t* seg,
         c->snd_nxt     = 0xc0fe0000u;      /* deterministic ISS for spike */
         c->snd_una     = c->snd_nxt;
         c->rcv_wnd     = 65535;
+        /* Congestion control init (RFC 5681 + RFC 6928 IW10). */
+        c->cwnd         = TCP_INIT_CWND;
+        c->ssthresh     = 0xffffffffu;     /* "infinity" until first loss */
+        c->snd_wnd      = seg->window ? seg->window : 65535u;
+        c->dupack_n     = 0;
+        c->in_recovery  = 0;
+        c->recovery_seq = 0;
         c->svc         = svc;              /* may be NULL in legacy mode */
         c->app_state   = NULL;
         c->opened      = 0;
@@ -315,8 +325,25 @@ void tcp_input_at(tcp_stack_t* s, const tcp_seg_t* seg,
             return;
         }
         if (seg->flags & TCPF_ACK) {
-            c->snd_una = seg->ack;
-            rtx_on_ack(c, seg->ack, now_ms);
+            /* Track peer's advertised window for our send-window calc. */
+            c->snd_wnd = seg->window ? seg->window : c->snd_wnd;
+            /* RFC 5681 §2 dup-ack predicate: ack == snd_una AND
+             * unacked data outstanding AND no payload AND no SYN/FIN.
+             * Window changes also disqualify a dup, but we ignore
+             * window field for simplicity. */
+            int is_dup = (seg->ack == c->snd_una)
+                      && (c->rtx_n > 0)
+                      && (seg->payload_len == 0)
+                      && ((seg->flags & (TCPF_SYN | TCPF_FIN)) == 0);
+            int32_t adv = (int32_t)(seg->ack - c->snd_una);
+            if (adv > 0) {
+                uint32_t bytes_acked = (uint32_t)adv;
+                c->snd_una = seg->ack;
+                rtx_on_ack(c, seg->ack, now_ms);
+                cc_on_new_ack(c, bytes_acked);
+            } else if (is_dup) {
+                cc_on_dupack(c, emit, emit_user);
+            }
         }
         if (seg->payload_len) {
             /* Zero-window flow control: if we have advertised a zero
@@ -380,6 +407,104 @@ int tcp_send(tcp_conn_t* c,
              const uint8_t* data, size_t len,
              tcp_emit_fn emit, void* emit_user) {
     return tcp_send_at(c, data, len, 0, emit, emit_user);
+}
+
+uint32_t tcp_flight_size(const tcp_conn_t* c) {
+    if (!c) return 0;
+    uint32_t sum = 0;
+    for (uint32_t i = 0; i < c->rtx_n; i++) sum += c->rtx[i].len;
+    return sum;
+}
+
+uint32_t tcp_send_window(const tcp_conn_t* c) {
+    if (!c) return 0;
+    uint32_t cwnd = c->cwnd ? c->cwnd : TCP_INIT_CWND;
+    uint32_t snd  = c->snd_wnd ? c->snd_wnd : 65535u;
+    uint32_t lim  = (cwnd < snd) ? cwnd : snd;
+    uint32_t fl   = tcp_flight_size(c);
+    return (fl >= lim) ? 0 : (lim - fl);
+}
+
+/* RFC 5681 §3.1: cwnd growth on cumulative-ack progress. Slow start
+ * (cwnd < ssthresh): cwnd += min(bytes_acked, MSS) per ACK.
+ * Congestion avoidance: cwnd += MSS*MSS/cwnd per ACK (one MSS per RTT). */
+static void cc_on_new_ack(tcp_conn_t* c, uint32_t bytes_acked) {
+    if (bytes_acked == 0) return;
+    /* Recovery exit: ack >= recovery_seq snapshotted at entry. We
+     * detect via snd_una; caller has already advanced snd_una before
+     * calling us, so just check the flag against the snapshot. */
+    if (c->in_recovery) {
+        if ((int32_t)(c->snd_una - c->recovery_seq) >= 0) {
+            c->in_recovery  = 0;
+            /* Deflate cwnd to ssthresh per RFC 5681 §3.2 step 6. */
+            c->cwnd = c->ssthresh;
+        }
+        /* While in recovery NewReno keeps cwnd inflated; do not grow. */
+        c->dupack_n = 0;
+        return;
+    }
+    if (c->cwnd < c->ssthresh) {
+        /* Slow start, RFC 5681 §3.1 (with abc=2 cap at one MSS). */
+        uint32_t inc = (bytes_acked < TCP_MSS) ? bytes_acked : TCP_MSS;
+        c->cwnd += inc;
+    } else {
+        /* Congestion avoidance, RFC 5681 §3.1. */
+        uint32_t inc = (TCP_MSS * TCP_MSS) / (c->cwnd ? c->cwnd : 1u);
+        if (inc == 0) inc = 1;
+        c->cwnd += inc;
+    }
+    c->dupack_n = 0;
+}
+
+/* RFC 5681 §3.2: duplicate ACK. Increment counter; on 3rd dup,
+ * enter fast retransmit/fast recovery: ssthresh = max(flight/2,
+ * 2*MSS), cwnd = ssthresh + 3*MSS, retransmit oldest unacked. */
+static void cc_on_dupack(tcp_conn_t* c, tcp_emit_fn emit, void* emit_user) {
+    c->dupack_n++;
+    if (c->dupack_n < TCP_DUPACK_THRESHOLD) return;
+    if (c->in_recovery) {
+        /* NewReno §3.2 step 4: in recovery, each further dupack
+         * inflates cwnd by 1*MSS to allow new data to be sent. */
+        c->cwnd += TCP_MSS;
+        return;
+    }
+    /* Enter fast recovery. */
+    uint32_t flight = tcp_flight_size(c);
+    uint32_t half   = flight / 2u;
+    c->ssthresh = (half > TCP_MIN_CWND) ? half : TCP_MIN_CWND;
+    c->cwnd     = c->ssthresh + 3u * TCP_MSS;
+    c->recovery_seq = c->snd_nxt;
+    c->in_recovery  = 1;
+    /* Fast retransmit: resend oldest unacked. */
+    if (c->rtx_n > 0 && emit) {
+        tcp_rtx_entry_t* e = &c->rtx[0];
+        c->rcv_wnd = tcp_advertised_wnd(c);
+        tcp_seg_t seg = {0};
+        seg.src_ip   = c->local_ip;
+        seg.dst_ip   = c->remote_ip;
+        seg.src_port = c->local_port;
+        seg.dst_port = c->remote_port;
+        seg.seq      = e->seq;
+        seg.ack      = c->rcv_nxt;
+        seg.flags    = e->flags;
+        seg.window   = c->rcv_wnd;
+        seg.payload  = e->payload;
+        seg.payload_len = e->len;
+        emit(&seg, emit_user);
+        e->retrans = 1;        /* Karn: don't sample RTT now */
+    }
+}
+
+/* RFC 5681 §3.1 step 4: RTO timeout collapses cwnd to 1*MSS,
+ * sets ssthresh to max(flight/2, 2*MSS), exits recovery. Caller
+ * (tcp_tick) handles the actual retransmit + RTO doubling. */
+static void cc_on_rto(tcp_conn_t* c) {
+    uint32_t flight = tcp_flight_size(c);
+    uint32_t half   = flight / 2u;
+    c->ssthresh = (half > TCP_MIN_CWND) ? half : TCP_MIN_CWND;
+    c->cwnd        = TCP_MSS;
+    c->dupack_n    = 0;
+    c->in_recovery = 0;
 }
 
 /* Append an entry to the retransmit queue. Returns 0 on success,
@@ -453,6 +578,12 @@ int tcp_send_at(tcp_conn_t* c,
     /* If the caller opted into RTX (now_ms != 0) and the queue is
      * full, refuse the send so they can back off. */
     if (now_ms != 0 && c->rtx_n >= TCP_RTX_QUEUE_MAX) return -1;
+    /* Congestion + flow control: refuse if the segment would exceed
+     * the effective send window (min(cwnd, snd_wnd) - flight).
+     * Caller is expected to retry once acks free up window. Only
+     * applied to RTX-tracked sends; legacy now_ms=0 path bypasses
+     * for back-compat. */
+    if (now_ms != 0 && (uint32_t)len > tcp_send_window(c)) return -1;
     if (c->rto_ms == 0) c->rto_ms = TCP_RTO_INIT_MS;
     /* Refresh advertised window for the outbound. */
     c->rcv_wnd = tcp_advertised_wnd(c);
@@ -502,6 +633,8 @@ void tcp_tick(tcp_stack_t* s, uint64_t now_ms,
         emit(&seg, emit_user);
         e->retrans    = 1;
         e->tx_time_ms = now_ms;
+        /* RFC 5681 §3.1 step 4: collapse cwnd, halve ssthresh. */
+        cc_on_rto(c);
         /* RFC 6298 §5.5: double RTO on timeout, cap at RTO_MAX. */
         uint64_t doubled = (uint64_t)c->rto_ms * 2u;
         if (doubled > TCP_RTO_MAX_MS) doubled = TCP_RTO_MAX_MS;
