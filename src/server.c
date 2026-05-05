@@ -231,7 +231,11 @@ static void try_accept(int listen_fd, int ep, pool_t* pool) {
  * resume cleanly with no per-conn iovec storage. */
 static int try_send(conn_t* c) {
     const resource_t* r = c->res;
-    const chrome_t* ch = c->send_body ? r->chrome : NULL;
+    /* When serving the compressed variant, the wire payload is a
+     * single contiguous blob — chrome bytes are baked into it. */
+    const chrome_t* ch = (c->send_body && !c->serve_compressed) ? r->chrome : NULL;
+    const char* body_ptr = c->serve_compressed ? r->compressed->body : r->body;
+    size_t      body_len = c->serve_compressed ? r->compressed->body_len : r->body_len;
 
     /* Build a fixed-size segment table (cheap on the stack). Using a
      * uniform walker handles both the chrome and no-chrome cases with
@@ -244,8 +248,8 @@ static int try_send(conn_t* c) {
         if (ch && ch->hdr_len) {
             seg_ptr[seg_n] = ch->hdr; seg_len[seg_n] = ch->hdr_len;     seg_n++;
         }
-        if (r->body_len) {
-            seg_ptr[seg_n] = r->body; seg_len[seg_n] = r->body_len;     seg_n++;
+        if (body_len) {
+            seg_ptr[seg_n] = body_ptr; seg_len[seg_n] = body_len;       seg_n++;
         }
         if (ch && ch->ftr_len) {
             seg_ptr[seg_n] = ch->ftr; seg_len[seg_n] = ch->ftr_len;     seg_n++;
@@ -346,8 +350,20 @@ static int dispatch_one(conn_t* c, const jumptable_t* jt, uint32_t max_req) {
      * serve. post_send() handles the "no more bytes to come" case. */
 
     c->res         = r;
-    c->head_ptr    = close_after ? r->head_close      : r->head_keepalive;
-    c->head_len    = close_after ? r->head_close_len  : r->head_keepalive_len;
+    /* Pick compressed variant if (a) the client opted in, (b) we built
+     * one at startup, and (c) we're sending a body (HEAD requests get
+     * the variant head if appropriate, since Content-Length must match
+     * what would be sent — RFC 9110 §9.3.2). */
+    bool use_pc = (req.accept_pc && r->compressed != NULL);
+    c->serve_compressed = use_pc;
+    if (use_pc) {
+        const resource_compress_t* rc = r->compressed;
+        c->head_ptr = close_after ? rc->head_close      : rc->head_keepalive;
+        c->head_len = close_after ? rc->head_close_len  : rc->head_keepalive_len;
+    } else {
+        c->head_ptr = close_after ? r->head_close       : r->head_keepalive;
+        c->head_len = close_after ? r->head_close_len   : r->head_keepalive_len;
+    }
     c->send_body   = !head_only;
     c->bytes_sent  = 0;
     c->close_after = close_after;
@@ -393,6 +409,7 @@ static bool post_send(conn_t* c, int ep, pool_t* pool,
         c->head_len    = 0;
         c->bytes_sent  = 0;
         c->send_body   = false;
+        c->serve_compressed = false;
         c->state       = ST_READING;
         /* Refresh idle timer ONLY at request/response boundary. */
         c->last_active_ms = metal_now_ms();

@@ -61,3 +61,16 @@ const char* mime_lookup(const char* filename, size_t len) {
     }
     return kDefault;
 }
+
+bool mime_is_compressible(const char* mime) {
+    if (!mime) return false;
+    /* text/anything */
+    if (strncmp(mime, "text/", 5) == 0) return true;
+    /* application/{json,javascript,xml} (with or without ;charset=...) */
+    if (strncmp(mime, "application/json", 16) == 0) return true;
+    if (strncmp(mime, "application/javascript", 22) == 0) return true;
+    if (strncmp(mime, "application/xml", 15) == 0) return true;
+    /* SVG: technically image/x but it's XML on the wire — compresses well. */
+    if (strncmp(mime, "image/svg+xml", 13) == 0) return true;
+    return false;
+}

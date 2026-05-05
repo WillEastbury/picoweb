@@ -90,12 +90,23 @@ infrastructure if all you want is "serve this folder really, really fast".
   independent; no shared mutable state on the hot path. Connection pool,
   read buffers, and metrics histograms are all per-worker.
 - **Cache-line-aligned `resource_t`** (64 B, `__attribute__((aligned(64)))`)
-  containing the two head pointers, the body pointer, body length, and an
-  optional pointer to a per-host header/footer "chrome" pair.
+  containing the two head pointers, the body pointer, body length, an
+  optional pointer to a per-host header/footer "chrome" pair, and an
+  optional pointer to a precomputed compressed variant. All eight pointers
+  fit in one cache line.
+- **Pre-compression with `picoweb-compress`.** Every text resource gets a
+  separately-stored compressed copy (chrome + body baked into one stream)
+  built at startup. Clients that send `Accept-Encoding: picoweb-compress`
+  get the variant; everyone else gets identity. **No allocations and no
+  CPU spent compressing anything on the hot path.** See *Performance
+  flags* below.
 - **Send path is a state machine.** Partial writes resume cleanly; slow
   readers are dropped via per-connection idle timeout. Keep-alive is bounded
   (default 100 reqs/conn, 10 s idle) so one bad client cannot hold a slot
   forever.
+- **Optional `MSG_ZEROCOPY`** (5th positional arg). Opt-in per-server
+  threshold; soft-fails on older kernels; drains the err queue on
+  `EPOLLERR`. See *Performance flags*.
 - **SIMD-accelerated string ops** (SSE2 on x86-64, NEON on aarch64, scalar
   fallback) for hostname lowercasing and 16-byte-chunked equality compare
   on the lookup key.
@@ -124,11 +135,22 @@ Produces a single statically-linked-against-libc binary called `picoweb`.
 ## Run
 
 ```sh
-./picoweb                      # :8080, ./wwwroot, $(nproc) workers
-./picoweb 8080 wwwroot 4       # port, root, worker count
-./picoweb 8080 wwwroot 4 100   # ...with max requests per keep-alive conn
+./picoweb                                # :8080, ./wwwroot, $(nproc) workers
+./picoweb 8080 wwwroot 4                 # port, root, worker count
+./picoweb 8080 wwwroot 4 100             # ...with max requests per keep-alive conn
+./picoweb 8080 wwwroot 4 100 16384       # ...with MSG_ZEROCOPY for sends >= 16KB
 ./picoweb --help
 ```
+
+Positional args:
+
+| # | Name      | Default      | Notes |
+|---|-----------|--------------|-------|
+| 1 | PORT      | `8080`       |       |
+| 2 | ROOT      | `./wwwroot`  | Directory containing per-host folders. |
+| 3 | WORKERS   | `nproc`      | Independent epoll loops, `SO_REUSEPORT`. |
+| 4 | MAX_REQS  | `0` = unlimited | Per keep-alive connection cap. |
+| 5 | ZC_MIN    | `0` = off    | Bytes; opts in to MSG_ZEROCOPY for sends ≥ this size. See *Performance flags* below. |
 
 Startup banner shows the SIMD path being used, the arena footprint, and
 per-worker readiness:
@@ -136,11 +158,11 @@ per-worker readiness:
 ```
 metrics: 4 worker(s), tsc/sec=2693907772
   host 'localhost': _pages/ enabled (chromed virtual root)
-picoweb: arena 81732 B for 2 host(s) / 4 dir(s) / 6 file(s) (+3 aliases) / 1132 body B / 32 slots
+picoweb: arena 86379 B for 2 host(s) / 4 dir(s) / 6 file(s) (+3 aliases) / 1132 body B / 32 slots
   host '_default': 1 file(s)
   host 'localhost': chrome hdr=150B ftr=66B
   host 'localhost': 5 file(s)
-picoweb: 4 worker(s) on :8080, root=wwwroot, maxreqs=100, simd=x86-64 SSE2
+picoweb: 4 worker(s) on :8080, root=wwwroot, maxreqs=100, zerocopy=off, simd=x86-64 SSE2
 ```
 
 Bind to a privileged port (80, 443) by either running as root, or granting the
@@ -152,6 +174,64 @@ sudo setcap 'cap_net_bind_service=+ep' ./picoweb
 ```
 
 `SIGINT` / `SIGTERM` cleanly stops all workers.
+
+---
+
+## Performance flags
+
+picoweb is built around **calculation hit at startup, pointer copies at runtime**.
+Anything optional follows the same rule: pre-compute, never mutate the hot path.
+
+### `MSG_ZEROCOPY` (5th positional arg `ZC_MIN`)
+
+When `ZC_MIN > 0`, accepted client sockets opt in to `SO_ZEROCOPY` and
+`sendmsg()` calls whose remaining payload is `>= ZC_MIN` bytes pass
+`MSG_ZEROCOPY`. The kernel pins the user pages and skips the data copy.
+
+- **Default `0` (off)** — per the kernel docs, MSG_ZEROCOPY is a regression
+  for sends below ~10 KB because the page-pinning and completion-queue
+  overhead beats the saved memcpy. Useful threshold: `16384` and up.
+- **Soft-fail** — older kernels (pre-4.14) or restrictive policies make
+  `setsockopt(SO_ZEROCOPY)` return `EPERM`/`ENOPROTOOPT`. We log one warn
+  and continue without ZC for that connection.
+- **`ENOBUFS` retry** — if the kernel's optmem cap is hit while ZC sends are
+  in flight, we retry the same iovec without `MSG_ZEROCOPY` rather than
+  dropping the connection.
+- **`MSG_ERRQUEUE` drain** — completion notifications fire `EPOLLERR`. We
+  drain via `recvmsg(MSG_ERRQUEUE)`, recognise `SO_EE_ORIGIN_ZEROCOPY`,
+  and only close on a real (non-ZC) error.
+
+### Pre-compression: `picoweb-compress` (always on)
+
+At startup we run a hand-written block-LZ encoder (vendored — no third-party
+deps) over every text-y resource (`text/*`, `application/json`, `application/javascript`,
+`application/xml`, `image/svg+xml`). The compressed bytes live in the same
+immutable arena. If the result isn't smaller than the original it's dropped.
+
+The encoder is **wire-compatible with [BareMetal.Compress.js](https://github.com/WillEastbury/BareMetalWeb)**,
+so the existing browser-side decoder works as-is. Tokens recognised in
+`Accept-Encoding`:
+
+- `picoweb-compress` (preferred)
+- `BareMetal.Compress` (legacy alias)
+
+When a client opts in, picoweb swaps to a precomputed head + body pair
+(`Content-Encoding: picoweb-compress`, `Vary: Accept-Encoding`). Chrome bytes
+are baked into the compressed stream so the iovec collapses from 4 segments
+to 2.
+
+Typical wins on real text content: **~5× on repetitive HTML/CSS/JS, ~2-3×
+on natural prose**. Random binary is correctly bypassed (no false positives).
+
+### Why other "go faster" options aren't simple flags
+
+These come up a lot. Here's the honest read on each:
+
+| Option            | Status        | Why |
+|-------------------|---------------|-----|
+| **`io_uring`**    | Not a flag    | This is a full architectural rewrite of the worker — different submission/completion model, different fd registration, different multishot accept. Worth a separate `picoweb_uring` build target; not viable as a runtime toggle. Tracked. |
+| **`sendfile()`**  | Won't ship    | We back resources with anonymous mmap (one arena per worker), not file fds. `sendfile()` requires per-resource fds and would force a `read`+`sendfile` pair per request — a regression vs the current single `sendmsg`. The arena model is already zero-copy in userspace; the only kernel-side win left is `MSG_ZEROCOPY`. |
+| **DPDK / AF_XDP** | Spike branch  | These bypass the kernel network stack entirely. The whole TCP state machine, congestion control, retransmit, **and TLS** would have to live in userspace. Months of work, not a flag. There's a feasibility branch tracked. |
 
 ---
 

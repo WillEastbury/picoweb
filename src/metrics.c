@@ -176,6 +176,7 @@ void metrics_build_resources(arena_t* arena,
     {
         static const char health_body[] = "OK";
         resource_t* r = (resource_t*)arena_alloc(arena, sizeof(*r), 64);
+        memset(r, 0, sizeof(*r));
         r->body = health_body;
         r->body_len = 2;
         r->head_close = build_head_local(arena, "HTTP/1.1 200 OK",
@@ -190,6 +191,7 @@ void metrics_build_resources(arena_t* arena,
     /* /stats */
     {
         resource_t* r = (resource_t*)arena_alloc(arena, sizeof(*r), 64);
+        memset(r, 0, sizeof(*r));
         r->body = g_stats_body;          /* writable mmap region */
         r->body_len = STATS_BODY_LEN;
         r->head_close = build_head_local(arena, "HTTP/1.1 200 OK",

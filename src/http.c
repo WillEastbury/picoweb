@@ -1,4 +1,5 @@
 #include "http.h"
+#include "compress.h"
 #include "util.h"
 
 #include <ctype.h>
@@ -166,6 +167,11 @@ http_result_t http_parse(char* buf, size_t buf_len, http_request_t* out) {
                     break;
                 }
             }
+        } else if (metal_ieq(p, name_len, "Accept-Encoding", 15)) {
+            /* Substring scan for tokens we serve. Token names are
+             * exact-form (case-sensitive); the rest of the value
+             * (q-values, other tokens) is ignored. */
+            if (metal_compress_accepted(tval, tl)) out->accept_pc = true;
         }
         p = eol + 2;
     }

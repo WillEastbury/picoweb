@@ -1,4 +1,5 @@
 #include "jumptable.h"
+#include "compress.h"
 #include "metrics.h"
 #include "mime.h"
 #include "simd.h"
@@ -429,6 +430,7 @@ static resource_t* build_resource(arena_t* arena,
     r->body = body_in_arena;
     r->body_len = body_len;
     r->chrome = NULL;
+    r->compressed = NULL;
     r->head_close = build_head(arena, status_line, mime_type, body_len,
                                false, extra_header, &r->head_close_len);
     r->head_keepalive = build_head(arena, status_line, mime_type, body_len,
@@ -452,11 +454,80 @@ static resource_t* build_resource_chromed(arena_t* arena,
     r->body = body_in_arena;
     r->body_len = body_len;
     r->chrome = chrome;
+    r->compressed = NULL;
     r->head_close = build_head(arena, status_line, mime_type, total_payload,
                                false, NULL, &r->head_close_len);
     r->head_keepalive = build_head(arena, status_line, mime_type, total_payload,
                                    true, NULL, &r->head_keepalive_len);
     return r;
+}
+
+/* Build a precomputed compressed variant of `r`. Compresses the FULL
+ * wire payload (chrome.hdr || body || chrome.ftr) if chromed, else
+ * just body. Attaches via r->compressed if and only if the result is
+ * strictly smaller than the uncompressed payload (otherwise we keep
+ * r->compressed = NULL and clients silently fall back to identity).
+ *
+ * Headers carry an extra "Content-Encoding: picoweb-compress\r\n"
+ * line and a Content-Length matching the compressed byte count.
+ *
+ * Uses a malloc'd scratch buffer for the input and bound; both are
+ * freed before returning. The compressed bytes themselves are copied
+ * into the immutable arena. */
+static void attach_compressed_variant(arena_t* arena,
+                                      resource_t* r,
+                                      const char* status_line,
+                                      const char* mime_type) {
+    if (!r || !r->body_len) return;
+
+    /* Step 1: assemble the raw payload (chrome+body if chromed). */
+    size_t hdr_len = r->chrome ? r->chrome->hdr_len : 0;
+    size_t ftr_len = r->chrome ? r->chrome->ftr_len : 0;
+    size_t raw_len = hdr_len + r->body_len + ftr_len;
+    if (raw_len == 0) return;
+
+    uint8_t* raw = (uint8_t*)malloc(raw_len);
+    if (!raw) return;
+    size_t off = 0;
+    if (hdr_len) { memcpy(raw + off, r->chrome->hdr, hdr_len); off += hdr_len; }
+    memcpy(raw + off, r->body, r->body_len);                   off += r->body_len;
+    if (ftr_len) { memcpy(raw + off, r->chrome->ftr, ftr_len); off += ftr_len; }
+
+    /* Step 2: compress into a worst-case scratch. */
+    size_t bound = metal_compress_bound(raw_len);
+    uint8_t* tmp = (uint8_t*)malloc(bound);
+    if (!tmp) { free(raw); return; }
+
+    int got = metal_compress(raw, raw_len, tmp, bound);
+    free(raw);
+    if (got <= 0 || (size_t)got >= raw_len) {
+        /* No win — drop the variant. */
+        free(tmp);
+        return;
+    }
+
+    /* Step 3: copy compressed bytes into the arena. */
+    void* body_pc = arena_dup(arena, tmp, (size_t)got);
+    free(tmp);
+    if (!body_pc) return;
+
+    /* Step 4: build the variant heads. Only difference vs the normal
+     * head is the extra Content-Encoding line and the new (smaller)
+     * Content-Length. The Vary header tells caches the response
+     * content depends on Accept-Encoding. */
+    static const char kExtra[] =
+        "Content-Encoding: picoweb-compress\r\n"
+        "Vary: Accept-Encoding\r\n";
+
+    resource_compress_t* rc = (resource_compress_t*)
+        arena_alloc(arena, sizeof(*rc), 64);
+    rc->body = (const char*)body_pc;
+    rc->body_len = (size_t)got;
+    rc->head_close = build_head(arena, status_line, mime_type, (size_t)got,
+                                false, kExtra, &rc->head_close_len);
+    rc->head_keepalive = build_head(arena, status_line, mime_type, (size_t)got,
+                                    true, kExtra, &rc->head_keepalive_len);
+    r->compressed = rc;
 }
 
 static const char kBody400[] = "<!doctype html><title>400</title><h1>400 Bad Request</h1>";
@@ -566,9 +637,18 @@ bool jumptable_build(jumptable_t* jt, const char* wwwroot) {
      * metric_entries for the path-key strings ("/health", "/stats")
      * plus 2 extra resource_t's (one /health, one /stats — shared
      * across hosts), plus per-host chrome bytes (header + footer copied
-     * into arena once per host) and a chrome_t struct per host. */
+     * into arena once per host) and a chrome_t struct per host.
+     *
+     * Pre-compressed variants: every text resource gets an extra
+     * arena copy up to ~120% of its raw payload (worst case: stored
+     * verbatim per block + 4-byte block headers) plus a
+     * resource_compress_t struct + two variant heads. We budget for
+     * this against EVERY body byte (cheap over-approximation; the
+     * bound is tight on text and a no-op on binary). */
     size_t arena_cap = total_bytes
+                     + total_bytes * 6 / 5         /* compressed copies */
                      + total_entries * 768
+                     + total_entries * 256         /* resource_compress_t + variant heads */
                      + slot_count * sizeof(flat_slot_t)
                      + total_hosts * 512
                      + 2 * 768                   /* /health + /stats heads */
@@ -632,6 +712,15 @@ bool jumptable_build(jumptable_t* jt, const char* wwwroot) {
                                              mime, body, got, host_chrome)
                     : build_resource(&jt->arena, "HTTP/1.1 200 OK",
                                      mime, body, got, NULL);
+
+                /* Pre-compress text bodies for clients that opt in
+                 * via Accept-Encoding. Variant is dropped silently if
+                 * compression doesn't shrink the payload. Computed
+                 * once at startup; never mutated on the hot path. */
+                if (mime_is_compressible(mime)) {
+                    attach_compressed_variant(&jt->arena, r,
+                                              "HTTP/1.1 200 OK", mime);
+                }
 
                 char url[8192];
                 int ulen = build_url(url, sizeof(url), d->path, d->path_len,

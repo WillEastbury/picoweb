@@ -15,6 +15,22 @@ typedef struct {
     const char* ftr;     size_t ftr_len;
 } __attribute__((aligned(64))) chrome_t;
 
+/* A pre-built compressed variant of a resource. The wire payload is
+ * the FULL response body (chrome.hdr || body || chrome.ftr if chromed,
+ * else just body) compressed once at startup. When this variant is
+ * served the iovec collapses to two segments — head_pc + body_pc —
+ * because chrome bytes are baked into the compressed stream.
+ *
+ * Lives in the immutable arena. Built only for compressible MIME
+ * types (text slash any, application/json, application/javascript,
+ * application/xml, image/svg+xml) and only kept if it actually
+ * shrinks the payload. */
+typedef struct {
+    const char* head_keepalive;  size_t head_keepalive_len;
+    const char* head_close;      size_t head_close_len;
+    const char* body;            size_t body_len;     /* compressed bytes */
+} __attribute__((aligned(64))) resource_compress_t;
+
 /* A pre-built HTTP response: head (status + headers, ending in \r\n\r\n)
  * in two flavours, plus an optional body and optional chrome.
  *
@@ -27,6 +43,13 @@ typedef struct {
  * For non-HTML or no-chrome resources, chrome == NULL and the iovec
  * collapses to the original 2 entries (head + body).
  *
+ * The optional `compressed` pointer references a precomputed
+ * `resource_compress_t` for clients that send Accept-Encoding:
+ * picoweb-compress (or BareMetal.Compress legacy alias). NULL if
+ * compression wasn't worth it (e.g. binary payload, or compressed
+ * size exceeded original). One pointer = 8 bytes, fits in the
+ * existing tail padding so resource_t stays at exactly 64 bytes.
+ *
  * All pointers reference either immutable arena memory or, for the
  * /stats endpoint specifically, a fixed-length writable region that
  * the metrics updater rewrites in place. Aligned to 64B so the hot
@@ -36,6 +59,7 @@ typedef struct {
     const char* head_close;      size_t head_close_len;
     const char* body;            size_t body_len;
     const chrome_t* chrome;      /* NULL if no chrome is applied */
+    const resource_compress_t* compressed; /* NULL if no compressed variant */
 } __attribute__((aligned(64))) resource_t;
 
 /* One flat-table slot. value == NULL marks the slot empty.
