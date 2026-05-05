@@ -229,9 +229,55 @@ These come up a lot. Here's the honest read on each:
 
 | Option            | Status        | Why |
 |-------------------|---------------|-----|
-| **`io_uring`**    | Not a flag    | This is a full architectural rewrite of the worker — different submission/completion model, different fd registration, different multishot accept. Worth a separate `picoweb_uring` build target; not viable as a runtime toggle. Tracked. |
+| **`io_uring`**    | Build target  | Available as `make uring`, produces a separate `picoweb_uring` binary that swaps the epoll worker for an io_uring worker (raw syscalls, no liburing). Same business logic — see *io_uring backend* below. |
 | **`sendfile()`**  | Won't ship    | We back resources with anonymous mmap (one arena per worker), not file fds. `sendfile()` requires per-resource fds and would force a `read`+`sendfile` pair per request — a regression vs the current single `sendmsg`. The arena model is already zero-copy in userspace; the only kernel-side win left is `MSG_ZEROCOPY`. |
 | **DPDK / AF_XDP** | Spike branch  | These bypass the kernel network stack entirely. The whole TCP state machine, congestion control, retransmit, **and TLS** would have to live in userspace. Months of work, not a flag. There's a feasibility branch tracked. |
+
+### `io_uring` backend (`make uring` → `picoweb_uring`)
+
+A second worker implementation lives in `src/server_uring.c` and is
+selected at build time:
+
+```
+make uring                # produces ./picoweb_uring
+./picoweb_uring 8080 wwwroot 4 100
+```
+
+The Makefile excludes `src/server.c` from this build so there's exactly
+one `server_worker_main` symbol — the runtime shape, the parser, the
+jumptable lookup, the `picoweb-compress` variant swap, and the
+keep-alive bookkeeping are unchanged. What's different:
+
+- **No `<liburing.h>`.** The worker calls `io_uring_setup` and
+  `io_uring_enter` directly via `syscall()` and uses the SQ/CQ ring
+  layout the kernel exposes through `<linux/io_uring.h>`. Same
+  no-third-party-deps stance as the rest of picoweb.
+- **One ring per worker, 1024 SQ entries.** `IORING_FEAT_SINGLE_MMAP`
+  is honoured when the kernel reports it (5.4+).
+- **Ops used:** `IORING_OP_ACCEPT` (one-shot, re-armed on every
+  completion), `IORING_OP_RECV`, `IORING_OP_SENDMSG`,
+  `IORING_OP_CLOSE`. The 56/8-bit user_data carries the connection
+  index plus a 1-byte op tag.
+- **Same partial-send loop.** `submit_sendmsg` walks the up-to-4
+  iovec segments, skips `bytes_sent` worth of prefix, hands the
+  remaining slice to the kernel, and reissues on partial completion.
+
+Status: passes the same regression suite as the epoll backend
+(`test_pages.sh`, `test_compress.sh`) plus a dedicated
+`test_uring.sh` smoke pack. **Permanent opt-in** — epoll remains the
+default until io_uring has been burned in under load.
+
+What's *not* in the io_uring backend yet (deliberate scope cuts —
+straightforward extensions, just not in the spike):
+
+- `MSG_ZEROCOPY`. Would map onto `IORING_OP_SENDMSG_ZC` and reuse the
+  same threshold knob.
+- Multishot accept / multishot recv. 5.19+ kernels only; the spike
+  targets WSL2's 5.15 line.
+- Registered fds and fixed buffers. Next-level perf; design intact.
+- Idle-timer eviction. The epoll backend's per-conn idle-timer is
+  not yet ported; under abusive slow-loris-style clients you'll want
+  the epoll backend.
 
 ---
 
