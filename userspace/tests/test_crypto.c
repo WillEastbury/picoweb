@@ -13,6 +13,7 @@
 
 #include "../crypto/sha256.h"
 #include "../crypto/sha512.h"
+#include "../crypto/ed25519.h"
 #include "../crypto/hmac.h"
 #include "../crypto/hkdf.h"
 #include "../crypto/chacha20.h"
@@ -430,6 +431,140 @@ static void test_x25519(void) {
     x25519(shared_b, bob_priv, alice_pub);
     check_eq("Alice shared secret", shared_a, want_shared, 32);
     check_eq("Bob   shared secret", shared_b, want_shared, 32);
+}
+
+/* ============================================================== */
+/* Ed25519 — RFC 8032 §7.1 test vectors.                          */
+/* ============================================================== */
+static void test_ed25519(void) {
+    printf("== Ed25519 (RFC 8032 §7.1) ==\n");
+
+    /* ---- TEST 1: empty message ---- */
+    uint8_t seed1[32], pk1_want[32], sig1_want[64];
+    unhex("9d61b19deffd5a60ba844af492ec2cc4"
+          "4449c5697b326919703bac031cae7f60", seed1, 32);
+    unhex("d75a980182b10ab7d54bfed3c964073a"
+          "0ee172f3daa62325af021a68f707511a", pk1_want, 32);
+    unhex("e5564300c360ac729086e2cc806e828a"
+          "84877f1eb8e5d974d873e065224901555fb8821590a33bacc61e3970"
+          "1cf9b46bd25bf5f0595bbe24655141438e7a100b", sig1_want, 64);
+
+    uint8_t pk1_got[32], sig1_got[64];
+    ed25519_pubkey_from_seed(pk1_got, seed1);
+    check_eq("RFC8032 TEST1 pubkey", pk1_got, pk1_want, 32);
+
+    ed25519_sign(sig1_got, NULL, 0, seed1, pk1_want);
+    check_eq("RFC8032 TEST1 sign  ", sig1_got, sig1_want, 64);
+
+    if (ed25519_verify(sig1_want, NULL, 0, pk1_want) == 1) {
+        printf("  PASS: RFC8032 TEST1 verify\n"); g_pass++;
+    } else {
+        printf("  FAIL: RFC8032 TEST1 verify\n"); g_fail++;
+    }
+
+    /* ---- TEST 2: 1-byte message 0x72 ---- */
+    uint8_t seed2[32], pk2_want[32], sig2_want[64];
+    uint8_t msg2[1] = { 0x72 };
+    unhex("4ccd089b28ff96da9db6c346ec114e0f"
+          "5b8a319f35aba624da8cf6ed4fb8a6fb", seed2, 32);
+    unhex("3d4017c3e843895a92b70aa74d1b7ebc"
+          "9c982ccf2ec4968cc0cd55f12af4660c", pk2_want, 32);
+    unhex("92a009a9f0d4cab8720e820b5f642540"
+          "a2b27b5416503f8fb3762223ebdb69da085ac1e43e15996e458f3613"
+          "d0f11d8c387b2eaeb4302aeeb00d291612bb0c00", sig2_want, 64);
+
+    uint8_t pk2_got[32], sig2_got[64];
+    ed25519_pubkey_from_seed(pk2_got, seed2);
+    check_eq("RFC8032 TEST2 pubkey", pk2_got, pk2_want, 32);
+
+    ed25519_sign(sig2_got, msg2, 1, seed2, pk2_want);
+    check_eq("RFC8032 TEST2 sign  ", sig2_got, sig2_want, 64);
+
+    if (ed25519_verify(sig2_want, msg2, 1, pk2_want) == 1) {
+        printf("  PASS: RFC8032 TEST2 verify\n"); g_pass++;
+    } else {
+        printf("  FAIL: RFC8032 TEST2 verify\n"); g_fail++;
+    }
+
+    /* ---- TEST 3: 2-byte message af82 ---- */
+    uint8_t seed3[32], pk3_want[32], sig3_want[64];
+    uint8_t msg3[2] = { 0xaf, 0x82 };
+    unhex("c5aa8df43f9f837bedb7442f31dcb7b1"
+          "66d38535076f094b85ce3a2e0b4458f7", seed3, 32);
+    unhex("fc51cd8e6218a1a38da47ed00230f058"
+          "0816ed13ba3303ac5deb911548908025", pk3_want, 32);
+    unhex("6291d657deec24024827e69c3abe01a3"
+          "0ce548a284743a445e3680d7db5ac3ac18ff9b538d16f290ae67f760"
+          "984dc6594a7c15e9716ed28dc027beceea1ec40a", sig3_want, 64);
+
+    uint8_t pk3_got[32], sig3_got[64];
+    ed25519_pubkey_from_seed(pk3_got, seed3);
+    check_eq("RFC8032 TEST3 pubkey", pk3_got, pk3_want, 32);
+
+    ed25519_sign(sig3_got, msg3, 2, seed3, pk3_want);
+    check_eq("RFC8032 TEST3 sign  ", sig3_got, sig3_want, 64);
+
+    if (ed25519_verify(sig3_want, msg3, 2, pk3_want) == 1) {
+        printf("  PASS: RFC8032 TEST3 verify\n"); g_pass++;
+    } else {
+        printf("  FAIL: RFC8032 TEST3 verify\n"); g_fail++;
+    }
+
+    /* ---- Sign-verify roundtrip on a 200-byte message ---- */
+    uint8_t big_msg[200];
+    for (int i = 0; i < 200; i++) big_msg[i] = (uint8_t)(i ^ 0x5a);
+    uint8_t sig_rt[64];
+    ed25519_sign(sig_rt, big_msg, 200, seed3, pk3_want);
+    if (ed25519_verify(sig_rt, big_msg, 200, pk3_want) == 1) {
+        printf("  PASS: sign-verify roundtrip (200 B)\n"); g_pass++;
+    } else {
+        printf("  FAIL: sign-verify roundtrip (200 B)\n"); g_fail++;
+    }
+
+    /* ---- Bit-flip in signature must fail ---- */
+    uint8_t sig_bad[64];
+    memcpy(sig_bad, sig_rt, 64);
+    sig_bad[10] ^= 0x01;
+    if (ed25519_verify(sig_bad, big_msg, 200, pk3_want) == 0) {
+        printf("  PASS: bit-flip in sig[10] rejected\n"); g_pass++;
+    } else {
+        printf("  FAIL: bit-flip in sig[10] accepted\n"); g_fail++;
+    }
+
+    /* ---- Bit-flip in pubkey must fail ---- */
+    uint8_t pk_bad[32];
+    memcpy(pk_bad, pk3_want, 32);
+    pk_bad[5] ^= 0x40;
+    if (ed25519_verify(sig_rt, big_msg, 200, pk_bad) == 0) {
+        printf("  PASS: bit-flip in pk[5] rejected\n"); g_pass++;
+    } else {
+        printf("  FAIL: bit-flip in pk[5] accepted\n"); g_fail++;
+    }
+
+    /* ---- Bit-flip in message must fail ---- */
+    uint8_t msg_bad[200];
+    memcpy(msg_bad, big_msg, 200);
+    msg_bad[100] ^= 0x80;
+    if (ed25519_verify(sig_rt, msg_bad, 200, pk3_want) == 0) {
+        printf("  PASS: bit-flip in msg[100] rejected\n"); g_pass++;
+    } else {
+        printf("  FAIL: bit-flip in msg[100] accepted\n"); g_fail++;
+    }
+
+    /* ---- Non-canonical R: y_bytes == p exactly must be rejected.
+     *   p = 2^255 - 19 → LE bytes = ed,ff,ff,...,ff,7f. We patch the
+     *   R-half of a real signature to that value; verify must say 0
+     *   (point decode rejects non-canonical y). */
+    uint8_t sig_noncanon[64];
+    memcpy(sig_noncanon, sig_rt, 64);
+    sig_noncanon[0]  = 0xed;
+    for (int i = 1; i < 31; i++) sig_noncanon[i] = 0xff;
+    sig_noncanon[31] = 0x7f;
+    if (ed25519_verify(sig_noncanon, big_msg, 200, pk3_want) == 0) {
+        printf("  PASS: non-canonical R (y==p) rejected\n"); g_pass++;
+    } else {
+        printf("  FAIL: non-canonical R (y==p) accepted\n"); g_fail++;
+    }
 }
 
 /* ============================================================== */
@@ -2676,6 +2811,7 @@ int main(void) {
     test_poly1305();
     test_aead_chacha20_poly1305();
     test_x25519();
+    test_ed25519();
     test_tls13_keysched();
     test_tls13_record();
     test_ip_tcp();

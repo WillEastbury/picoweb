@@ -32,13 +32,16 @@
 > slice → response_fn → TLS-seal → TX in one call.
 >
 > **What is sketched but not wired:** AF_PACKET I/O (compiles on
-> Linux, no E2E test), DPDK loop pattern (commented sketch only),
-> BearSSL-style explicit TLS engine state machine (planned next).
+> Linux, no E2E test), DPDK loop pattern (commented sketch only).
+> The BearSSL-style explicit TLS engine state machine is in tree but
+> still uses the spike-mode `install_app_keys` shortcut; full
+> handshake hookup is the next step.
 >
 > **What is deliberately not in scope:**
-> - **Ed25519 / ECDSA / RSA** cert signing — Ed25519 is the gating item
->   for completing a real handshake (CertificateVerify); intentionally
->   deferred until the dispatch + engine refactor settles.
+> - **ECDSA / RSA** cert signing — Ed25519 is implemented (RFC 8032,
+>   §7.1 vectors pass) and is the only signature algorithm the server
+>   advertises. ECDSA / RSA add code surface without buying anything
+>   we need for a single-cert spike.
 > - **AES-GCM** — TLS 1.3 ChaCha20-Poly1305 only. AES-GCM costs a real
 >   amount of code without a real perf win on modern CPUs that have AES-NI
 >   but no SHA-NI for AES-GCM's GHASH (and vice versa). One AEAD is
@@ -110,10 +113,8 @@ What is **explicitly NOT** in this branch:
 
 - AES-GCM (we have ChaCha20-Poly1305; that's enough for TLS 1.3
   interop — RFC 8446 mandates it as a mandatory cipher suite).
-- Ed25519 / RSA. We have ECDHE via X25519. Server cert verification
-  is on the client side; we'd only need to *sign* if we were the
-  server, and even then we can use externally-generated certs read
-  off disk and signed at provisioning time.
+- RSA / ECDSA. Ed25519 (RFC 8032) is implemented; that's the only
+  signature algorithm we advertise.
 - TCP retransmit, RTO, congestion control, SACK, fast retransmit.
 - TCP listen-queue / SYN cookies. Without these, picoweb is trivially
   DoS-able once it's on its own stack.
@@ -342,6 +343,9 @@ immutable `mprotect(PROT_READ)` arena.
 
 
 - TLS 1.3 Certificate / CertificateVerify (Ed25519 sign) / Finished —
+  Ed25519 is implemented (RFC 8032 §7.1 vectors pass); wiring it
+  into the engine's CertificateVerify is the next step.
+
 ## L4 pre-jump table (`userspace/dispatch.{c,h}`)
 
 Right after iov was the load-bearing primitive for the data path,
@@ -545,13 +549,84 @@ two-iov push, multi-record sequence-number advance, tampered tag
 → FAILED, dispatch round-trip with on_open at ESTABLISHED and
 on_close exactly once on FIN.
 
+## Ed25519 (`userspace/crypto/ed25519.{c,h}`)
+
+Pure-C Ed25519 sign / verify (RFC 8032), the signature half of the
+TLS 1.3 handshake. Lets the engine compute its own
+CertificateVerify and lets us drop the spike-mode
+`install_app_keys` shortcut.
+
+Layout (single C file, ~1100 lines, four numbered sections):
+
+1. **Field arithmetic** over `GF(2^255 - 19)` with 5×51-bit limbs.
+   Algorithmically identical to `x25519.c`; duplicated rather than
+   shared because the Edwards code wants several extra primitives
+   (`fe_neg`, `fe_pow22523`, `fe_isnegative`, `fe_iszero`) and we
+   didn't want to grow X25519's surface area.
+2. **Edwards group ops** in extended coordinates `(X:Y:Z:T)` with
+   `T = X*Y/Z`. Hisil-Wong-Carter-Dawson formulas for `a = -1`.
+   Doubling and (cached-form) addition only — no separate
+   `ge_p2` / `ge_p1p1` types. The HWCD doubling output satisfies
+   `X3*Y3 = T3*Z3` directly so we never lose the `T` invariant.
+   `ge_p3_frombytes_vartime` rejects non-canonical `y` (reject
+   `y_bytes >= p`) and the special case `(x = 0, sign-bit = 1)`.
+   Strategic `fe_carry` calls in `ge_dbl` keep limbs bounded so
+   the next `fe_sub` cannot underflow.
+3. **Scalar arithmetic mod L** where
+   `L = 2^252 + 0x14def9dea2f79cd65812631a5cf5d3ed`.
+   `sc_reduce` (64 → 32 bytes) and `sc_muladd` (`s = a*b + c mod L`)
+   in the standard 12 × 21-bit balanced-limb form. Reduction
+   constants `{666643, 470296, 654183, -997805, 136657, -683901}`
+   are `L_low` re-expressed in those limbs — mathematical facts
+   derived from `L`, not third-party code.
+4. **Public API**: `ed25519_pubkey_from_seed`, `ed25519_sign`
+   (RFC 8032 §5.1.6), `ed25519_verify` (§5.1.7 non-cofactor).
+
+```c
+void ed25519_pubkey_from_seed(uint8_t pk[32], const uint8_t seed[32]);
+void ed25519_sign(uint8_t sig[64], const uint8_t* msg, size_t len,
+                  const uint8_t seed[32], const uint8_t pk[32]);
+int  ed25519_verify(const uint8_t sig[64], const uint8_t* msg, size_t len,
+                    const uint8_t pk[32]);  /* 1 valid, 0 invalid */
+```
+
+Curve constants (`d`, `2d`, `sqrt(-1)`, base point `B`) are stored
+as 32-byte little-endian arrays and decoded via `fe_from_bytes`
+locally inside each call — no global init, no cache, no thread-
+safety trap. The ~50 ns per decode is amortised across a scalar
+mult.
+
+Verify uses naïve double-scalar-mult (two separate scalar mults
+summed). Slower than Strauss-Shamir, but the verify path isn't on
+the hot loop for a TLS *server* — we sign far more than we verify.
+
+**Spike-scope gaps documented in the file header**:
+- Variable-time scalar mult in both sign and verify. Fine for the
+  picoweb use case (server signs with its own cert) — *not* fine
+  for production CT requirements.
+- No small-order public-key rejection in `verify`. Justified by
+  current threat model: the server signs with its own static cert
+  and never verifies attacker-controlled public keys (no mTLS).
+  Must be added before mTLS lands.
+
+Tests (RFC 8032 §7.1 `TEST 1` / `TEST 2` / `TEST 3` plus negative
+cases):
+- `pubkey_from_seed` matches RFC for all three vectors.
+- `sign(msg)` produces RFC-bit-identical signatures.
+- `verify(sig)` accepts the RFC signatures.
+- Sign-verify roundtrip on a 200-byte message.
+- Bit-flips in `sig`, `pk`, and `msg` are all rejected.
+- A non-canonical `R` (`y_bytes == p` exactly) is rejected
+  by point decode.
+
+170/170 total tests on `main`.
+
 ## <a id="open-engineering-items"></a>Open engineering items
 
 This is the running TODO for what's blocking real-traffic readiness.
 
-- **Ed25519 sign / verify** (RFC 8032). Gates real TLS handshakes
-  (CertificateVerify). Needs SHA-512 first. Without these no real
-  client completes a handshake.
+- **Wire Ed25519 into CertificateVerify** in the TLS engine and
+  delete the spike-mode `install_app_keys` shortcut.
 - **Receive-window-driven backpressure** on the TCP layer
   (rubber-duck'd: "no ACK = backpressure" was wrong; the right answer
   is to advertise zero `rcv_wnd` and support persist).
@@ -566,3 +641,8 @@ This is the running TODO for what's blocking real-traffic readiness.
   many concurrent flows (today services own their own fixed pool;
   shared rental would let many low-traffic services share a single
   budget).
+- **Constant-time scalar mult** in Ed25519 (currently variable-time;
+  prerequisite for production cert-signing in adversarial latency
+  contexts).
+- **Small-order public-key rejection** in `ed25519_verify`
+  (prerequisite for mTLS).
