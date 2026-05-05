@@ -284,7 +284,39 @@ bytes flow bottom-up, no copy required.
    `tls13_seal_record`, and `tls13_open_record` of the iov-sealed
    record recovers the original plaintext.
 
-### What still needs to land
+### Run-to-completion connection runtime (`userspace/conn.{c,h}`)
+
+The `pw_conn_t` ties the layers together as a single function call:
+
+```
+pw_conn_rx(conn, in_bytes, in_len,
+           response_fn, response_user,
+           out_buf, out_cap, &out_len);
+```
+
+walks the diagram:
+
+```
+in bytes  -> rx_buf reassembly
+          -> tls13_open_record (in-place AEAD)
+          -> response_fn(request_bytes) -> pw_response_t (iov chain)
+          -> tls13_seal_record_iov (scatter-gather AEAD)
+          -> sealed wire bytes ready for TCP segmentation
+```
+
+Status returns: `OK` (sealed bytes ready), `NEED_MORE` (record not
+yet complete; feed more bytes), `AUTH_FAIL` (bad tag — close conn),
+`PROTOCOL_ERR`, `RESPONSE_FAIL`, `OUT_OVERFLOW`. Tested end-to-end
+with chunked arrival (2x NEED_MORE then OK), tampered ciphertext
+(rejected with AUTH_FAIL), and roundtrip plaintext equivalence.
+
+The webserver-as-module decoupling is now real: `pw_response_fn` is
+the only thing the runtime knows about the application. picoweb's
+existing flat-table lookup + chrome/page/footer rendering plugs in
+as a `pw_response_fn` whose `pw_iov_t[]` points straight at the
+immutable `mprotect(PROT_READ)` arena.
+
+
 
 - TLS 1.3 Certificate / CertificateVerify (Ed25519 sign) / Finished —
   without these no real client completes a handshake.

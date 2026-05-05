@@ -15,6 +15,7 @@
 
 #include "pem.h"
 
+#include <stdio.h>
 #include <string.h>
 
 /* Returns base64 value for `c` in [0,63], or

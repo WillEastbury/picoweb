@@ -29,6 +29,7 @@
 #include "../tcp/ip.h"
 #include "../tcp/tcp.h"
 #include "../iov.h"
+#include "../conn.h"
 
 static int g_pass = 0;
 static int g_fail = 0;
@@ -1348,6 +1349,149 @@ static void test_tls13_record_iov(void) {
                   rc, (int)inner, pt_len, total); g_fail++; }
 }
 
+/* ---------------- pw_conn run-to-completion ---------------- */
+
+/* Stand-in webserver: looks at the request line, returns a hard-
+ * coded HTML response from immutable storage. */
+static const uint8_t k_resp_status[]  = "HTTP/1.1 200 OK\r\n";
+static const uint8_t k_resp_headers[] = "Content-Type: text/html\r\nContent-Length: 47\r\nConnection: keep-alive\r\nServer: picoweb\r\n\r\n";
+static const uint8_t k_resp_chrome_h[]= "<!DOCTYPE html><html><body>";
+static const uint8_t k_resp_body[]    = "<h1>iov</h1>";
+static const uint8_t k_resp_chrome_f[]= "</body></html>";
+
+static int test_response_fn(const uint8_t* request, size_t request_len,
+                            pw_response_t* out, void* user) {
+    (void)user;
+    /* Sanity: must look like an HTTP request line. */
+    if (request_len < 4 || memcmp(request, "GET ", 4) != 0) return -1;
+    out->parts[0].base = k_resp_status;   out->parts[0].len = sizeof(k_resp_status)  - 1;
+    out->parts[1].base = k_resp_headers;  out->parts[1].len = sizeof(k_resp_headers) - 1;
+    out->parts[2].base = k_resp_chrome_h; out->parts[2].len = sizeof(k_resp_chrome_h)- 1;
+    out->parts[3].base = k_resp_body;     out->parts[3].len = sizeof(k_resp_body)    - 1;
+    out->parts[4].base = k_resp_chrome_f; out->parts[4].len = sizeof(k_resp_chrome_f)- 1;
+    out->n = 5;
+    out->total_len = pw_iov_total(out->parts, out->n);
+    return 0;
+}
+
+static void test_pw_conn(void) {
+    printf("== pw_conn run-to-completion (RX -> TLS open -> HTTP -> TLS seal -> TX) ==\n");
+
+    /* Two record_dirs that share key/iv: one for the client's TX
+     * (== server's RX), one for the server's TX (== client's RX).
+     * In a real handshake these come out of derive_traffic_keys. */
+    tls_record_dir_t c2s = {0};   /* client -> server */
+    tls_record_dir_t s2c = {0};   /* server -> client */
+    for (int i = 0; i < 32; i++) c2s.key[i] = (uint8_t)(0xC0 + i);
+    for (int i = 0; i < 12; i++) c2s.static_iv[i] = (uint8_t)(0xE0 + i);
+    for (int i = 0; i < 32; i++) s2c.key[i] = (uint8_t)(0x10 + i);
+    for (int i = 0; i < 12; i++) s2c.static_iv[i] = (uint8_t)(0x90 + i);
+
+    /* Server connection: rx is c2s, tx is s2c. */
+    pw_conn_t server;
+    pw_conn_init(&server, &c2s, &s2c);
+
+    /* Client side just uses raw record_dirs to seal/open. */
+    tls_record_dir_t client_tx = c2s;
+    tls_record_dir_t client_rx = s2c;
+
+    /* --- Client builds a request and seals it. --- */
+    static const uint8_t request[] = "GET /index.html HTTP/1.1\r\nHost: example.com\r\n\r\n";
+    uint8_t req_record[512];
+    size_t  req_len = tls13_seal_record(&client_tx,
+                                        TLS_CT_APPLICATION_DATA,
+                                        TLS_CT_APPLICATION_DATA,
+                                        request, sizeof(request) - 1,
+                                        req_record, sizeof(req_record));
+    if (req_len > 0) { printf("  PASS: client sealed request (%zu B)\n", req_len); g_pass++; }
+    else             { printf("  FAIL: client seal\n"); g_fail++; return; }
+
+    /* --- Hand the sealed bytes to the server in ONE chunk. --- */
+    uint8_t resp_record[1024];
+    size_t  resp_len = 0;
+    pw_conn_status_t st = pw_conn_rx(&server, req_record, req_len,
+                                     test_response_fn, NULL,
+                                     resp_record, sizeof(resp_record), &resp_len);
+    if (st == PW_CONN_OK)        { printf("  PASS: server processed request (%zu B sealed)\n", resp_len); g_pass++; }
+    else                          { printf("  FAIL: server st=%d\n", (int)st); g_fail++; return; }
+    if (server.records_in == 1)  { printf("  PASS: server records_in=1\n"); g_pass++; }
+    else                          { printf("  FAIL: records_in=%llu\n",
+                                          (unsigned long long)server.records_in); g_fail++; }
+    if (server.records_out == 1) { printf("  PASS: server records_out=1\n"); g_pass++; }
+    else                          { printf("  FAIL: records_out=%llu\n",
+                                          (unsigned long long)server.records_out); g_fail++; }
+
+    /* --- Client opens the sealed response and verifies content. --- */
+    tls_content_type_t inner = TLS_CT_INVALID;
+    uint8_t* pt_out = NULL;
+    size_t   pt_len = 0;
+    int orc = tls13_open_record(&client_rx, resp_record, resp_len,
+                                &inner, &pt_out, &pt_len);
+    if (orc == 0 && inner == TLS_CT_APPLICATION_DATA)
+         { printf("  PASS: client opened response\n"); g_pass++; }
+    else { printf("  FAIL: client open rc=%d inner=%d\n", orc, (int)inner); g_fail++; return; }
+
+    /* Reconstruct expected plaintext = concatenation of fragments. */
+    uint8_t expected[256];
+    size_t  exp_off = 0;
+    memcpy(expected + exp_off, k_resp_status,   sizeof(k_resp_status)   - 1); exp_off += sizeof(k_resp_status)   - 1;
+    memcpy(expected + exp_off, k_resp_headers,  sizeof(k_resp_headers)  - 1); exp_off += sizeof(k_resp_headers)  - 1;
+    memcpy(expected + exp_off, k_resp_chrome_h, sizeof(k_resp_chrome_h) - 1); exp_off += sizeof(k_resp_chrome_h) - 1;
+    memcpy(expected + exp_off, k_resp_body,     sizeof(k_resp_body)     - 1); exp_off += sizeof(k_resp_body)     - 1;
+    memcpy(expected + exp_off, k_resp_chrome_f, sizeof(k_resp_chrome_f) - 1); exp_off += sizeof(k_resp_chrome_f) - 1;
+    if (pt_len == exp_off && memcmp(pt_out, expected, exp_off) == 0)
+         { printf("  PASS: response plaintext matches iov chain\n"); g_pass++; }
+    else { printf("  FAIL: pt_len=%zu exp=%zu\n", pt_len, exp_off); g_fail++; }
+
+    /* --- Now exercise NEED_MORE: feed the next request in 3 chunks. --- */
+    uint8_t req2_record[512];
+    size_t  req2_len = tls13_seal_record(&client_tx,
+                                         TLS_CT_APPLICATION_DATA,
+                                         TLS_CT_APPLICATION_DATA,
+                                         request, sizeof(request) - 1,
+                                         req2_record, sizeof(req2_record));
+    /* Chunk it: 3 bytes (less than header), then 7 bytes (header complete
+     * but body short), then the rest. */
+    size_t c1 = 3;
+    size_t c2 = 7;
+    size_t c3 = req2_len - c1 - c2;
+
+    pw_conn_status_t st1 = pw_conn_rx(&server, req2_record, c1, test_response_fn, NULL,
+                                      resp_record, sizeof(resp_record), &resp_len);
+    pw_conn_status_t st2 = pw_conn_rx(&server, req2_record + c1, c2, test_response_fn, NULL,
+                                      resp_record, sizeof(resp_record), &resp_len);
+    pw_conn_status_t st3 = pw_conn_rx(&server, req2_record + c1 + c2, c3, test_response_fn, NULL,
+                                      resp_record, sizeof(resp_record), &resp_len);
+    if (st1 == PW_CONN_NEED_MORE && st2 == PW_CONN_NEED_MORE && st3 == PW_CONN_OK)
+         { printf("  PASS: chunked arrival NEED_MORE,NEED_MORE,OK\n"); g_pass++; }
+    else { printf("  FAIL: chunked st1=%d st2=%d st3=%d\n",
+                  (int)st1, (int)st2, (int)st3); g_fail++; }
+    if (server.records_in == 2)  { printf("  PASS: 2 records processed total\n"); g_pass++; }
+    else                          { printf("  FAIL: records_in=%llu\n",
+                                          (unsigned long long)server.records_in); g_fail++; }
+
+    /* --- Tampered ciphertext rejected with AUTH_FAIL. --- */
+    pw_conn_t s2;
+    pw_conn_init(&s2, &c2s, &s2c);
+    /* Reset client_tx seq so the next sealed record uses seq 0 (same
+     * as the server expects on a fresh connection). */
+    client_tx.seq = 0;
+    uint8_t bad_record[512];
+    size_t bad_len = tls13_seal_record(&client_tx,
+                                       TLS_CT_APPLICATION_DATA,
+                                       TLS_CT_APPLICATION_DATA,
+                                       request, sizeof(request) - 1,
+                                       bad_record, sizeof(bad_record));
+    bad_record[bad_len - 1] ^= 1;     /* flip the last byte of the tag */
+    pw_conn_status_t st_bad = pw_conn_rx(&s2, bad_record, bad_len,
+                                         test_response_fn, NULL,
+                                         resp_record, sizeof(resp_record), &resp_len);
+    if (st_bad == PW_CONN_AUTH_FAIL)
+         { printf("  PASS: tampered tag -> AUTH_FAIL\n"); g_pass++; }
+    else { printf("  FAIL: tampered st=%d\n", (int)st_bad); g_fail++; }
+}
+
+
 int main(void) {
     /* Pick the best SHA-256 + ChaCha20 impls available; tests below
      * run through the public entry points so they exercise whichever
@@ -1381,6 +1525,7 @@ int main(void) {
     test_chacha20_stream_iov();
     test_aead_seal_iov();
     test_tls13_record_iov();
+    test_pw_conn();
 
     printf("\n=== RESULTS: PASS=%d FAIL=%d ===\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
