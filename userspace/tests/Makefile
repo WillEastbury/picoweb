@@ -30,6 +30,7 @@ CRYPTO_SRC := \
     ../tls/cert.c                \
     ../tls/handshake.c           \
     ../tls/engine.c              \
+    ../tls/engine_pool.c         \
     ../tcp/ip.c                  \
     ../tcp/tcp.c                 \
     ../dispatch.c                \

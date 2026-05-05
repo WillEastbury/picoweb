@@ -4087,6 +4087,111 @@ static void test_engine_tolerates_dummy_ccs(void) {
     free(eng);
 }
 
+/* ---------- engine pool (rent / release) ---------- */
+
+#include "../tls/engine_pool.h"
+
+static void test_engine_pool(void) {
+    printf("== engine pool (rent / release / scrub) ==\n");
+
+    /* 4 slots is enough to exercise exhaustion + reuse without
+     * blowing the stack (engine is ~64 KiB, so 4 * 64 = 256 KiB). */
+    enum { N = 4 };
+    static uint8_t storage[PW_TLS_ENGINE_POOL_BYTES(N)];
+    pw_tls_engine_pool_t pool;
+    int rc = pw_tls_engine_pool_init(&pool, storage, N);
+    if (rc == 0 && pw_tls_engine_pool_capacity(&pool) == N
+                && pw_tls_engine_pool_in_use(&pool) == 0)
+         { printf("  PASS: pool init capacity=%u\n", N); g_pass++; }
+    else { printf("  FAIL: pool init rc=%d\n", rc); g_fail++; }
+
+    /* Acquire all N slots. */
+    pw_tls_engine_t* es[N] = {0};
+    int all_ok = 1;
+    for (int i = 0; i < N; i++) {
+        es[i] = pw_tls_engine_pool_acquire(&pool);
+        if (!es[i]) { all_ok = 0; break; }
+        /* Engine must be in the post-init state. */
+        if (pw_tls_state(es[i]) != PW_TLS_ST_HANDSHAKE) { all_ok = 0; break; }
+        if (es[i]->records_in != 0 || es[i]->records_out != 0) { all_ok = 0; break; }
+    }
+    if (all_ok && pw_tls_engine_pool_in_use(&pool) == N
+               && pw_tls_engine_pool_high_water(&pool) == N)
+         { printf("  PASS: acquired %d clean engines (in_use=%u hwm=%u)\n",
+                  N, pw_tls_engine_pool_in_use(&pool),
+                  pw_tls_engine_pool_high_water(&pool)); g_pass++; }
+    else { printf("  FAIL: acquire-N\n"); g_fail++; }
+
+    /* Pool exhausted now: next acquire must NULL + bump exhaustion. */
+    uint64_t exh_before = pw_tls_engine_pool_exhaustion(&pool);
+    pw_tls_engine_t* over = pw_tls_engine_pool_acquire(&pool);
+    if (over == NULL && pw_tls_engine_pool_exhaustion(&pool) == exh_before + 1)
+         { printf("  PASS: exhaustion returns NULL + bumps counter\n"); g_pass++; }
+    else { printf("  FAIL: exhaustion behaviour\n"); g_fail++; }
+
+    /* Stash some "key material" in es[2] so we can verify scrub. */
+    for (size_t i = 0; i < sizeof(es[2]->cs_app_traffic_secret); i++) {
+        es[2]->cs_app_traffic_secret[i] = (uint8_t)(0xA0 + i);
+    }
+    es[2]->records_in = 0xdeadbeefULL;
+    es[2]->state = PW_TLS_ST_APP;
+    es[2]->keys_installed = 1;
+
+    /* Snapshot the slot address so we can assert the scrub on the
+     * SAME memory after release. (Pool may hand the same slot back
+     * on next acquire — LIFO free list.) */
+    pw_tls_engine_t* slot_addr = es[2];
+
+    pw_tls_engine_pool_release(&pool, es[2]);
+    es[2] = NULL;
+
+    /* The slot's first 4 bytes now hold a free-list pointer (set by
+     * pool_release) — that's where `state` happens to live, so we
+     * don't check `state` here. Every OTHER byte must be zero, in
+     * particular all key material and counters. */
+    int scrubbed = 1;
+    for (size_t i = 0; i < sizeof(slot_addr->cs_app_traffic_secret); i++) {
+        if (slot_addr->cs_app_traffic_secret[i] != 0) { scrubbed = 0; break; }
+    }
+    if (slot_addr->records_in != 0)     scrubbed = 0;
+    if (slot_addr->keys_installed != 0) scrubbed = 0;
+    if (scrubbed && pw_tls_engine_pool_in_use(&pool) == N - 1)
+         { printf("  PASS: release scrubs key material + counters (in_use=%u)\n",
+                  pw_tls_engine_pool_in_use(&pool)); g_pass++; }
+    else { printf("  FAIL: release scrub\n"); g_fail++; }
+
+    /* Reacquire — should reuse the just-released slot (LIFO) and
+     * present a clean engine again. */
+    pw_tls_engine_t* re = pw_tls_engine_pool_acquire(&pool);
+    if (re == slot_addr
+        && pw_tls_state(re) == PW_TLS_ST_HANDSHAKE
+        && re->records_in == 0
+        && re->keys_installed == 0)
+         { printf("  PASS: reacquired same slot, clean state\n"); g_pass++; }
+    else { printf("  FAIL: reacquire (re=%p slot=%p state=%d)\n",
+                  (void*)re, (void*)slot_addr,
+                  re ? (int)pw_tls_state(re) : -1); g_fail++; }
+    es[2] = re;
+
+    /* Release everything; in_use must drop to zero. */
+    for (int i = 0; i < N; i++) {
+        if (es[i]) pw_tls_engine_pool_release(&pool, es[i]);
+    }
+    if (pw_tls_engine_pool_in_use(&pool) == 0
+        && pw_tls_engine_pool_high_water(&pool) == N)
+         { printf("  PASS: drained pool, hwm preserved (rents=%llu)\n",
+                  (unsigned long long)pw_tls_engine_pool_rents(&pool));
+           g_pass++; }
+    else { printf("  FAIL: drain (in_use=%u)\n",
+                  pw_tls_engine_pool_in_use(&pool)); g_fail++; }
+
+    /* NULL safety. */
+    pw_tls_engine_pool_release(&pool, NULL);
+    if (pw_tls_engine_pool_in_use(&pool) == 0)
+         { printf("  PASS: release(NULL) is a no-op\n"); g_pass++; }
+    else { printf("  FAIL: release(NULL) corrupted in_use\n"); g_fail++; }
+}
+
 int main(void) {
     /* Pick the best SHA-256 + ChaCha20 impls available; tests below
      * run through the public entry points so they exercise whichever
@@ -4136,6 +4241,7 @@ int main(void) {
     test_engine_tolerates_dummy_ccs();
     test_engine_tolerates_dummy_ccs_split();
     test_engine_fatal_wipes_tx_and_keys();
+    test_engine_pool();
 
     printf("\n=== RESULTS: PASS=%d FAIL=%d ===\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
