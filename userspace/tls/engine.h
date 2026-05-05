@@ -225,6 +225,33 @@ int pw_tls_engine_install_app_keys(pw_tls_engine_t* eng,
  * CLOSED so the caller stops polling.) */
 void pw_tls_close(pw_tls_engine_t* eng);
 
+/* Emit a single NewSessionTicket (RFC 8446 §4.6.1) record on the TX
+ * port, sealed under the current server-application-traffic write key.
+ *
+ * Pre-conditions:
+ *   - pw_tls_state(eng) == PW_TLS_ST_APP
+ *   - eng->has_rms == 1 (resumption_master_secret available)
+ *
+ * Caller supplies `ticket_nonce` (1..255 bytes) and `ticket_id`
+ * (1..65535 bytes; the opaque label the client will return on
+ * resumption). Server stores (ticket_id, derived_psk, age_add,
+ * lifetime_s, issued_at_ms) externally; this function does NOT
+ * touch any store.
+ *
+ * Per-ticket PSK is derived as
+ *   PSK = HKDF-Expand-Label(RMS, "resumption", ticket_nonce, 32)
+ * and written into `out_psk` for the caller to insert into its store.
+ *
+ * Returns 0 on success, -1 on bad args / TX overflow / wrong state. */
+int pw_tls_engine_emit_session_ticket(pw_tls_engine_t* eng,
+                                      uint32_t lifetime_s,
+                                      uint32_t age_add,
+                                      const uint8_t* ticket_nonce,
+                                      size_t nonce_len,
+                                      const uint8_t* ticket_id,
+                                      size_t id_len,
+                                      uint8_t out_psk[32]);
+
 /* ---------- state introspection ---------- */
 
 pw_tls_state_t    pw_tls_state(const pw_tls_engine_t* eng);

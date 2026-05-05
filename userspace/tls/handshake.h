@@ -143,6 +143,36 @@ int tls13_build_certificate(uint8_t* out, size_t out_cap,
 int tls13_build_finished(uint8_t* out, size_t out_cap,
                          const uint8_t verify_data[32]);
 
+/* ---------------- NewSessionTicket (RFC 8446 §4.6.1) ---------------- */
+/*
+ * Builds a complete NewSessionTicket handshake message (incl. the
+ * 0x04 + 24-bit length header) into `out`. Layout:
+ *
+ *   uint32 ticket_lifetime
+ *   uint32 ticket_age_add
+ *   opaque ticket_nonce<0..255>
+ *   opaque ticket<1..2^16-1>      -- server-chosen opaque label
+ *   Extension extensions<0..2^16-2>  -- emitted empty (no early_data)
+ *
+ * `ticket_id` is the opaque label the server will hand back to the
+ * client; the server uses it to look up the per-ticket PSK in its
+ * own store. Returns total bytes written, or -1 on error. */
+int tls13_build_new_session_ticket(uint8_t* out, size_t out_cap,
+                                   uint32_t lifetime_s,
+                                   uint32_t age_add,
+                                   const uint8_t* ticket_nonce,
+                                   size_t nonce_len,
+                                   const uint8_t* ticket_id,
+                                   size_t id_len);
+
+/* Per-ticket PSK derivation (RFC 8446 §4.6.1):
+ *   PSK = HKDF-Expand-Label(resumption_master_secret, "resumption",
+ *                           ticket_nonce, Hash.length)
+ * Outputs 32 bytes. Returns 0 on success, -1 on bad inputs. */
+int tls13_derive_resumption_psk(const uint8_t resumption_master_secret[32],
+                                const uint8_t* ticket_nonce, size_t nonce_len,
+                                uint8_t psk[32]);
+
 /* ---------------- CertificateVerify (RFC 8446 §4.4.3) ---------------- */
 /*
  * Per §4.4.3 the signed content is:

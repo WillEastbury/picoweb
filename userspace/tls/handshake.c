@@ -431,6 +431,64 @@ int tls13_build_finished(uint8_t* out, size_t out_cap,
     return 4 + 32;
 }
 
+/* ---------------- NewSessionTicket (RFC 8446 §4.6.1) ---------------- */
+
+int tls13_build_new_session_ticket(uint8_t* out, size_t out_cap,
+                                   uint32_t lifetime_s,
+                                   uint32_t age_add,
+                                   const uint8_t* ticket_nonce,
+                                   size_t nonce_len,
+                                   const uint8_t* ticket_id,
+                                   size_t id_len) {
+    if (!out || !ticket_nonce || !ticket_id) return -1;
+    if (nonce_len == 0 || nonce_len > 255)   return -1;
+    if (id_len    == 0 || id_len    > 0xffff) return -1;
+    /* body = 4 + 4 + 1 + nonce + 2 + id + 2 (empty exts) */
+    size_t body = 4 + 4 + 1 + nonce_len + 2 + id_len + 2;
+    if (body > 0xffffffu)   return -1;
+    if (out_cap < 4 + body) return -1;
+
+    uint8_t* p = out;
+    *p++ = 0x04;                                  /* HS type = NewSessionTicket */
+    *p++ = (uint8_t)((body >> 16) & 0xff);
+    *p++ = (uint8_t)((body >>  8) & 0xff);
+    *p++ = (uint8_t)( body        & 0xff);
+
+    *p++ = (uint8_t)((lifetime_s >> 24) & 0xff);
+    *p++ = (uint8_t)((lifetime_s >> 16) & 0xff);
+    *p++ = (uint8_t)((lifetime_s >>  8) & 0xff);
+    *p++ = (uint8_t)( lifetime_s        & 0xff);
+
+    *p++ = (uint8_t)((age_add >> 24) & 0xff);
+    *p++ = (uint8_t)((age_add >> 16) & 0xff);
+    *p++ = (uint8_t)((age_add >>  8) & 0xff);
+    *p++ = (uint8_t)( age_add        & 0xff);
+
+    *p++ = (uint8_t)nonce_len;
+    memcpy(p, ticket_nonce, nonce_len); p += nonce_len;
+
+    *p++ = (uint8_t)((id_len >> 8) & 0xff);
+    *p++ = (uint8_t)( id_len       & 0xff);
+    memcpy(p, ticket_id, id_len); p += id_len;
+
+    /* Empty extensions block. */
+    *p++ = 0x00; *p++ = 0x00;
+
+    return (int)(p - out);
+}
+
+int tls13_derive_resumption_psk(const uint8_t resumption_master_secret[32],
+                                const uint8_t* ticket_nonce, size_t nonce_len,
+                                uint8_t psk[32]) {
+    if (!resumption_master_secret || !ticket_nonce || !psk) return -1;
+    if (nonce_len == 0 || nonce_len > 255) return -1;
+    /* PSK = HKDF-Expand-Label(RMS, "resumption", ticket_nonce, 32). */
+    if (tls13_hkdf_expand_label(resumption_master_secret, "resumption",
+                                ticket_nonce, nonce_len,
+                                psk, 32) != 0) return -1;
+    return 0;
+}
+
 /* ---------------- CertificateVerify (RFC 8446 §4.4.3) ---------------- */
 
 int tls13_build_certificate_verify_signed_data(uint8_t out[TLS13_CV_SIGNED_LEN],

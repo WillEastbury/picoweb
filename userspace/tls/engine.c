@@ -112,6 +112,54 @@ void pw_tls_close(pw_tls_engine_t* eng) {
     eng->state = PW_TLS_ST_CLOSED;
 }
 
+int pw_tls_engine_emit_session_ticket(pw_tls_engine_t* eng,
+                                      uint32_t lifetime_s,
+                                      uint32_t age_add,
+                                      const uint8_t* ticket_nonce,
+                                      size_t nonce_len,
+                                      const uint8_t* ticket_id,
+                                      size_t id_len,
+                                      uint8_t out_psk[32]) {
+    if (!eng || !ticket_nonce || !ticket_id || !out_psk)         return -1;
+    if (eng->state != PW_TLS_ST_APP || eng->has_rms != 1)        return -1;
+    if (nonce_len == 0 || nonce_len > 255)                       return -1;
+    if (id_len    == 0 || id_len    > 0xffff)                    return -1;
+
+    /* Derive per-ticket PSK for the caller's ticket store. */
+    if (tls13_derive_resumption_psk(eng->resumption_master_secret,
+                                    ticket_nonce, nonce_len,
+                                    out_psk) != 0) return -1;
+
+    /* Build NST plaintext. Worst-case ~ 4 + 13 + 255 + 65535 — too
+     * large to stack-alloc safely. We bound to TLS13_MAX_PLAINTEXT
+     * (16384) which more than covers any reasonable ticket id. */
+    uint8_t nst[TLS13_MAX_PLAINTEXT];
+    int nst_len = tls13_build_new_session_ticket(nst, sizeof(nst),
+                                                 lifetime_s, age_add,
+                                                 ticket_nonce, nonce_len,
+                                                 ticket_id, id_len);
+    if (nst_len <= 0) { secure_zero(out_psk, 32); return -1; }
+
+    size_t need = TLS13_RECORD_HEADER_LEN + (size_t)nst_len + 1 + TLS13_AEAD_TAG_LEN;
+    if (need > PW_TLS_BUF_CAP - eng->tx_len) {
+        secure_zero(out_psk, 32);
+        secure_zero(nst,     sizeof(nst));
+        return -1;
+    }
+
+    size_t wrote = tls13_seal_record(&eng->write,
+                                     TLS_CT_HANDSHAKE,
+                                     TLS_CT_APPLICATION_DATA,
+                                     nst, (size_t)nst_len,
+                                     eng->tx_buf + eng->tx_len,
+                                     PW_TLS_BUF_CAP - eng->tx_len);
+    secure_zero(nst, sizeof(nst));
+    if (wrote == 0) { secure_zero(out_psk, 32); return -1; }
+    eng->tx_len += wrote;
+    eng->records_out++;
+    return 0;
+}
+
 /* ----------------------- introspection ----------------------- */
 
 pw_tls_state_t pw_tls_state(const pw_tls_engine_t* eng) {

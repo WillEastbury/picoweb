@@ -4148,6 +4148,92 @@ static void test_engine_handshake_roundtrip(void) {
         else { printf("  FAIL: app_in_len=%zu\n", app_in_len); g_fail++; }
     }
 
+    /* ---- Emit a NewSessionTicket; verify it lands in TX, decrypts
+     * cleanly under server app traffic key, parses correctly, and the
+     * derived per-ticket PSK matches an independent derivation. ---- */
+    {
+        /* Snapshot the server write seq + tx buffer length BEFORE
+         * the emit. The TX buffer still holds the server handshake
+         * flight (the test never tx_ack'd it), so we slice past it
+         * to find the new NST record. write.seq was reset to 0 when
+         * the engine swapped to app keys after cFin, and no app
+         * record has been written by the server yet. */
+        size_t tx_before; pw_tls_tx_buf(eng, &tx_before);
+        uint64_t srv_seq_before = eng->write.seq;
+
+        const uint8_t nonce[8] = { 1,2,3,4,5,6,7,8 };
+        const uint8_t tid[16]  = { 0xa,0xb,0xc,0xd,0xe,0xf,0x10,0x11,
+                                   0x12,0x13,0x14,0x15,0x16,0x17,0x18,0x19 };
+        uint8_t derived_psk[32];
+        if (pw_tls_engine_emit_session_ticket(eng, 7200, 0xdeadbeef,
+                                              nonce, sizeof(nonce),
+                                              tid,   sizeof(tid),
+                                              derived_psk) != 0)
+             { printf("  FAIL: emit_session_ticket\n"); g_fail++; free(eng); return; }
+        printf("  PASS: pw_tls_engine_emit_session_ticket OK\n"); g_pass++;
+
+        /* PSK independent recompute. */
+        uint8_t expect_psk[32];
+        if (tls13_derive_resumption_psk(eng->resumption_master_secret,
+                                        nonce, sizeof(nonce),
+                                        expect_psk) == 0
+            && memcmp(derived_psk, expect_psk, 32) == 0)
+             { printf("  PASS: per-ticket PSK matches independent HKDF\n"); g_pass++; }
+        else { printf("  FAIL: PSK mismatch\n"); g_fail++; }
+        memset(expect_psk, 0, sizeof(expect_psk));
+
+        /* Pull the freshly-sealed record out of TX (it's the only new
+         * thing there since srv_seq_before was 0). */
+        size_t txlen; const uint8_t* tx_all = pw_tls_tx_buf(eng, &txlen);
+        if (txlen <= tx_before) { printf("  FAIL: TX did not grow\n"); g_fail++; free(eng); return; }
+        const uint8_t* tx_nst = tx_all + tx_before;
+        size_t nst_tx_len = txlen - tx_before;
+        if (nst_tx_len < TLS13_RECORD_HEADER_LEN) { printf("  FAIL: NST too short %zu\n", nst_tx_len); g_fail++; free(eng); return; }
+        uint16_t reclen = ((uint16_t)tx_nst[3] << 8) | tx_nst[4];
+        size_t rec_total = TLS13_RECORD_HEADER_LEN + reclen;
+        if (rec_total != nst_tx_len) { printf("  FAIL: NST tx_len mismatch (rec=%zu tx=%zu)\n", rec_total, nst_tx_len); g_fail++; free(eng); return; }
+
+        tls_record_dir_t cli_nst_read = {0};
+        tls13_derive_traffic_keys(ss_app, cli_nst_read.key, cli_nst_read.static_iv);
+        cli_nst_read.seq = srv_seq_before;
+
+        /* tls13_open_record mutates the buffer in place — copy it. */
+        uint8_t copy[1024];
+        if (rec_total > sizeof(copy)) { printf("  FAIL: NST too big\n"); g_fail++; free(eng); return; }
+        memcpy(copy, tx_nst, rec_total);
+        tls_content_type_t inner = TLS_CT_INVALID;
+        uint8_t* pt = NULL; size_t pt_len = 0;
+        if (tls13_open_record(&cli_nst_read, copy, rec_total, &inner, &pt, &pt_len) != 0)
+             { printf("  FAIL: client cannot decrypt NST\n"); g_fail++; free(eng); return; }
+        if (inner != TLS_CT_HANDSHAKE) { printf("  FAIL: NST inner=%d (want HS)\n", inner); g_fail++; free(eng); return; }
+
+        /* Parse NST: type 0x04, len, lifetime, age_add, nonce, ticket, exts. */
+        if (pt_len < 4 + 13 + 2)        { printf("  FAIL: NST too short %zu\n", pt_len); g_fail++; free(eng); return; }
+        if (pt[0] != 0x04)              { printf("  FAIL: NST type=%02x\n", pt[0]); g_fail++; free(eng); return; }
+        uint32_t body_len = ((uint32_t)pt[1] << 16) | ((uint32_t)pt[2] << 8) | pt[3];
+        if ((size_t)body_len + 4 != pt_len) { printf("  FAIL: NST body_len mismatch\n"); g_fail++; free(eng); return; }
+        const uint8_t* q = pt + 4;
+        uint32_t lifetime = ((uint32_t)q[0]<<24)|((uint32_t)q[1]<<16)|((uint32_t)q[2]<<8)|q[3]; q += 4;
+        uint32_t aa       = ((uint32_t)q[0]<<24)|((uint32_t)q[1]<<16)|((uint32_t)q[2]<<8)|q[3]; q += 4;
+        uint8_t  nl = *q++;
+        if (lifetime == 7200 && aa == 0xdeadbeef && nl == sizeof(nonce)
+            && memcmp(q, nonce, sizeof(nonce)) == 0)
+             { printf("  PASS: NST lifetime/age_add/nonce parse OK\n"); g_pass++; }
+        else { printf("  FAIL: NST hdr fields lifetime=%u aa=%08x nl=%u\n",
+                      lifetime, aa, nl); g_fail++; }
+        q += nl;
+        uint16_t il = ((uint16_t)q[0] << 8) | q[1]; q += 2;
+        if (il == sizeof(tid) && memcmp(q, tid, sizeof(tid)) == 0)
+             { printf("  PASS: NST ticket_id roundtrip\n"); g_pass++; }
+        else { printf("  FAIL: NST ticket_id mismatch (len=%u)\n", il); g_fail++; }
+        q += il;
+        uint16_t exts = ((uint16_t)q[0] << 8) | q[1];
+        if (exts == 0) { printf("  PASS: NST extensions empty\n"); g_pass++; }
+        else           { printf("  FAIL: NST exts=%u\n", exts); g_fail++; }
+
+        memset(derived_psk, 0, sizeof(derived_psk));
+    }
+
     /* ---- Handshake secrets must have been wiped. ---- */
     {
         uint8_t zero[32] = {0};
