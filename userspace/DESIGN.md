@@ -440,6 +440,111 @@ crosstalk).
 UDP support: API surface (`PW_PROTO_UDP`) is in place but `udp.c` is
 not yet written. When it lands, the dispatch table is the same.
 
+## TLS engine (`userspace/tls/engine.{c,h}`)
+
+The original `pw_conn` runs a full RX→TLS-open→HTTP→TLS-seal→TX
+pipeline as one call. That works for the in-tree dispatch demo, but
+inverts control: the I/O loop has to *be* the loop. For io_uring,
+DPDK, and any caller that wants its own scheduler, the right shape
+is byte-level ports plus a `step` function that does no more work
+than the current bytes allow.
+
+`pw_tls_engine_t` is exactly that. The engine has four ports:
+
+```
+                   +------------------+
+   ciphertext  --> |  RX buffer       |
+   from socket     +--------+---------+
+                            v
+                   +------------------+        +-----------+
+                   |  step(): try to  |        |  state:   |
+                   |   open one record|----->  | HANDSHAKE |
+                   |   try to seal one|        |    APP    |
+                   +--------+---------+        |  CLOSED   |
+                            ^                  |  FAILED   |
+   plaintext   <-- +--------+---------+        +-----------+
+   to handler      |  APP_IN buffer   |
+                   +------------------+
+
+                   +------------------+
+   plaintext   --> |  APP_OUT buffer  |
+   from handler    +--------+---------+
+                            v   step()
+                   +------------------+
+   ciphertext  <-- |  TX buffer       |
+   to socket       +------------------+
+```
+
+API (paraphrased):
+
+```c
+void  pw_tls_engine_init(pw_tls_engine_t*);
+int   pw_tls_engine_install_app_keys(pw_tls_engine_t*, ...);
+unsigned pw_tls_want(const pw_tls_engine_t*);   /* WANT_RX|WANT_TX|APP_IN_RDY|APP_OUT_OK */
+pw_tls_state_t pw_tls_state(const pw_tls_engine_t*);
+
+/* Transport side */
+uint8_t* pw_tls_rx_buf(pw_tls_engine_t*, size_t* cap);
+void     pw_tls_rx_ack(pw_tls_engine_t*, size_t n);
+const uint8_t* pw_tls_tx_buf(const pw_tls_engine_t*, size_t* len);
+void     pw_tls_tx_ack(pw_tls_engine_t*, size_t n);
+
+/* App side */
+const uint8_t* pw_tls_app_in_buf(const pw_tls_engine_t*, size_t* len);
+void     pw_tls_app_in_ack(pw_tls_engine_t*, size_t n);
+int      pw_tls_app_out_push(pw_tls_engine_t*, const pw_iov_t*, unsigned n);
+
+/* Drive forward as far as current bytes allow. */
+int   pw_tls_step(pw_tls_engine_t*);
+void  pw_tls_close(pw_tls_engine_t*);
+```
+
+The engine is the same architecture as `pw_conn`, just with the
+loop inverted: caller drives `step` whenever bytes move.
+
+`pw_tls_engine_install_app_keys` is a **spike-mode shortcut** that
+jumps directly to APP state with caller-supplied symmetric keys.
+This exists because Ed25519 isn't landed yet, so a real handshake
+can't actually complete. Once Ed25519 is in, the engine drives the
+handshake itself and `install_app_keys` becomes a test-only helper.
+
+**Want bits** are the only thing the I/O loop needs to look at:
+- `WANT_RX`: room in the RX buffer; safe to `recv()`.
+- `WANT_TX`: TX buffer has bytes; should be drained to the wire.
+- `APP_IN_RDY`: plaintext is ready for the handler.
+- `APP_OUT_OK`: room in APP_OUT; safe to push more plaintext.
+
+In `HANDSHAKE` state APP_IN_RDY / APP_OUT_OK are masked off so
+nobody pushes plaintext before keys exist (gated test:
+`APP_OUT_OK NOT set in HANDSHAKE state`).
+
+Buffer sizing: each engine carries 4 × `PW_TLS_BUF_CAP` (~66 KiB).
+That's a lot per concurrent flow; the engine is designed to be
+*rented* from a fixed pool of N engines, not allocated per flow
+(see open items).
+
+**Composition with dispatch.** The engine is what makes the killer
+demo work: a `tls_echo` service registered on TCP/443 that decrypts
+inbound bytes and seals the same bytes back out, all driven by
+dispatch's `on_data` returning a `pw_iov_t` pointing at the
+engine's TX buffer. Test
+`test_engine_via_dispatch` does exactly this end-to-end through the
+TCP state machine:
+
+```
+client engine  ──seal──> [TCP/443] ──> dispatch ──> tls_echo
+                                                      │
+                                       open + reseal  ▼
+                              <── [TCP/443 reply] ──── server engine
+                       open
+client engine  ──────────────> "echo me!" ✓
+```
+
+149/149 tests covering: state transitions, want-bit gating,
+two-iov push, multi-record sequence-number advance, tampered tag
+→ FAILED, dispatch round-trip with on_open at ESTABLISHED and
+on_close exactly once on FIN.
+
 ## <a id="open-engineering-items"></a>Open engineering items
 
 This is the running TODO for what's blocking real-traffic readiness.
@@ -447,12 +552,6 @@ This is the running TODO for what's blocking real-traffic readiness.
 - **Ed25519 sign / verify** (RFC 8032). Gates real TLS handshakes
   (CertificateVerify). Needs SHA-512 first. Without these no real
   client completes a handshake.
-- **BearSSL-style explicit TLS engine.** Refactor `pw_conn`'s
-  run-to-completion path into a true byte-driven state machine with
-  `WANT_RX / WANT_TX / APP_IN / APP_OUT` ports, so any I/O backend
-  (epoll, io_uring, DPDK, in-tree dispatch) can drive TLS without a
-  callback inversion. Architecture-equivalent to today's pipeline,
-  just more control. Planned next.
 - **Receive-window-driven backpressure** on the TCP layer
   (rubber-duck'd: "no ACK = backpressure" was wrong; the right answer
   is to advertise zero `rcv_wnd` and support persist).

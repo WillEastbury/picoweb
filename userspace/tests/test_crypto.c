@@ -25,6 +25,7 @@
 #include "../tls/pem.h"
 #include "../tls/cert.h"
 #include "../tls/handshake.h"
+#include "../tls/engine.h"
 #include "../crypto/x25519.h"
 #include "../tcp/ip.h"
 #include "../tcp/tcp.h"
@@ -2148,6 +2149,415 @@ static void test_tcp_dispatch(void) {
     g_active_echo = NULL;
 }
 
+/* ====================================================================
+ * BearSSL-style TLS engine (post-handshake app-data path)
+ * ==================================================================== */
+
+/* Helper: install symmetric app keys on two engines so they can
+ * encrypt/decrypt for each other. Returns 0 on success. */
+static int test_install_symmetric_keys(pw_tls_engine_t* server,
+                                       pw_tls_engine_t* client) {
+    uint8_t ck[32], civ[12], sk[32], siv[12];
+    for (int i = 0; i < 32; i++) ck[i] = (uint8_t)(0x10 + i);
+    for (int i = 0; i < 12; i++) civ[i] = (uint8_t)(0x40 + i);
+    for (int i = 0; i < 32; i++) sk[i] = (uint8_t)(0x80 + i);
+    for (int i = 0; i < 12; i++) siv[i] = (uint8_t)(0xa0 + i);
+    if (pw_tls_engine_install_app_keys(server, ck, civ, sk, siv, 1) != 0) return -1;
+    if (pw_tls_engine_install_app_keys(client, ck, civ, sk, siv, 0) != 0) return -1;
+    return 0;
+}
+
+static void test_tls_engine(void) {
+    printf("== BearSSL-style TLS engine (RX/TX/APP_IN/APP_OUT ports) ==\n");
+
+    /* Engines are large (~66KB each) - allocate on heap to avoid
+     * blowing the test runner's stack frame. */
+    pw_tls_engine_t* svr = malloc(sizeof(*svr));
+    pw_tls_engine_t* cli = malloc(sizeof(*cli));
+    if (!svr || !cli) {
+        printf("  FAIL: engine alloc\n"); g_fail++; free(svr); free(cli); return;
+    }
+    pw_tls_engine_init(svr);
+    pw_tls_engine_init(cli);
+
+    /* Pre-install: state must be HANDSHAKE, no want bits set for app. */
+    if (pw_tls_state(svr) == PW_TLS_ST_HANDSHAKE)
+         { printf("  PASS: fresh engine in HANDSHAKE state\n"); g_pass++; }
+    else { printf("  FAIL: state=%d\n", pw_tls_state(svr)); g_fail++; }
+
+    if ((pw_tls_want(svr) & PW_TLS_APP_OUT_OK) == 0)
+         { printf("  PASS: APP_OUT_OK NOT set in HANDSHAKE state\n"); g_pass++; }
+    else { printf("  FAIL: APP_OUT_OK leaked through HANDSHAKE\n"); g_fail++; }
+
+    /* app_out_push must refuse before keys are installed. */
+    {
+        pw_iov_t iov = { .base = (const uint8_t*)"x", .len = 1 };
+        if (pw_tls_app_out_push(svr, &iov, 1) == -1)
+             { printf("  PASS: app_out_push refused before keys\n"); g_pass++; }
+        else { printf("  FAIL: app_out_push accepted before keys\n"); g_fail++; }
+    }
+
+    if (test_install_symmetric_keys(svr, cli) == 0)
+         { printf("  PASS: install symmetric app keys\n"); g_pass++; }
+    else { printf("  FAIL: install keys\n"); g_fail++; goto out; }
+
+    if (pw_tls_state(svr) == PW_TLS_ST_APP && pw_tls_state(cli) == PW_TLS_ST_APP)
+         { printf("  PASS: state -> APP after key install\n"); g_pass++; }
+    else { printf("  FAIL: state svr=%d cli=%d\n",
+                  pw_tls_state(svr), pw_tls_state(cli)); g_fail++; }
+
+    /* Want bits in APP state with empty buffers:
+     *   WANT_RX (room for cipher), APP_OUT_OK (room for plaintext)
+     *   NOT WANT_TX (no cipher to send), NOT APP_IN_RDY (no plaintext) */
+    {
+        unsigned w = pw_tls_want(svr);
+        int ok = (w & PW_TLS_WANT_RX) && (w & PW_TLS_APP_OUT_OK) &&
+                 !(w & PW_TLS_WANT_TX) && !(w & PW_TLS_APP_IN_RDY);
+        if (ok) { printf("  PASS: want bits in fresh APP state\n"); g_pass++; }
+        else    { printf("  FAIL: want=0x%x\n", w); g_fail++; }
+    }
+
+    /* ---------- Round-trip 1: client -> server -> response ---------- */
+
+    /* Client pushes plaintext request, steps. */
+    const char* req = "GET / HTTP/1.1\r\nHost: api\r\n\r\n";
+    size_t req_len = strlen(req);
+    {
+        pw_iov_t iov = { .base = (const uint8_t*)req, .len = req_len };
+        if (pw_tls_app_out_push(cli, &iov, 1) == 0)
+             { printf("  PASS: client app_out_push request (%zu B)\n", req_len); g_pass++; }
+        else { printf("  FAIL: client push\n"); g_fail++; goto out; }
+    }
+    pw_tls_step(cli);
+
+    /* Client TX should now hold a sealed record. */
+    size_t cli_tx_len;
+    const uint8_t* cli_tx = pw_tls_tx_buf(cli, &cli_tx_len);
+    if (cli_tx_len == TLS13_RECORD_HEADER_LEN + req_len + 1 + TLS13_AEAD_TAG_LEN)
+         { printf("  PASS: client TX has sealed record (%zu B)\n", cli_tx_len); g_pass++; }
+    else { printf("  FAIL: client tx_len=%zu\n", cli_tx_len); g_fail++; goto out; }
+
+    /* Pump bytes: client TX -> server RX. */
+    {
+        size_t cap;
+        uint8_t* dst = pw_tls_rx_buf(svr, &cap);
+        if (cli_tx_len > cap) { printf("  FAIL: server RX too small\n"); g_fail++; goto out; }
+        memcpy(dst, cli_tx, cli_tx_len);
+        pw_tls_rx_ack(svr, cli_tx_len);
+        pw_tls_tx_ack(cli, cli_tx_len);
+    }
+
+    /* Server steps - record opens into APP_IN. */
+    pw_tls_step(svr);
+    {
+        size_t pt_len;
+        const uint8_t* pt = pw_tls_app_in_buf(svr, &pt_len);
+        if (pt_len == req_len && memcmp(pt, req, req_len) == 0)
+             { printf("  PASS: server APP_IN matches client plaintext\n"); g_pass++; }
+        else { printf("  FAIL: server pt_len=%zu vs %zu\n", pt_len, req_len); g_fail++; goto out; }
+        if ((pw_tls_want(svr) & PW_TLS_APP_IN_RDY))
+             { printf("  PASS: APP_IN_RDY want bit set\n"); g_pass++; }
+        else { printf("  FAIL: APP_IN_RDY missing\n"); g_fail++; }
+        pw_tls_app_in_ack(svr, pt_len);
+    }
+    if ((pw_tls_want(svr) & PW_TLS_APP_IN_RDY) == 0)
+         { printf("  PASS: APP_IN_RDY clears after ack\n"); g_pass++; }
+    else { printf("  FAIL: APP_IN_RDY stuck\n"); g_fail++; }
+
+    /* Server pushes a response, steps, pump back to client. */
+    const char* resp = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+    size_t resp_len = strlen(resp);
+    {
+        pw_iov_t iov[2] = {
+            { .base = (const uint8_t*)resp,           .len = 17 },
+            { .base = (const uint8_t*)resp + 17,      .len = resp_len - 17 },
+        };
+        if (pw_tls_app_out_push(svr, iov, 2) == 0)
+             { printf("  PASS: server app_out_push 2-iov response\n"); g_pass++; }
+        else { printf("  FAIL: server push\n"); g_fail++; goto out; }
+    }
+    pw_tls_step(svr);
+
+    /* Pump server TX -> client RX. */
+    {
+        size_t svr_tx_len;
+        const uint8_t* svr_tx = pw_tls_tx_buf(svr, &svr_tx_len);
+        size_t cap;
+        uint8_t* dst = pw_tls_rx_buf(cli, &cap);
+        memcpy(dst, svr_tx, svr_tx_len);
+        pw_tls_rx_ack(cli, svr_tx_len);
+        pw_tls_tx_ack(svr, svr_tx_len);
+    }
+    pw_tls_step(cli);
+    {
+        size_t pt_len;
+        const uint8_t* pt = pw_tls_app_in_buf(cli, &pt_len);
+        if (pt_len == resp_len && memcmp(pt, resp, resp_len) == 0)
+             { printf("  PASS: client APP_IN matches server response\n"); g_pass++; }
+        else { printf("  FAIL: client got %zu B\n", pt_len); g_fail++; }
+        pw_tls_app_in_ack(cli, pt_len);
+    }
+
+    /* ---------- Round-trip 2: prove seq numbers advance ---------- */
+    {
+        const char* req2 = "PING";
+        pw_iov_t iov = { .base = (const uint8_t*)req2, .len = 4 };
+        pw_tls_app_out_push(cli, &iov, 1);
+        pw_tls_step(cli);
+        size_t tx_len;
+        const uint8_t* tx = pw_tls_tx_buf(cli, &tx_len);
+        size_t cap;
+        uint8_t* dst = pw_tls_rx_buf(svr, &cap);
+        memcpy(dst, tx, tx_len);
+        pw_tls_rx_ack(svr, tx_len);
+        pw_tls_tx_ack(cli, tx_len);
+        pw_tls_step(svr);
+        size_t pt_len;
+        const uint8_t* pt = pw_tls_app_in_buf(svr, &pt_len);
+        if (pt_len == 4 && memcmp(pt, "PING", 4) == 0)
+             { printf("  PASS: 2nd record decrypts (seq advanced)\n"); g_pass++; }
+        else { printf("  FAIL: 2nd record pt_len=%zu\n", pt_len); g_fail++; }
+        pw_tls_app_in_ack(svr, pt_len);
+    }
+
+    /* ---------- Tampered tag is detected, state -> FAILED ---------- */
+    {
+        pw_tls_engine_t* a = malloc(sizeof(*a));
+        pw_tls_engine_t* b = malloc(sizeof(*b));
+        pw_tls_engine_init(a); pw_tls_engine_init(b);
+        test_install_symmetric_keys(a, b);
+
+        const uint8_t junk[] = "ZZZZ";
+        pw_iov_t iov = { .base = junk, .len = 4 };
+        pw_tls_app_out_push(b, &iov, 1);
+        pw_tls_step(b);
+        size_t tx_len;
+        const uint8_t* tx = pw_tls_tx_buf(b, &tx_len);
+
+        /* Pump to a, but flip a tag byte first. */
+        size_t cap;
+        uint8_t* dst = pw_tls_rx_buf(a, &cap);
+        memcpy(dst, tx, tx_len);
+        dst[tx_len - 1] ^= 0x42;     /* corrupt last byte (in tag) */
+        pw_tls_rx_ack(a, tx_len);
+
+        int rc = pw_tls_step(a);
+        if (rc == -1 && pw_tls_state(a) == PW_TLS_ST_FAILED)
+             { printf("  PASS: tampered tag -> step returns -1, state FAILED\n"); g_pass++; }
+        else { printf("  FAIL: rc=%d state=%d\n", rc, pw_tls_state(a)); g_fail++; }
+
+        free(a); free(b);
+    }
+
+    /* ---------- close transitions to CLOSED ---------- */
+    pw_tls_close(svr);
+    if (pw_tls_state(svr) == PW_TLS_ST_CLOSED)
+         { printf("  PASS: pw_tls_close -> CLOSED\n"); g_pass++; }
+    else { printf("  FAIL: state=%d\n", pw_tls_state(svr)); g_fail++; }
+
+out:
+    free(svr);
+    free(cli);
+}
+
+/* ====================================================================
+ * Engine plugged behind dispatch: TLS service on a port
+ * ==================================================================== */
+
+/* A tiny TLS-echo service: decrypts, copies plaintext back as the
+ * response. Demonstrates engine + dispatch composition. */
+
+typedef struct {
+    pw_tls_engine_t* eng;
+    /* Long-lived response buffer the iov_out points at. */
+    uint8_t  reply_cipher[PW_TLS_BUF_CAP];
+    size_t   reply_cipher_len;
+} tls_echo_conn_t;
+
+typedef struct {
+    /* Pool of two so we can verify the reuse path. */
+    tls_echo_conn_t  pool[2];
+    pw_tls_engine_t  engs[2];
+    int              opened, closed;
+    /* Symmetric keys to install on each new conn. */
+    uint8_t  ck[32], civ[12], sk[32], siv[12];
+} tls_echo_svc_t;
+
+static void* tls_echo_open(void* svc_state, const pw_conn_info_t* info) {
+    (void)info;
+    tls_echo_svc_t* s = svc_state;
+    for (int i = 0; i < 2; i++) {
+        if (s->pool[i].eng == NULL) {
+            s->pool[i].eng = &s->engs[i];
+            s->pool[i].reply_cipher_len = 0;
+            pw_tls_engine_init(s->pool[i].eng);
+            pw_tls_engine_install_app_keys(s->pool[i].eng,
+                                           s->ck, s->civ, s->sk, s->siv, 1);
+            s->opened++;
+            return &s->pool[i];
+        }
+    }
+    return NULL;
+}
+
+static pw_disp_status_t tls_echo_data(void* per_conn_state,
+                                      const uint8_t* data, size_t len,
+                                      pw_iov_t* iov_out, unsigned iov_max,
+                                      unsigned* iov_n) {
+    (void)iov_max;
+    tls_echo_conn_t* c = per_conn_state;
+    *iov_n = 0;
+
+    /* Inject ciphertext, step. */
+    size_t cap;
+    uint8_t* dst = pw_tls_rx_buf(c->eng, &cap);
+    if (len > cap) return PW_DISP_ERROR;
+    memcpy(dst, data, len);
+    pw_tls_rx_ack(c->eng, len);
+    if (pw_tls_step(c->eng) < 0) return PW_DISP_RESET;
+
+    /* Drain plaintext, push back through the engine as response. */
+    size_t pt_len;
+    const uint8_t* pt = pw_tls_app_in_buf(c->eng, &pt_len);
+    if (pt_len) {
+        pw_iov_t iov = { .base = pt, .len = pt_len };
+        if (pw_tls_app_out_push(c->eng, &iov, 1) != 0) return PW_DISP_ERROR;
+        pw_tls_app_in_ack(c->eng, pt_len);
+        pw_tls_step(c->eng);
+    }
+
+    /* Pull sealed bytes out of TX into the long-lived reply_cipher
+     * buffer (which iov_out points at). */
+    size_t tx_len;
+    const uint8_t* tx = pw_tls_tx_buf(c->eng, &tx_len);
+    if (tx_len) {
+        if (tx_len > sizeof(c->reply_cipher)) return PW_DISP_ERROR;
+        memcpy(c->reply_cipher, tx, tx_len);
+        c->reply_cipher_len = tx_len;
+        pw_tls_tx_ack(c->eng, tx_len);
+        iov_out[0].base = c->reply_cipher;
+        iov_out[0].len  = c->reply_cipher_len;
+        *iov_n = 1;
+        return PW_DISP_OUTPUT;
+    }
+    return PW_DISP_NO_OUTPUT;
+}
+
+static void tls_echo_close(void* per_conn_state) {
+    tls_echo_conn_t* c = per_conn_state;
+    if (c->eng) { pw_tls_close(c->eng); c->eng = NULL; }
+    extern tls_echo_svc_t* g_active_tls_echo;
+    if (g_active_tls_echo) g_active_tls_echo->closed++;
+}
+
+tls_echo_svc_t* g_active_tls_echo = NULL;
+
+static void test_engine_via_dispatch(void) {
+    printf("== TLS engine plugged behind dispatch (port 443 = TLS-echo) ==\n");
+
+    /* Build the echo service with symmetric keys. */
+    tls_echo_svc_t* svc = calloc(1, sizeof(*svc));
+    if (!svc) { printf("  FAIL: alloc\n"); g_fail++; return; }
+    for (int i = 0; i < 32; i++) svc->ck[i] = (uint8_t)(0x10 + i);
+    for (int i = 0; i < 12; i++) svc->civ[i] = (uint8_t)(0x40 + i);
+    for (int i = 0; i < 32; i++) svc->sk[i] = (uint8_t)(0x80 + i);
+    for (int i = 0; i < 12; i++) svc->siv[i] = (uint8_t)(0xa0 + i);
+    g_active_tls_echo = svc;
+
+    /* A peer engine for the "client" side. */
+    pw_tls_engine_t* peer = malloc(sizeof(*peer));
+    pw_tls_engine_init(peer);
+    pw_tls_engine_install_app_keys(peer, svc->ck, svc->civ, svc->sk, svc->siv, 0);
+
+    /* Build the dispatch + TCP stack and register the TLS-echo service. */
+    pw_service_t s = {
+        .proto = PW_PROTO_TCP, .port = 443,
+        .svc_state = svc,
+        .on_open  = tls_echo_open,
+        .on_data  = tls_echo_data,
+        .on_close = tls_echo_close,
+    };
+    pw_dispatch_t disp; pw_dispatch_init(&disp);
+    pw_dispatch_register(&disp, &s);
+    tcp_stack_t stack;
+    tcp_attach_dispatch(&stack, 0x0a000002u, &disp);
+
+    /* Drive one TCP handshake on port 443. */
+    emit_log_t log = {0};
+    tcp_seg_t syn = {0};
+    syn.src_ip=0x0a000001u; syn.dst_ip=0x0a000002u;
+    syn.src_port=4242;     syn.dst_port=443;
+    syn.seq=1000; syn.flags=TCPF_SYN; syn.window=65535;
+    tcp_input(&stack, &syn, NULL, NULL, log_emit, &log);
+    uint32_t srv_iss = log.segs[0].seq;
+
+    log.n = 0;
+    tcp_seg_t ack = {0};
+    ack.src_ip=0x0a000001u; ack.dst_ip=0x0a000002u;
+    ack.src_port=4242;     ack.dst_port=443;
+    ack.seq=1001; ack.ack=srv_iss+1; ack.flags=TCPF_ACK; ack.window=65535;
+    tcp_input(&stack, &ack, NULL, NULL, log_emit, &log);
+
+    if (svc->opened == 1)
+         { printf("  PASS: TLS service on_open fired at ESTABLISHED\n"); g_pass++; }
+    else { printf("  FAIL: opened=%d\n", svc->opened); g_fail++; }
+
+    /* Client engine seals "echo me!" into a TLS record. */
+    const char* msg = "echo me!";
+    pw_iov_t iov = { .base = (const uint8_t*)msg, .len = strlen(msg) };
+    pw_tls_app_out_push(peer, &iov, 1);
+    pw_tls_step(peer);
+    size_t cipher_len;
+    const uint8_t* cipher = pw_tls_tx_buf(peer, &cipher_len);
+
+    /* Send that ciphertext over TCP to the dispatched TLS service. */
+    log.n = 0;
+    tcp_seg_t pkt = {0};
+    pkt.src_ip=0x0a000001u; pkt.dst_ip=0x0a000002u;
+    pkt.src_port=4242;     pkt.dst_port=443;
+    pkt.seq=1001; pkt.ack=srv_iss+1;
+    pkt.flags=TCPF_ACK|TCPF_PSH; pkt.window=65535;
+    pkt.payload=cipher; pkt.payload_len=cipher_len;
+    tcp_input(&stack, &pkt, NULL, NULL, log_emit, &log);
+
+    /* Find the data-bearing reply segment, feed it into the peer's
+     * RX, decrypt, and check we got "echo me!" back. */
+    int saw_data = 0;
+    for (int i = 0; i < log.n; i++) {
+        if (log.segs[i].payload_len > 0) {
+            size_t cap;
+            uint8_t* dst = pw_tls_rx_buf(peer, &cap);
+            memcpy(dst, log.segs[i].payload, log.segs[i].payload_len);
+            pw_tls_rx_ack(peer, log.segs[i].payload_len);
+            pw_tls_step(peer);
+            size_t pt_len;
+            const uint8_t* pt = pw_tls_app_in_buf(peer, &pt_len);
+            if (pt_len == strlen(msg) && memcmp(pt, msg, pt_len) == 0)
+                saw_data = 1;
+            pw_tls_app_in_ack(peer, pt_len);
+        }
+    }
+    if (saw_data)
+         { printf("  PASS: round-trip 'echo me!' through dispatch->engine->dispatch\n"); g_pass++; }
+    else { printf("  FAIL: no echo back\n"); g_fail++; }
+
+    /* Tear down. Send FIN and check close fires. */
+    log.n = 0;
+    tcp_seg_t fin = {0};
+    fin.src_ip=0x0a000001u; fin.dst_ip=0x0a000002u;
+    fin.src_port=4242;     fin.dst_port=443;
+    fin.seq=1001+cipher_len; fin.ack=srv_iss+1;
+    fin.flags=TCPF_FIN|TCPF_ACK; fin.window=65535;
+    tcp_input(&stack, &fin, NULL, NULL, log_emit, &log);
+    if (svc->closed == 1)
+         { printf("  PASS: on_close fired exactly once on FIN\n"); g_pass++; }
+    else { printf("  FAIL: closed=%d\n", svc->closed); g_fail++; }
+
+    free(peer);
+    free(svc);
+    g_active_tls_echo = NULL;
+}
+
 int main(void) {
     /* Pick the best SHA-256 + ChaCha20 impls available; tests below
      * run through the public entry points so they exercise whichever
@@ -2187,6 +2597,8 @@ int main(void) {
     test_tls13_transcript();
     test_dispatch_table();
     test_tcp_dispatch();
+    test_tls_engine();
+    test_engine_via_dispatch();
 
     printf("\n=== RESULTS: PASS=%d FAIL=%d ===\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;

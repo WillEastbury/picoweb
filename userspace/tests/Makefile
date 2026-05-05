@@ -27,6 +27,7 @@ CRYPTO_SRC := \
     ../tls/pem.c                 \
     ../tls/cert.c                \
     ../tls/handshake.c           \
+    ../tls/engine.c              \
     ../tcp/ip.c                  \
     ../tcp/tcp.c                 \
     ../dispatch.c                \
