@@ -13,6 +13,7 @@
 
 #include <string.h>
 
+#include "../crypto/ed25519.h"
 #include "../crypto/hkdf.h"
 #include "../crypto/hmac.h"
 #include "../crypto/sha256.h"
@@ -375,6 +376,86 @@ int tls13_build_finished(uint8_t* out, size_t out_cap,
     out[1] = 0x00; out[2] = 0x00; out[3] = 0x20;   /* body length = 32 */
     memcpy(out + 4, verify_data, 32);
     return 4 + 32;
+}
+
+/* ---------------- CertificateVerify (RFC 8446 §4.4.3) ---------------- */
+
+int tls13_build_certificate_verify_signed_data(uint8_t out[TLS13_CV_SIGNED_LEN],
+                                               const uint8_t transcript_hash[32],
+                                               int is_server) {
+    if (!out || !transcript_hash) return -1;
+
+    /* 64 bytes of 0x20 padding. */
+    memset(out, 0x20, 64);
+
+    /* 33-byte ASCII context string (no NUL). */
+    const char* label = is_server ? TLS13_CV_LABEL_SERVER
+                                  : TLS13_CV_LABEL_CLIENT;
+    /* Compile-time-ish sanity: both labels are 33 bytes. */
+    memcpy(out + 64, label, 33);
+
+    /* 1-byte 0x00 separator. */
+    out[64 + 33] = 0x00;
+
+    /* 32-byte transcript hash. */
+    memcpy(out + 64 + 33 + 1, transcript_hash, 32);
+    return 0;
+}
+
+int tls13_build_certificate_verify(uint8_t* out, size_t out_cap,
+                                   const uint8_t transcript_hash[32],
+                                   const uint8_t seed[32]) {
+    if (!out || !transcript_hash || !seed) return -1;
+    /* Wire size = 4 (handshake header) + 2 (sig_scheme) + 2 (sig_len)
+     *           + 64 (signature) = 72 bytes. */
+    const size_t wire_len = 4u + 2u + 2u + ED25519_SIG_LEN;
+    if (out_cap < wire_len) return -1;
+
+    /* Build the signed prefix on the stack. */
+    uint8_t signed_data[TLS13_CV_SIGNED_LEN];
+    if (tls13_build_certificate_verify_signed_data(signed_data,
+                                                   transcript_hash, 1) != 0) {
+        return -1;
+    }
+
+    /* Derive pubkey from seed. ~50us; one-shot per handshake.
+     * (Caller could pre-derive and cache it on cert load if needed.) */
+    uint8_t pubkey[ED25519_PUBKEY_LEN];
+    ed25519_pubkey_from_seed(pubkey, seed);
+
+    uint8_t sig[ED25519_SIG_LEN];
+    ed25519_sign(sig, signed_data, TLS13_CV_SIGNED_LEN, seed, pubkey);
+
+    /* Wipe the derived pubkey buffer + signed-data buffer. signed_data
+     * isn't a secret (it's transcript-hash-prefixed) but the seed-derived
+     * pubkey isn't either. We wipe defensively to keep the function's
+     * stack frame clean. The 'seed' input is owned by the caller. */
+    secure_zero(signed_data, sizeof(signed_data));
+
+    /* Now write the wire bytes:
+     *   handshake header  : 0x0f, body_len_24 = 4 + 64 = 68
+     *   sig_scheme        : 0x0807 (ed25519)
+     *   signature length  : 0x0040 (= 64)
+     *   signature         : 64 bytes
+     */
+    uint8_t* p = out;
+    *p++ = 0x0f;
+    *p++ = 0x00;
+    *p++ = 0x00;
+    *p++ = (uint8_t)(2u + 2u + ED25519_SIG_LEN);    /* = 0x44 = 68 */
+    *p++ = (uint8_t)(TLS13_SIG_SCHEME_ED25519 >> 8);
+    *p++ = (uint8_t)(TLS13_SIG_SCHEME_ED25519 & 0xFF);
+    *p++ = 0x00;
+    *p++ = (uint8_t)ED25519_SIG_LEN;                /* = 0x40 */
+    memcpy(p, sig, ED25519_SIG_LEN);
+    p += ED25519_SIG_LEN;
+
+    /* Wipe sig (defence-in-depth — sig isn't really secret but
+     * keeping locals clean is cheap). */
+    secure_zero(sig, sizeof(sig));
+    secure_zero(pubkey, sizeof(pubkey));
+
+    return (int)(p - out);
 }
 
 /* ---------------- Handshake transcript hash ---------------- */

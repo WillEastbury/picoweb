@@ -123,6 +123,61 @@ int tls13_build_certificate(uint8_t* out, size_t out_cap,
 int tls13_build_finished(uint8_t* out, size_t out_cap,
                          const uint8_t verify_data[32]);
 
+/* ---------------- CertificateVerify (RFC 8446 §4.4.3) ---------------- */
+/*
+ * Per §4.4.3 the signed content is:
+ *
+ *   64 bytes of 0x20 (SP) padding
+ * || ASCII context string (33 B for server, 33 B for client)
+ * || 0x00 separator
+ * || transcript hash (32 B for SHA-256-based suites)
+ *
+ * For ed25519 (SignatureScheme 0x0807), the whole 130-byte buffer is
+ * fed into ed25519_sign as the message — Ed25519 hashes it itself.
+ */
+
+#define TLS13_SIG_SCHEME_ED25519 0x0807u
+
+/* ASCII labels — 33 bytes each (no NUL). */
+#define TLS13_CV_LABEL_SERVER "TLS 1.3, server CertificateVerify"
+#define TLS13_CV_LABEL_CLIENT "TLS 1.3, client CertificateVerify"
+
+#define TLS13_CV_SIGNED_LEN   130u   /* 64 + 33 + 1 + 32 */
+
+/* Build the 130-byte CertificateVerify signed-data buffer.
+ *
+ *   is_server != 0  -> use the server context label
+ *   is_server == 0  -> use the client context label (mTLS)
+ *
+ * Returns 0 on success, -1 on bad args. */
+int tls13_build_certificate_verify_signed_data(uint8_t out[TLS13_CV_SIGNED_LEN],
+                                               const uint8_t transcript_hash[32],
+                                               int is_server);
+
+/* Build a server CertificateVerify handshake message (RFC 8446 §4.4.3)
+ * using Ed25519.
+ *
+ * Wire format (post handshake header):
+ *   u16 SignatureScheme  = 0x0807 (ed25519)
+ *   u16 sig_len          = 0x0040 (= 64)
+ *   u8  signature[64]
+ *
+ * Includes the 4-byte handshake header (0x0f + 24-bit length).
+ *
+ * Inputs:
+ *   transcript_hash[32]  — SHA-256 of all handshake messages so far
+ *                          (CH .. ServerHello .. EE .. Certificate),
+ *                          NOT including this CV.
+ *   seed[32]             — Ed25519 raw seed (use cert_extract_ed25519_seed).
+ *
+ * The corresponding public key is derived internally from seed
+ * (~50us extra; fine for one-per-handshake usage).
+ *
+ * Returns bytes written (= 4 + 4 + 64 = 72), or -1 on overflow / bad args. */
+int tls13_build_certificate_verify(uint8_t* out, size_t out_cap,
+                                   const uint8_t transcript_hash[32],
+                                   const uint8_t seed[32]);
+
 /* Compute the TLS 1.3 handshake-phase secrets per RFC 8446 §7.1.
  *
  * Inputs:

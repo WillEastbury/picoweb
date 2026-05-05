@@ -343,8 +343,10 @@ immutable `mprotect(PROT_READ)` arena.
 
 
 - TLS 1.3 Certificate / CertificateVerify (Ed25519 sign) / Finished —
-  Ed25519 is implemented (RFC 8032 §7.1 vectors pass); wiring it
-  into the engine's CertificateVerify is the next step.
+  wire builders complete: `tls13_build_certificate`,
+  `tls13_build_certificate_verify` (Ed25519, RFC 8446 §4.4.3),
+  `tls13_build_finished`. Engine integration — using these to drive
+  the handshake instead of `install_app_keys` — is the next step.
 
 ## L4 pre-jump table (`userspace/dispatch.{c,h}`)
 
@@ -621,12 +623,40 @@ cases):
 
 170/170 total tests on `main`.
 
+### CertificateVerify (RFC 8446 §4.4.3)
+
+`tls13_build_certificate_verify` produces the 72-byte wire CV
+message for an Ed25519 server cert. It builds the 130-byte signed
+prefix (64 × 0x20 padding || ASCII context label || 0x00 ||
+transcript hash), feeds it to `ed25519_sign`, and emits:
+
+```
+0x0f  body_len_u24=68              ; handshake header
+0x0807                              ; SignatureScheme = ed25519
+0x0040                              ; sig length = 64
+[64-byte Ed25519 signature]
+```
+
+`cert_extract_ed25519_seed(entry, out)` walks the PKCS#8
+PrivateKeyInfo (`SEQUENCE { INTEGER 0, alg-OID-Ed25519,
+OCTET STRING wrapping CurvePrivateKey }`) and returns the 32-byte
+seed. Tiny inline DER walker in `cert.c`; long-form lengths
+explicitly rejected (Ed25519 keys are always short-form).
+
+The signed prefix is also exposed via
+`tls13_build_certificate_verify_signed_data` so tests (and a
+future verify path for mTLS) can construct it directly.
+
 ## <a id="open-engineering-items"></a>Open engineering items
 
 This is the running TODO for what's blocking real-traffic readiness.
 
-- **Wire Ed25519 into CertificateVerify** in the TLS engine and
-  delete the spike-mode `install_app_keys` shortcut.
+- **Drive engine through full handshake**. With Ed25519 +
+  `tls13_build_certificate_verify` + `cert_extract_ed25519_seed` in
+  place, the engine has every primitive needed: it just needs to be
+  taught to walk CH parse → SH/EE/Cert/CV/Finished emission → derive
+  app keys → state→APP and delete the spike-mode `install_app_keys`
+  shortcut.
 - **Receive-window-driven backpressure** on the TCP layer
   (rubber-duck'd: "no ACK = backpressure" was wrong; the right answer
   is to advertise zero `rcv_wnd` and support persist).

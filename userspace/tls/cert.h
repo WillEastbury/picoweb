@@ -111,4 +111,21 @@ const cert_entry_t* cert_store_lookup(const cert_store_t* s,
  * or exceeds CERT_HOSTNAME_MAX. */
 int cert_normalize_hostname(char* hostname, size_t* hostname_len);
 
+/* Extract the 32-byte raw Ed25519 seed from a cert entry's PKCS#8
+ * private key (RFC 8410 §7).
+ *
+ * Returns 0 on success, -1 if the entry is not Ed25519, the PKCS#8
+ * structure is malformed, or `out_seed` is NULL. The seed is the
+ * input to ed25519_pubkey_from_seed / ed25519_sign.
+ *
+ * Canonical Ed25519 PKCS#8 v1 layout (48 bytes):
+ *   30 2e 02 01 00                  SEQUENCE / version 0
+ *   30 05 06 03 2b 65 70            algorithm OID 1.3.101.112
+ *   04 22 04 20 [seed:32]           OCTET STRING wrapping CurvePrivateKey
+ *
+ * v2 (with optional attributes / public key) is also accepted as
+ * long as the algorithm OID is Ed25519 and the privateKey field
+ * is the standard inner-OCTET-STRING wrapper. */
+int cert_extract_ed25519_seed(const cert_entry_t* e, uint8_t out_seed[32]);
+
 #endif

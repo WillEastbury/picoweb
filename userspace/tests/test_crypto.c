@@ -1230,6 +1230,33 @@ static void test_cert_store(void) {
         printf("  FAIL: bad hostname accepted\n"); g_fail++;
     }
 
+    /* Ed25519 seed extraction from the synthetic PKCS#8.
+     * build_synthetic_cert_pem fills the seed with bytes 0xC0..0xDF;
+     * round-trip the PKCS#8 -> 32-byte seed and check. */
+    {
+        uint8_t seed[32];
+        int erc = cert_extract_ed25519_seed(def, seed);
+        uint8_t want_seed[32];
+        for (int i = 0; i < 32; i++) want_seed[i] = (uint8_t)(0xC0 + i);
+        if (erc == 0 && memcmp(seed, want_seed, 32) == 0) {
+            printf("  PASS: ed25519 seed extracted from PKCS#8\n"); g_pass++;
+        } else {
+            printf("  FAIL: seed extract erc=%d\n", erc); g_fail++;
+        }
+    }
+
+    /* Negative: passing a fake non-Ed25519 entry must return -1. */
+    {
+        cert_entry_t fake = *def;
+        fake.key_type = CERT_KEY_RSA;
+        uint8_t seed[32];
+        if (cert_extract_ed25519_seed(&fake, seed) < 0) {
+            printf("  PASS: non-Ed25519 entry rejected\n"); g_pass++;
+        } else {
+            printf("  FAIL: non-Ed25519 entry accepted\n"); g_fail++;
+        }
+    }
+
     unsetenv("PICOWEB_TLS_CERT_PEM");
     unsetenv("PICOWEB_TLS_KEY_PEM");
 }
@@ -1877,6 +1904,122 @@ static void test_tls13_build_messages(void) {
         if (tls13_build_finished(buf, 35, vd) == -1)
              { printf("  PASS: Finished rejects undersized buf\n"); g_pass++; }
         else { printf("  FAIL: Finished accepted undersized buf\n"); g_fail++; }
+    }
+}
+
+/* ============================================================== */
+/* TLS 1.3 CertificateVerify (RFC 8446 §4.4.3) — Ed25519          */
+/* ============================================================== */
+static void test_tls13_certificate_verify(void) {
+    printf("== TLS 1.3 CertificateVerify (Ed25519) ==\n");
+
+    /* Known transcript hash: bytes 0..31 incrementing (deterministic). */
+    uint8_t th[32];
+    for (int i = 0; i < 32; i++) th[i] = (uint8_t)i;
+
+    /* ---- Signed-data structure: server label ---- */
+    {
+        uint8_t sd[TLS13_CV_SIGNED_LEN];
+        int rc = tls13_build_certificate_verify_signed_data(sd, th, 1);
+
+        int ok = (rc == 0);
+        /* 64 bytes of 0x20 padding. */
+        for (int i = 0; i < 64 && ok; i++) if (sd[i] != 0x20) ok = 0;
+        /* 33-byte server context label. */
+        if (ok && memcmp(sd + 64, "TLS 1.3, server CertificateVerify", 33) != 0) ok = 0;
+        /* 0x00 separator. */
+        if (ok && sd[97] != 0x00) ok = 0;
+        /* Transcript hash. */
+        if (ok && memcmp(sd + 98, th, 32) != 0) ok = 0;
+
+        if (ok) { printf("  PASS: signed-data layout (server label)\n"); g_pass++; }
+        else    { printf("  FAIL: signed-data layout (server label)\n"); g_fail++; }
+    }
+
+    /* ---- Signed-data structure: client label (mTLS path) ---- */
+    {
+        uint8_t sd[TLS13_CV_SIGNED_LEN];
+        int rc = tls13_build_certificate_verify_signed_data(sd, th, 0);
+        int ok = (rc == 0) &&
+                 memcmp(sd + 64, "TLS 1.3, client CertificateVerify", 33) == 0;
+        if (ok) { printf("  PASS: signed-data layout (client label)\n"); g_pass++; }
+        else    { printf("  FAIL: signed-data layout (client label)\n"); g_fail++; }
+    }
+
+    /* ---- Build full CV wire message + roundtrip-verify the signature ---- */
+
+    /* Use a known seed (RFC 8032 §7.1 TEST 3 seed). */
+    uint8_t seed[32];
+    unhex("c5aa8df43f9f837bedb7442f31dcb7b1"
+          "66d38535076f094b85ce3a2e0b4458f7", seed, 32);
+    uint8_t pk[32];
+    ed25519_pubkey_from_seed(pk, seed);
+
+    uint8_t cv[72];
+    int n = tls13_build_certificate_verify(cv, sizeof(cv), th, seed);
+
+    if (n == 72) { printf("  PASS: CV wire length = 72\n"); g_pass++; }
+    else         { printf("  FAIL: CV wire length = %d\n", n); g_fail++; return; }
+
+    /* Header: 0x0f, 0x00, 0x00, 0x44 (body = 4 + 64 = 68). */
+    if (cv[0] == 0x0f && cv[1] == 0 && cv[2] == 0 && cv[3] == 68) {
+        printf("  PASS: CV handshake header\n"); g_pass++;
+    } else {
+        printf("  FAIL: CV header bytes %02x %02x %02x %02x\n",
+               cv[0], cv[1], cv[2], cv[3]); g_fail++;
+    }
+
+    /* SignatureScheme = 0x0807 (ed25519); sig_len = 0x0040 (= 64). */
+    if (cv[4] == 0x08 && cv[5] == 0x07 && cv[6] == 0x00 && cv[7] == 0x40) {
+        printf("  PASS: CV sig_scheme + sig_len\n"); g_pass++;
+    } else {
+        printf("  FAIL: CV sig_scheme/len bytes %02x %02x %02x %02x\n",
+               cv[4], cv[5], cv[6], cv[7]); g_fail++;
+    }
+
+    /* Reconstruct the signed prefix and verify with the extracted sig. */
+    uint8_t sd[TLS13_CV_SIGNED_LEN];
+    tls13_build_certificate_verify_signed_data(sd, th, 1);
+
+    if (ed25519_verify(cv + 8, sd, TLS13_CV_SIGNED_LEN, pk) == 1) {
+        printf("  PASS: CV signature verifies under Ed25519\n"); g_pass++;
+    } else {
+        printf("  FAIL: CV signature does NOT verify\n"); g_fail++;
+    }
+
+    /* ---- Bit-flip in transcript hash must invalidate the signature ---- */
+    {
+        uint8_t th_bad[32];
+        memcpy(th_bad, th, 32);
+        th_bad[10] ^= 0x01;
+        uint8_t sd_bad[TLS13_CV_SIGNED_LEN];
+        tls13_build_certificate_verify_signed_data(sd_bad, th_bad, 1);
+        if (ed25519_verify(cv + 8, sd_bad, TLS13_CV_SIGNED_LEN, pk) == 0) {
+            printf("  PASS: CV sig fails under altered transcript hash\n"); g_pass++;
+        } else {
+            printf("  FAIL: CV sig accepted altered transcript hash\n"); g_fail++;
+        }
+    }
+
+    /* ---- Wrong context (client label) must also fail under server-signed ---- */
+    {
+        uint8_t sd_wrongctx[TLS13_CV_SIGNED_LEN];
+        tls13_build_certificate_verify_signed_data(sd_wrongctx, th, 0);
+        if (ed25519_verify(cv + 8, sd_wrongctx, TLS13_CV_SIGNED_LEN, pk) == 0) {
+            printf("  PASS: CV sig fails under client context label\n"); g_pass++;
+        } else {
+            printf("  FAIL: CV sig accepted client context label\n"); g_fail++;
+        }
+    }
+
+    /* ---- Truncated output buffer rejected. ---- */
+    {
+        uint8_t small[71];
+        if (tls13_build_certificate_verify(small, sizeof(small), th, seed) == -1) {
+            printf("  PASS: CV rejects undersized buf (71 bytes)\n"); g_pass++;
+        } else {
+            printf("  FAIL: CV accepted undersized buf\n"); g_fail++;
+        }
     }
 }
 
@@ -2826,6 +2969,7 @@ int main(void) {
     test_pw_conn();
     test_tls13_finished();
     test_tls13_build_messages();
+    test_tls13_certificate_verify();
     test_tls13_transcript();
     test_dispatch_table();
     test_tcp_dispatch();

@@ -218,6 +218,75 @@ int cert_normalize_hostname(char* hostname, size_t* hostname_len) {
     return 0;
 }
 
+/* ---------------- Ed25519 seed extraction (RFC 8410 §7) ---------------- */
+/*
+ * Tiny DER walker. We only handle short-form lengths (high bit clear)
+ * because Ed25519 PKCS#8 is always under 127 bytes — the algorithm
+ * SEQUENCE is 5 bytes, the OCTET STRING wrappers are 32-34 bytes, and
+ * the whole thing is 48 bytes for v1 and a few dozen more for v2.
+ *
+ * Returns 0 and advances *off on success; -1 on malformed/long-form.
+ */
+static int der_read_tag_len(const uint8_t* der, size_t der_len,
+                            size_t* off,
+                            uint8_t* out_tag, size_t* out_len) {
+    if (*off + 2 > der_len) return -1;
+    uint8_t tag = der[*off];
+    uint8_t l   = der[*off + 1];
+    if (l & 0x80) return -1;            /* long-form length: not supported */
+    if (*off + 2 + l > der_len) return -1;
+    *out_tag = tag;
+    *out_len = l;
+    *off += 2;
+    return 0;
+}
+
+int cert_extract_ed25519_seed(const cert_entry_t* e, uint8_t out_seed[32]) {
+    if (!e || !out_seed) return -1;
+    if (e->key_type != CERT_KEY_ED25519) return -1;
+    if (!e->key_der || e->key_der_len < 16) return -1;
+
+    const uint8_t* d = e->key_der;
+    size_t        n  = e->key_der_len;
+    size_t        o  = 0;
+    uint8_t       tag;
+    size_t        len;
+
+    /* PrivateKeyInfo SEQUENCE. */
+    if (der_read_tag_len(d, n, &o, &tag, &len) < 0) return -1;
+    if (tag != 0x30) return -1;
+    size_t end_outer = o + len;
+    if (end_outer > n) return -1;
+
+    /* version INTEGER. Per RFC 5958 v1=0, v2=1. Either is fine. */
+    if (der_read_tag_len(d, n, &o, &tag, &len) < 0) return -1;
+    if (tag != 0x02 || len != 1) return -1;
+    o += len;
+
+    /* algorithm AlgorithmIdentifier SEQUENCE. */
+    if (der_read_tag_len(d, n, &o, &tag, &len) < 0) return -1;
+    if (tag != 0x30) return -1;
+    /* Inside: must contain the Ed25519 OID 1.3.101.112 (06 03 2b 65 70).
+     * detect_key_type already verified Ed25519 at the top, but we
+     * sanity-check here too to defend against a key_type lie. */
+    static const uint8_t ed25519_oid[] = {0x06,0x03,0x2b,0x65,0x70};
+    if (len < sizeof(ed25519_oid)) return -1;
+    if (memcmp(d + o, ed25519_oid, sizeof(ed25519_oid)) != 0) return -1;
+    o += len;
+
+    /* privateKey OCTET STRING wrapping CurvePrivateKey. */
+    if (der_read_tag_len(d, n, &o, &tag, &len) < 0) return -1;
+    if (tag != 0x04) return -1;
+    /* Outer OCTET STRING content must itself be an OCTET STRING of
+     * exactly 32 bytes (the raw Ed25519 seed). */
+    if (len < 2 + 32) return -1;
+    if (d[o] != 0x04 || d[o + 1] != 0x20) return -1;
+    if (o + 2 + 32 > n) return -1;
+
+    memcpy(out_seed, d + o + 2, 32);
+    return 0;
+}
+
 const cert_entry_t* cert_store_lookup(const cert_store_t* s,
                                       const char* hostname,
                                       size_t hostname_len) {
