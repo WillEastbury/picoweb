@@ -495,6 +495,20 @@ int tls13_build_encrypted_extensions(uint8_t* out, size_t out_cap) {
     return 6;
 }
 
+int tls13_build_encrypted_extensions_ex(uint8_t* out, size_t out_cap,
+                                        int include_early_data) {
+    if (!include_early_data) return tls13_build_encrypted_extensions(out, out_cap);
+    /* EE with one extension: early_data (type 0x002a, body empty).
+     * Per RFC 8446 §4.2.10 the EE early_data extension body is empty. */
+    if (!out || out_cap < 10) return -1;
+    out[0] = 0x08;
+    out[1] = 0x00; out[2] = 0x00; out[3] = 0x06;   /* body = ext_list_len(2) + ext(4) = 6 */
+    out[4] = 0x00; out[5] = 0x04;                   /* ext_list_len = 4 */
+    out[6] = 0x00; out[7] = 0x2a;                   /* type = early_data */
+    out[8] = 0x00; out[9] = 0x00;                   /* ext_data length = 0 */
+    return 10;
+}
+
 int tls13_build_certificate(uint8_t* out, size_t out_cap,
                             const uint8_t* chain_der,
                             const size_t* cert_lens,

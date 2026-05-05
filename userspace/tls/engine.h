@@ -205,6 +205,21 @@ typedef struct pw_tls_engine {
     uint32_t          early_data_max;
     uint32_t          early_data_seen;
 
+    /* 0-RTT runtime state.
+     * early_data_phase: 0 = none, 1 = ACTIVE (eng->read.key holds the
+     *   client_early_traffic-derived key, expecting application_data
+     *   inner=APP_DATA OR EndOfEarlyData),
+     * 2 = DONE (EOED seen, eng->read.key now holds the
+     *   handshake-traffic key from saved_hs_read_*).
+     *
+     * saved_hs_read_*[]: derived (key,iv) for the cs_handshake_traffic
+     * secret, stashed at install time so we can swap to it after EOED
+     * without re-deriving from secret material that might have been
+     * wiped. */
+    int               early_data_phase;
+    uint8_t           saved_hs_read_key[32];
+    uint8_t           saved_hs_read_iv[12];
+
     /* Diagnostics. */
     uint64_t records_in;
     uint64_t records_out;

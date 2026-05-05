@@ -5195,6 +5195,183 @@ static void test_engine_psk_resumption(void) {
 
 
 
+/* ---------- TLS engine: 0-RTT acceptance ---------- */
+
+static void test_engine_0rtt_acceptance(void) {
+    printf("== TLS engine: 0-RTT (early data) acceptance ==\n");
+
+    uint8_t psk[32];
+    for (int i = 0; i < 32; i++) psk[i] = (uint8_t)(0x70 + i);
+    const uint8_t ticket_id[8] = { 0x20,0x21,0x22,0x23,0x24,0x25,0x26,0x27 };
+
+    pw_tls_ticket_store_t store;
+    pw_tls_ticket_store_init(&store);
+    if (pw_tls_ticket_store_insert(&store, ticket_id, sizeof(ticket_id),
+                                   psk, 0xcafebabe, 86400u, 1000u,
+                                   /*max_early_data*/ 16384u) != 0)
+         { printf("  FAIL: ticket insert\n"); g_fail++; return; }
+
+    uint8_t ch_rec[1024];
+    memset(ch_rec, 0, sizeof(ch_rec));
+    uint8_t* p = ch_rec + 5;
+    *p++ = 0x01;
+    uint8_t* hs_len_at = p; p += 3;
+    uint8_t* hs_body = p;
+
+    *p++ = 0x03; *p++ = 0x03;
+    for (int j = 0; j < 32; j++) *p++ = (uint8_t)(0xD0 + j);
+    *p++ = 0;
+    *p++ = 0x00; *p++ = 0x02; *p++ = 0x13; *p++ = 0x03;
+    *p++ = 0x01; *p++ = 0x00;
+
+    uint8_t* ext_len_at = p; p += 2;
+    uint8_t* ext_start = p;
+
+    *p++ = 0x00; *p++ = 0x2b;
+    *p++ = 0x00; *p++ = 0x03; *p++ = 0x02; *p++ = 0x03; *p++ = 0x04;
+    *p++ = 0x00; *p++ = 0x0a;
+    *p++ = 0x00; *p++ = 0x04; *p++ = 0x00; *p++ = 0x02; *p++ = 0x00; *p++ = 0x1d;
+    uint8_t cli_priv[32];
+    for (int j = 0; j < 32; j++) cli_priv[j] = (uint8_t)(0x44 ^ j);
+    cli_priv[0] &= 248; cli_priv[31] &= 127; cli_priv[31] |= 64;
+    uint8_t cli_pub[32];
+    x25519(cli_pub, cli_priv, X25519_BASE_POINT);
+    *p++ = 0x00; *p++ = 0x33;
+    *p++ = 0x00; *p++ = 0x26;
+    *p++ = 0x00; *p++ = 0x24;
+    *p++ = 0x00; *p++ = 0x1d;
+    *p++ = 0x00; *p++ = 0x20;
+    memcpy(p, cli_pub, 32); p += 32;
+    *p++ = 0x00; *p++ = 0x2d;
+    *p++ = 0x00; *p++ = 0x02; *p++ = 0x01; *p++ = 0x01;
+    *p++ = 0x00; *p++ = 0x2a;
+    *p++ = 0x00; *p++ = 0x00;
+    *p++ = 0x00; *p++ = 0x29;
+    *p++ = 0x00; *p++ = 51;
+    *p++ = 0x00; *p++ = 14;
+    *p++ = 0x00; *p++ = 0x08;
+    memcpy(p, ticket_id, 8); p += 8;
+    *p++ = 0; *p++ = 0; *p++ = 0; *p++ = 0;
+    uint8_t* binders_at = p;
+    *p++ = 0x00; *p++ = 33;
+    *p++ = 32;
+    uint8_t* binder_at = p;
+    memset(p, 0, 32); p += 32;
+
+    uint16_t ext_len = (uint16_t)(p - ext_start);
+    ext_len_at[0] = (uint8_t)(ext_len >> 8);
+    ext_len_at[1] = (uint8_t)ext_len;
+    uint32_t hs_len = (uint32_t)(p - hs_body);
+    hs_len_at[0] = (uint8_t)(hs_len >> 16);
+    hs_len_at[1] = (uint8_t)(hs_len >> 8);
+    hs_len_at[2] = (uint8_t)hs_len;
+
+    size_t partial_off = (size_t)(binders_at - (ch_rec + 5));
+    uint8_t partial_hash[32];
+    sha256(ch_rec + 5, partial_off, partial_hash);
+    uint8_t es[32], bk[32], binder[32];
+    if (tls13_compute_early_secret(psk, 32, es) != 0
+        || tls13_compute_binder_key(es, 0, bk) != 0
+        || tls13_compute_psk_binder(bk, partial_hash, binder) != 0)
+         { printf("  FAIL: binder compute\n"); g_fail++; return; }
+    memcpy(binder_at, binder, 32);
+
+    size_t body_len = (size_t)(p - (ch_rec + 5));
+    ch_rec[0] = TLS_CT_HANDSHAKE;
+    ch_rec[1] = 0x03; ch_rec[2] = 0x03;
+    ch_rec[3] = (uint8_t)(body_len >> 8);
+    ch_rec[4] = (uint8_t)body_len;
+    size_t ch_total = 5 + body_len;
+
+    uint8_t srv_seed[32];
+    for (int j = 0; j < 32; j++) srv_seed[j] = (uint8_t)(0x50 + j);
+    const uint8_t fake_cert[8] = { 0x30,0x06,0x05,0x00, 1,2,3,4 };
+    const size_t  cert_lens[1] = { sizeof(fake_cert) };
+
+    pw_tls_engine_t* eng = malloc(sizeof(*eng));
+    pw_tls_engine_init(eng);
+    test_rng_state_t rng = { .next = 0 };
+    if (pw_tls_engine_configure_server(eng, test_rng, &rng, srv_seed,
+                                       fake_cert, cert_lens, 1) != 0)
+         { printf("  FAIL: configure_server\n"); g_fail++; free(eng); return; }
+    pw_tls_engine_attach_resumption(eng, &store);
+    pw_tls_engine_set_clock(eng, 2000u);
+
+    size_t cap; uint8_t* rx = pw_tls_rx_buf(eng, &cap);
+    memcpy(rx, ch_rec, ch_total);
+    pw_tls_rx_ack(eng, ch_total);
+    int want = pw_tls_step(eng);
+    if (want >= 0
+        && pw_tls_engine_was_resumed(eng)
+        && pw_tls_engine_early_data_accepted(eng))
+         { printf("  PASS: engine accepted PSK + 0-RTT\n"); g_pass++; }
+    else { printf("  FAIL: resumed=%d ed=%d\n",
+                  pw_tls_engine_was_resumed(eng),
+                  pw_tls_engine_early_data_accepted(eng));
+           g_fail++; free(eng); return; }
+
+    /* Independently derive c_e_traffic and seal an early-data record. */
+    uint8_t ce_secret[32], ce_key[32], ce_iv[12];
+    {
+        uint8_t th_ch[32];
+        sha256(ch_rec + 5, ch_total - 5, th_ch);
+        uint8_t es2[32];
+        if (tls13_compute_early_secret(psk, 32, es2) != 0
+            || tls13_compute_client_early_traffic_secret(es2, th_ch, ce_secret) != 0)
+             { printf("  FAIL: derive c_e_traffic\n"); g_fail++; free(eng); return; }
+        tls13_derive_traffic_keys(ce_secret, ce_key, ce_iv);
+    }
+    tls_record_dir_t cli_ed; memset(&cli_ed, 0, sizeof(cli_ed));
+    memcpy(cli_ed.key,       ce_key, 32);
+    memcpy(cli_ed.static_iv, ce_iv,  12);
+
+    const uint8_t early_pt[] = "EARLY!";
+    uint8_t ed_rec[256];
+    size_t ed_wire = tls13_seal_record(&cli_ed,
+                                       TLS_CT_APPLICATION_DATA,
+                                       TLS_CT_APPLICATION_DATA,
+                                       early_pt, sizeof(early_pt) - 1,
+                                       ed_rec, sizeof(ed_rec));
+    if (ed_wire == 0) { printf("  FAIL: seal early data\n"); g_fail++; free(eng); return; }
+
+    rx = pw_tls_rx_buf(eng, &cap);
+    memcpy(rx, ed_rec, ed_wire);
+    pw_tls_rx_ack(eng, ed_wire);
+    pw_tls_step(eng);
+    size_t app_in_len; const uint8_t* app_in = pw_tls_app_in_buf(eng, &app_in_len);
+    if (app_in_len == sizeof(early_pt) - 1
+        && memcmp(app_in, early_pt, app_in_len) == 0)
+         { printf("  PASS: early-data plaintext surfaced via APP_IN\n"); g_pass++; }
+    else { printf("  FAIL: app_in_len=%zu\n", app_in_len); g_fail++; }
+
+    pw_tls_app_in_ack(eng, app_in_len);
+
+    /* EOED under c_e_traffic. */
+    uint8_t eoed_msg[4] = { 0x05, 0x00, 0x00, 0x00 };
+    uint8_t eoed_rec[64];
+    size_t eoed_wire = tls13_seal_record(&cli_ed,
+                                         TLS_CT_HANDSHAKE,
+                                         TLS_CT_APPLICATION_DATA,
+                                         eoed_msg, 4,
+                                         eoed_rec, sizeof(eoed_rec));
+    if (eoed_wire == 0) { printf("  FAIL: seal EOED\n"); g_fail++; free(eng); return; }
+    rx = pw_tls_rx_buf(eng, &cap);
+    memcpy(rx, eoed_rec, eoed_wire);
+    pw_tls_rx_ack(eng, eoed_wire);
+    pw_tls_step(eng);
+
+    if (pw_tls_state(eng) == PW_TLS_ST_HANDSHAKE
+        && pw_tls_hs_phase(eng) == PW_TLS_HS_AFTER_SF_AWAIT_CF)
+         { printf("  PASS: EOED consumed; engine still in AFTER_SF_AWAIT_CF\n"); g_pass++; }
+    else { printf("  FAIL: post-EOED state=%d phase=%d\n",
+                  pw_tls_state(eng), pw_tls_hs_phase(eng));
+           g_fail++; }
+
+    free(eng);
+}
+
+
+
 #include "../io/dpdk.h"
 
 static void test_dpdk_stub(void) {
@@ -5290,6 +5467,7 @@ int main(void) {
     test_tls_early_secret_schedule();
     test_tls_psk_extension_parser();
     test_engine_psk_resumption();
+    test_engine_0rtt_acceptance();
     test_dpdk_stub();
 
     printf("\n=== RESULTS: PASS=%d FAIL=%d ===\n", g_pass, g_fail);

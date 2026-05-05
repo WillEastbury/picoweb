@@ -168,6 +168,12 @@ int tls13_build_server_hello_psk(uint8_t* out, size_t out_cap,
  * handshake header. Returns bytes written, or -1 on overflow. */
 int tls13_build_encrypted_extensions(uint8_t* out, size_t out_cap);
 
+/* EE variant. When include_early_data != 0, includes a single
+ * early_data extension (RFC 8446 §4.2.10) with empty body — used to
+ * signal 0-RTT acceptance to the client. */
+int tls13_build_encrypted_extensions_ex(uint8_t* out, size_t out_cap,
+                                        int include_early_data);
+
 /* Build a Certificate handshake message (RFC 8446 §4.4.2).
  *
  *   struct {
