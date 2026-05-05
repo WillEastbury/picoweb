@@ -1491,6 +1491,85 @@ static void test_pw_conn(void) {
     else { printf("  FAIL: tampered st=%d\n", (int)st_bad); g_fail++; }
 }
 
+/* ---------------- TLS 1.3 Finished (RFC 8446 §4.4.4) ---------------- */
+
+static void test_tls13_finished(void) {
+    printf("== TLS 1.3 Finished (compute + verify + tamper reject) ==\n");
+
+    /* base_key = a hypothetical server_handshake_traffic_secret. */
+    uint8_t base_key[32];
+    uint8_t transcript[32];
+    for (int i = 0; i < 32; i++) base_key[i]   = (uint8_t)(0xB0 + i);
+    for (int i = 0; i < 32; i++) transcript[i] = (uint8_t)(0x40 + i);
+
+    uint8_t vd[32];
+    int rc = tls13_compute_finished(base_key, transcript, vd);
+    if (rc == 0) { printf("  PASS: compute_finished\n"); g_pass++; }
+    else         { printf("  FAIL: compute rc=%d\n", rc); g_fail++; return; }
+
+    /* Determinism. */
+    {
+        uint8_t vd2[32];
+        tls13_compute_finished(base_key, transcript, vd2);
+        if (memcmp(vd, vd2, 32) == 0)
+             { printf("  PASS: deterministic\n"); g_pass++; }
+        else { printf("  FAIL: non-deterministic\n"); g_fail++; }
+    }
+
+    /* Hand-rolled reference: HMAC(HKDF-Expand-Label(base_key, "finished",
+     * "", 32), transcript). Recompute from primitives directly so we
+     * also check our keysched plumbing. */
+    {
+        uint8_t fk[32];
+        if (tls13_hkdf_expand_label(base_key, "finished", NULL, 0, fk, 32) != 0) {
+            printf("  FAIL: hkdf-expand-label\n"); g_fail++;
+        } else {
+            uint8_t mac[32];
+            hmac_sha256(fk, sizeof(fk), transcript, sizeof(transcript), mac);
+            if (memcmp(vd, mac, 32) == 0)
+                 { printf("  PASS: matches manual HKDF+HMAC composition\n"); g_pass++; }
+            else { printf("  FAIL: differs from HKDF+HMAC reference\n"); g_fail++; }
+        }
+    }
+
+    /* verify_finished accepts a correct value. */
+    if (tls13_verify_finished(base_key, transcript, vd) == 0)
+         { printf("  PASS: verify accepts correct verify_data\n"); g_pass++; }
+    else { printf("  FAIL: verify rejected correct verify_data\n"); g_fail++; }
+
+    /* Tampered verify_data is rejected. */
+    {
+        uint8_t bad[32];
+        memcpy(bad, vd, 32);
+        bad[7] ^= 1;
+        if (tls13_verify_finished(base_key, transcript, bad) == -1)
+             { printf("  PASS: verify rejects tampered verify_data\n"); g_pass++; }
+        else { printf("  FAIL: verify accepted tampered\n"); g_fail++; }
+    }
+
+    /* Tampered transcript is rejected. */
+    {
+        uint8_t tt[32];
+        memcpy(tt, transcript, 32);
+        tt[15] ^= 0x80;
+        if (tls13_verify_finished(base_key, tt, vd) == -1)
+             { printf("  PASS: verify rejects mismatching transcript\n"); g_pass++; }
+        else { printf("  FAIL: verify accepted mismatching transcript\n"); g_fail++; }
+    }
+
+    /* Different traffic secrets MUST produce different verify_data. */
+    {
+        uint8_t bk2[32];
+        memcpy(bk2, base_key, 32);
+        bk2[0] ^= 1;
+        uint8_t vd2[32];
+        tls13_compute_finished(bk2, transcript, vd2);
+        if (memcmp(vd, vd2, 32) != 0)
+             { printf("  PASS: distinct base_keys -> distinct verify_data\n"); g_pass++; }
+        else { printf("  FAIL: collision on different base_key\n"); g_fail++; }
+    }
+}
+
 
 int main(void) {
     /* Pick the best SHA-256 + ChaCha20 impls available; tests below
@@ -1526,6 +1605,7 @@ int main(void) {
     test_aead_seal_iov();
     test_tls13_record_iov();
     test_pw_conn();
+    test_tls13_finished();
 
     printf("\n=== RESULTS: PASS=%d FAIL=%d ===\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;

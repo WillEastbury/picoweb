@@ -7,7 +7,9 @@
 #include <string.h>
 
 #include "../crypto/hkdf.h"
+#include "../crypto/hmac.h"
 #include "../crypto/sha256.h"
+#include "../crypto/util.h"
 
 int tls13_hkdf_expand_label(const uint8_t secret[TLS13_HASH_LEN],
                             const char* label,
@@ -57,4 +59,39 @@ void tls13_derive_traffic_keys(const uint8_t traffic_secret[TLS13_HASH_LEN],
      */
     tls13_hkdf_expand_label(traffic_secret, "key", NULL, 0, key, 32);
     tls13_hkdf_expand_label(traffic_secret, "iv",  NULL, 0, iv,  12);
+}
+
+int tls13_compute_finished(const uint8_t base_key[TLS13_HASH_LEN],
+                           const uint8_t transcript_hash[TLS13_HASH_LEN],
+                           uint8_t verify_data[TLS13_HASH_LEN]) {
+    /* RFC 8446 §4.4.4:
+     *   finished_key = HKDF-Expand-Label(BaseKey, "finished", "", Hash.length)
+     *   verify_data  = HMAC(finished_key, Transcript-Hash)
+     */
+    uint8_t finished_key[TLS13_HASH_LEN];
+    int rc = tls13_hkdf_expand_label(base_key, "finished",
+                                     NULL, 0,
+                                     finished_key, sizeof(finished_key));
+    if (rc != 0) {
+        secure_zero(finished_key, sizeof(finished_key));
+        return -1;
+    }
+    hmac_sha256(finished_key, sizeof(finished_key),
+                transcript_hash, TLS13_HASH_LEN,
+                verify_data);
+    secure_zero(finished_key, sizeof(finished_key));
+    return 0;
+}
+
+int tls13_verify_finished(const uint8_t base_key[TLS13_HASH_LEN],
+                          const uint8_t transcript_hash[TLS13_HASH_LEN],
+                          const uint8_t verify_data[TLS13_HASH_LEN]) {
+    uint8_t expected[TLS13_HASH_LEN];
+    if (tls13_compute_finished(base_key, transcript_hash, expected) != 0) {
+        secure_zero(expected, sizeof(expected));
+        return -1;
+    }
+    int ok = crypto_consttime_eq(expected, verify_data, TLS13_HASH_LEN);
+    secure_zero(expected, sizeof(expected));
+    return ok ? 0 : -1;
 }
