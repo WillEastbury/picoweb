@@ -510,6 +510,29 @@ Helper scripts at the repo root:
 
 ---
 
+## Experimental branches
+
+These live off `main` and intentionally don't merge in. They're kept
+for reference and as a launching pad for future work.
+
+- **`spike/io_uring`** — second build target (`make uring`) that
+  swaps the per-worker epoll loop for raw `io_uring` syscalls (no
+  liburing). Same test suite passes (26 tests). See the "io_uring
+  backend" section above.
+
+- **`spike/userspace-tcp-tls`** — pure-C TLS 1.3 + TCP/IP +
+  AF_PACKET foundation. No third-party crypto (SHA-256, HMAC,
+  HKDF, ChaCha20, Poly1305, ChaCha20-Poly1305 AEAD, X25519, all
+  validated against RFC vectors). TLS 1.3 record layer + key
+  schedule (RFC 8448 §3 vectors green). TCP passive-open state
+  machine. AF_PACKET I/O skeleton. DPDK loop pattern documented
+  but not built. `cd userspace/tests && make test` runs the full
+  38-test RFC-vector suite. See [`userspace/DESIGN.md`](./userspace/DESIGN.md)
+  for honest scope; this is a foundation for a months-long effort,
+  not a shippable stack.
+
+---
+
 ## License
 
 MIT — see [LICENSE](./LICENSE).
