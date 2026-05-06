@@ -1,4 +1,5 @@
 #include "http.h"
+#include "brotli.h"
 #include "compress.h"
 #include "util.h"
 
@@ -172,6 +173,7 @@ http_result_t http_parse(char* buf, size_t buf_len, http_request_t* out) {
              * exact-form (case-sensitive); the rest of the value
              * (q-values, other tokens) is ignored. */
             if (metal_compress_accepted(tval, tl)) out->accept_pc = true;
+            if (brotli_accepted(tval, tl)) out->accept_br = true;
         }
         p = eol + 2;
     }

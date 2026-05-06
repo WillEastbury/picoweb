@@ -60,7 +60,8 @@ typedef struct {
     const char* body;            size_t body_len;
     const chrome_t* chrome;      /* NULL if no chrome is applied */
     const resource_compress_t* compressed; /* NULL if no compressed variant */
-} __attribute__((aligned(64))) resource_t;
+    const resource_compress_t* brotli;     /* NULL if no Brotli variant */
+} __attribute__((aligned(128))) resource_t;
 
 /* One flat-table slot. value == NULL marks the slot empty.
  * Layout is exactly one cache line so each probe touches a single

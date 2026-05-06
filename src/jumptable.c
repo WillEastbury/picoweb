@@ -1,4 +1,5 @@
 #include "jumptable.h"
+#include "brotli.h"
 #include "compress.h"
 #include "metrics.h"
 #include "mime.h"
@@ -425,12 +426,12 @@ static resource_t* build_resource(arena_t* arena,
                                   const char* mime_type,
                                   const char* body_in_arena, size_t body_len,
                                   const char* extra_header) {
-    /* 64-byte align resource_t; struct itself is also __aligned(64). */
     resource_t* r = (resource_t*)arena_alloc(arena, sizeof(*r), 64);
     r->body = body_in_arena;
     r->body_len = body_len;
     r->chrome = NULL;
     r->compressed = NULL;
+    r->brotli = NULL;
     r->head_close = build_head(arena, status_line, mime_type, body_len,
                                false, extra_header, &r->head_close_len);
     r->head_keepalive = build_head(arena, status_line, mime_type, body_len,
@@ -446,7 +447,8 @@ static resource_t* build_resource_chromed(arena_t* arena,
                                           const char* status_line,
                                           const char* mime_type,
                                           const char* body_in_arena, size_t body_len,
-                                          const chrome_t* chrome) {
+                                          const chrome_t* chrome,
+                                          const char* extra_header) {
     size_t total_payload = body_len
                          + (chrome ? chrome->hdr_len : 0)
                          + (chrome ? chrome->ftr_len : 0);
@@ -455,10 +457,11 @@ static resource_t* build_resource_chromed(arena_t* arena,
     r->body_len = body_len;
     r->chrome = chrome;
     r->compressed = NULL;
+    r->brotli = NULL;
     r->head_close = build_head(arena, status_line, mime_type, total_payload,
-                               false, NULL, &r->head_close_len);
+                               false, extra_header, &r->head_close_len);
     r->head_keepalive = build_head(arena, status_line, mime_type, total_payload,
-                                   true, NULL, &r->head_keepalive_len);
+                                   true, extra_header, &r->head_keepalive_len);
     return r;
 }
 
@@ -530,6 +533,62 @@ static void attach_compressed_variant(arena_t* arena,
     r->compressed = rc;
 }
 
+/* Build a Brotli-compressed variant of a resource. Same pattern as
+ * attach_compressed_variant but uses our micro-brotli encoder. */
+static void attach_brotli_variant(arena_t* arena, resource_t* r,
+                                  const char* status_line,
+                                  const char* mime_type,
+                                  const char* cache_hdr) {
+    if (!r || !r->body_len) return;
+
+    /* Assemble raw payload (chrome+body if chromed) */
+    size_t hdr_len = r->chrome ? r->chrome->hdr_len : 0;
+    size_t ftr_len = r->chrome ? r->chrome->ftr_len : 0;
+    size_t raw_len = hdr_len + r->body_len + ftr_len;
+    if (raw_len == 0) return;
+
+    uint8_t* raw = (uint8_t*)malloc(raw_len);
+    if (!raw) return;
+    size_t off = 0;
+    if (hdr_len) { memcpy(raw + off, r->chrome->hdr, hdr_len); off += hdr_len; }
+    memcpy(raw + off, r->body, r->body_len); off += r->body_len;
+    if (ftr_len) { memcpy(raw + off, r->chrome->ftr, ftr_len); }
+
+    /* Compress */
+    size_t bound = brotli_bound(raw_len);
+    uint8_t* tmp = (uint8_t*)malloc(bound);
+    if (!tmp) { free(raw); return; }
+
+    int got = brotli_encode(raw, raw_len, tmp, bound);
+    free(raw);
+    if (got <= 0 || (size_t)got >= raw_len) {
+        free(tmp);
+        return;
+    }
+
+    /* Copy into arena */
+    void* body_br = arena_dup(arena, tmp, (size_t)got);
+    free(tmp);
+    if (!body_br) return;
+
+    /* Build variant headers */
+    char extra[256];
+    snprintf(extra, sizeof(extra),
+             "Content-Encoding: br\r\n"
+             "Vary: Accept-Encoding\r\n"
+             "%s", cache_hdr ? cache_hdr : "");
+
+    resource_compress_t* rc = (resource_compress_t*)
+        arena_alloc(arena, sizeof(*rc), 64);
+    rc->body = (const char*)body_br;
+    rc->body_len = (size_t)got;
+    rc->head_close = build_head(arena, status_line, mime_type, (size_t)got,
+                                false, extra, &rc->head_close_len);
+    rc->head_keepalive = build_head(arena, status_line, mime_type, (size_t)got,
+                                    true, extra, &rc->head_keepalive_len);
+    r->brotli = rc;
+}
+
 static const char kBody400[] = "<!doctype html><title>400</title><h1>400 Bad Request</h1>";
 static const char kBody404[] = "<!doctype html><title>404</title><h1>404 Not Found</h1>";
 static const char kBody405[] = "<!doctype html><title>405</title><h1>405 Method Not Allowed</h1>";
@@ -539,6 +598,7 @@ static const char kBody505[] = "<!doctype html><title>505</title><h1>505 HTTP Ve
 
 static void build_canned_errors(jumptable_t* jt) {
     arena_t* a = &jt->arena;
+    static const char kNoCache[] = "Cache-Control: no-cache\r\n";
     const char* b400 = (const char*)arena_dup(a, kBody400, sizeof(kBody400) - 1);
     const char* b404 = (const char*)arena_dup(a, kBody404, sizeof(kBody404) - 1);
     const char* b405 = (const char*)arena_dup(a, kBody405, sizeof(kBody405) - 1);
@@ -546,17 +606,18 @@ static void build_canned_errors(jumptable_t* jt) {
     const char* b414 = (const char*)arena_dup(a, kBody414, sizeof(kBody414) - 1);
     const char* b505 = (const char*)arena_dup(a, kBody505, sizeof(kBody505) - 1);
     jt->err_400 = build_resource(a, "HTTP/1.1 400 Bad Request",
-        "text/html; charset=utf-8", b400, sizeof(kBody400) - 1, NULL);
+        "text/html; charset=utf-8", b400, sizeof(kBody400) - 1, kNoCache);
     jt->err_404 = build_resource(a, "HTTP/1.1 404 Not Found",
-        "text/html; charset=utf-8", b404, sizeof(kBody404) - 1, NULL);
+        "text/html; charset=utf-8", b404, sizeof(kBody404) - 1, kNoCache);
     jt->err_405 = build_resource(a, "HTTP/1.1 405 Method Not Allowed",
-        "text/html; charset=utf-8", b405, sizeof(kBody405) - 1, "Allow: GET, HEAD\r\n");
+        "text/html; charset=utf-8", b405, sizeof(kBody405) - 1,
+        "Allow: GET, HEAD\r\nCache-Control: no-cache\r\n");
     jt->err_413 = build_resource(a, "HTTP/1.1 413 Payload Too Large",
-        "text/html; charset=utf-8", b413, sizeof(kBody413) - 1, NULL);
+        "text/html; charset=utf-8", b413, sizeof(kBody413) - 1, kNoCache);
     jt->err_414 = build_resource(a, "HTTP/1.1 414 URI Too Long",
-        "text/html; charset=utf-8", b414, sizeof(kBody414) - 1, NULL);
+        "text/html; charset=utf-8", b414, sizeof(kBody414) - 1, kNoCache);
     jt->err_505 = build_resource(a, "HTTP/1.1 505 HTTP Version Not Supported",
-        "text/html; charset=utf-8", b505, sizeof(kBody505) - 1, NULL);
+        "text/html; charset=utf-8", b505, sizeof(kBody505) - 1, kNoCache);
 }
 
 static const char* slurp(arena_t* arena, const char* path, off_t expected, size_t* out_len) {
@@ -647,8 +708,9 @@ bool jumptable_build(jumptable_t* jt, const char* wwwroot) {
      * bound is tight on text and a no-op on binary). */
     size_t arena_cap = total_bytes
                      + total_bytes * 6 / 5         /* compressed copies */
+                     + total_bytes * 6 / 5         /* brotli copies */
                      + total_entries * 768
-                     + total_entries * 256         /* resource_compress_t + variant heads */
+                     + total_entries * 512         /* resource_compress_t*2 + variant heads */
                      + slot_count * sizeof(flat_slot_t)
                      + total_hosts * 512
                      + 2 * 768                   /* /health + /stats heads */
@@ -702,24 +764,47 @@ bool jumptable_build(jumptable_t* jt, const char* wwwroot) {
                 if (!body) continue;
                 const char* mime = mime_lookup(f->name, f->name_len);
 
-                /* Apply chrome only to text/html responses. mime_lookup
-                 * always returns "text/html; charset=utf-8" for .html
-                 * (see mime.c) so an exact-prefix compare suffices. */
+                /* Cache-Control policy:
+                 * HTML pages: 1 hour (content may change)
+                 * Other static assets: 1 day
+                 * Compressible resources also get Vary for identity responses. */
                 bool is_html = (host_chrome != NULL)
                             && strncmp(mime, "text/html", 9) == 0;
+                bool compressible = mime_is_compressible(mime);
+
+                const char* extra_hdr;
+                const char* cache_hdr;  /* just the Cache-Control line for variants */
+                if (is_html) {
+                    if (compressible)
+                        extra_hdr = "Cache-Control: public, max-age=3600\r\n"
+                                    "Vary: Accept-Encoding\r\n";
+                    else
+                        extra_hdr = "Cache-Control: public, max-age=3600\r\n";
+                    cache_hdr = "Cache-Control: public, max-age=3600\r\n";
+                } else if (compressible) {
+                    extra_hdr = "Cache-Control: public, max-age=86400\r\n"
+                                "Vary: Accept-Encoding\r\n";
+                    cache_hdr = "Cache-Control: public, max-age=86400\r\n";
+                } else {
+                    extra_hdr = "Cache-Control: public, max-age=86400\r\n";
+                    cache_hdr = "Cache-Control: public, max-age=86400\r\n";
+                }
+
                 resource_t* r = is_html
                     ? build_resource_chromed(&jt->arena, "HTTP/1.1 200 OK",
-                                             mime, body, got, host_chrome)
+                                             mime, body, got, host_chrome, extra_hdr)
                     : build_resource(&jt->arena, "HTTP/1.1 200 OK",
-                                     mime, body, got, NULL);
+                                     mime, body, got, extra_hdr);
 
                 /* Pre-compress text bodies for clients that opt in
-                 * via Accept-Encoding. Variant is dropped silently if
+                 * via Accept-Encoding. Variants are dropped silently if
                  * compression doesn't shrink the payload. Computed
                  * once at startup; never mutated on the hot path. */
-                if (mime_is_compressible(mime)) {
+                if (compressible) {
                     attach_compressed_variant(&jt->arena, r,
                                               "HTTP/1.1 200 OK", mime);
+                    attach_brotli_variant(&jt->arena, r,
+                                          "HTTP/1.1 200 OK", mime, cache_hdr);
                 }
 
                 char url[8192];

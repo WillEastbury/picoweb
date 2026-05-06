@@ -28,6 +28,7 @@ typedef struct {
     size_t path_len;
     bool   client_close;  /* Connection: close */
     bool   accept_pc;     /* Accept-Encoding contains picoweb-compress / BareMetal.Compress */
+    bool   accept_br;     /* Accept-Encoding contains br (Brotli) */
     bool   has_leftover;  /* extra bytes after \r\n\r\n */
     size_t consumed;      /* total bytes consumed from buf */
 } http_request_t;

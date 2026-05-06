@@ -27,7 +27,7 @@ typedef struct conn {
     const char*       head_ptr;
     size_t            head_len;
     bool              send_body;
-    bool              serve_compressed;   /* use res->compressed body, no chrome iovec */
+    const resource_compress_t* active_variant; /* non-NULL = serving compressed body */
     size_t            bytes_sent;     /* 0..head_len + (send_body ? body_len : 0) */
     bool              close_after;
 
