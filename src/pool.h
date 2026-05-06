@@ -28,8 +28,12 @@ typedef struct conn {
     size_t            head_len;
     bool              send_body;
     const resource_compress_t* active_variant; /* non-NULL = serving compressed body */
-    size_t            bytes_sent;     /* 0..head_len + (send_body ? body_len : 0) */
+    size_t            wire_total;     /* precomputed total bytes to send */
+    size_t            bytes_sent;     /* 0..wire_total */
     bool              close_after;
+
+    /* Epoll interest tracking — skip redundant epoll_ctl MOD calls */
+    uint32_t          epoll_mask;
 
     /* Per-connection lifetime caps & flags */
     uint32_t req_count;          /* # full requests served on this conn */

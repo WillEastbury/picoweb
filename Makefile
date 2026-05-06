@@ -1,8 +1,9 @@
 # picoweb Makefile
 CC      ?= gcc
 CFLAGS  ?= -O3 -Wall -Wextra -Wshadow -Wpedantic -std=c11 -D_GNU_SOURCE \
-           -fno-strict-aliasing -fstack-protector-strong
-LDFLAGS ?=
+           -fno-strict-aliasing -fstack-protector-strong \
+           -flto -march=native -fomit-frame-pointer
+LDFLAGS ?= -flto -O3
 LDLIBS  ?= -pthread
 
 # All backends are compiled into a single binary; main.c picks
@@ -29,6 +30,7 @@ debug: CFLAGS := -O0 -g3 -Wall -Wextra -Wshadow -Wpedantic -std=c11 \
                  -D_GNU_SOURCE -fno-strict-aliasing \
                  -fsanitize=address,undefined
 debug: LDLIBS += -fsanitize=address,undefined
+debug: LDFLAGS :=
 debug: clean $(BIN)
 
 run: $(BIN)

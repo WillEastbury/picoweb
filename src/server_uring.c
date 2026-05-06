@@ -322,9 +322,10 @@ static bool submit_close(ring_t* r, int fd, size_t conn_idx) {
 static bool submit_sendmsg(ring_t* r, conn_t* c, size_t conn_idx,
                            size_t total_payload) {
     const resource_t* res = c->res;
-    const chrome_t* ch = (c->send_body && !c->serve_compressed) ? res->chrome : NULL;
-    const char* body_ptr = c->serve_compressed ? res->compressed->body : res->body;
-    size_t      body_len = c->serve_compressed ? res->compressed->body_len : res->body_len;
+    bool encoded = (c->active_variant != NULL);
+    const chrome_t* ch = (c->send_body && !encoded) ? res->chrome : NULL;
+    const char* body_ptr = encoded ? c->active_variant->body : res->body;
+    size_t      body_len = encoded ? c->active_variant->body_len : res->body_len;
 
     const char* seg_ptr[4];
     size_t      seg_len[4];
@@ -380,8 +381,9 @@ static void conn_reset_for_next(conn_t* c) {
     c->head_ptr    = NULL;
     c->head_len    = 0;
     c->bytes_sent  = 0;
+    c->wire_total  = 0;
     c->send_body   = false;
-    c->serve_compressed = false;
+    c->active_variant = NULL;
     c->state       = ST_READING;
     c->last_active_ms = metal_now_ms();
 }
@@ -393,13 +395,15 @@ static void conn_init_new(conn_t* c, int fd) {
     c->res = NULL;
     c->head_ptr = NULL; c->head_len = 0;
     c->send_body = false;
-    c->serve_compressed = false;
+    c->active_variant = NULL;
+    c->wire_total = 0;
     c->bytes_sent = 0;
     c->close_after = false;
     c->req_count = 0;
     c->peer_half_closed = false;
     c->req_start_tsc = 0;
     c->last_active_ms = metal_now_ms();
+    c->epoll_mask = 0;
 }
 
 /* Compute the wire-bytes total for the response c is currently
@@ -410,8 +414,8 @@ static inline size_t conn_total_payload(const conn_t* c) {
     size_t total = c->head_len;
     if (c->send_body) {
         const resource_t* rs = c->res;
-        if (c->serve_compressed) {
-            total += rs->compressed->body_len;
+        if (c->active_variant) {
+            total += c->active_variant->body_len;
         } else {
             total += rs->body_len;
             if (rs->chrome) total += rs->chrome->hdr_len + rs->chrome->ftr_len;
@@ -436,12 +440,16 @@ static bool dispatch_one(conn_t* c, const jumptable_t* jt, uint32_t max_req) {
     if (max_req && c->req_count >= max_req) close_after = true;
 
     c->res = r;
-    bool use_pc = (req.accept_pc && r->compressed != NULL);
-    c->serve_compressed = use_pc;
-    if (use_pc) {
-        const resource_compress_t* rc = r->compressed;
-        c->head_ptr = close_after ? rc->head_close : rc->head_keepalive;
-        c->head_len = close_after ? rc->head_close_len : rc->head_keepalive_len;
+    const resource_compress_t* variant = NULL;
+    if (req.accept_br && r->brotli != NULL)
+        variant = r->brotli;
+    else if (req.accept_pc && r->compressed != NULL)
+        variant = r->compressed;
+
+    c->active_variant = variant;
+    if (variant) {
+        c->head_ptr = close_after ? variant->head_close : variant->head_keepalive;
+        c->head_len = close_after ? variant->head_close_len : variant->head_keepalive_len;
     } else {
         c->head_ptr = close_after ? r->head_close : r->head_keepalive;
         c->head_len = close_after ? r->head_close_len : r->head_keepalive_len;

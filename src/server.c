@@ -90,6 +90,13 @@ static void ep_mod(int ep, int fd, void* ptr, uint32_t events) {
     }
 }
 
+/* Conditional ep_mod: skip syscall if mask is already what we want. */
+static inline void ep_mod_if(int ep, conn_t* c, uint32_t events) {
+    if (c->epoll_mask == events) return;
+    c->epoll_mask = events;
+    ep_mod(ep, c->fd, c, events);
+}
+
 /* Drain MSG_ERRQUEUE on a socket. Returns:
  *   0 - the queue contained only MSG_ZEROCOPY completion notifications
  *       (which we silently discard — our arena memory is immutable, so
@@ -153,7 +160,7 @@ static void close_conn(pool_t* pool, int ep, conn_t* c) {
  * distinguish it from per-connection events. */
 static int g_listen_marker;
 
-static void try_accept(int listen_fd, int ep, pool_t* pool) {
+static void try_accept(int listen_fd, int ep, pool_t* pool, int64_t batch_now_ms) {
     for (;;) {
         struct sockaddr_in peer;
         socklen_t plen = sizeof(peer);
@@ -202,12 +209,15 @@ static void try_accept(int listen_fd, int ep, pool_t* pool) {
         conn->head_len = 0;
         conn->send_body = false;
         conn->bytes_sent = 0;
+        conn->wire_total = 0;
         conn->close_after = false;
         conn->req_count = 0;
         conn->peer_half_closed = false;
-        conn->last_active_ms = metal_now_ms();
+        conn->last_active_ms = batch_now_ms;
 
-        ep_add(ep, c, conn, EPOLLIN | EPOLLRDHUP);
+        uint32_t mask = EPOLLIN | EPOLLRDHUP;
+        conn->epoll_mask = mask;
+        ep_add(ep, c, conn, mask);
     }
 }
 
@@ -257,8 +267,7 @@ static int try_send(conn_t* c) {
         }
     }
 
-    size_t total = 0;
-    for (int i = 0; i < seg_n; i++) total += seg_len[i];
+    size_t total = c->wire_total;
 
     for (;;) {
         if (c->bytes_sent >= total) return 1;
@@ -373,6 +382,21 @@ static int dispatch_one(conn_t* c, const jumptable_t* jt, uint32_t max_req) {
     c->close_after = close_after;
     c->state       = ST_WRITING;
 
+    /* Precompute total wire bytes to avoid recomputing in try_send. */
+    {
+        size_t wt = c->head_len;
+        if (!head_only) {
+            if (variant) {
+                wt += variant->body_len;
+            } else {
+                const chrome_t* ch = r->chrome;
+                if (ch) wt += ch->hdr_len + r->body_len + ch->ftr_len;
+                else    wt += r->body_len;
+            }
+        }
+        c->wire_total = wt;
+    }
+
     /* Compact: preserve any leftover bytes (start of next request)
      * at the front of the buffer for after we finish this response. */
     if (pr == HTTP_OK && req.consumed > 0 && c->read_off > req.consumed) {
@@ -391,7 +415,8 @@ static int dispatch_one(conn_t* c, const jumptable_t* jt, uint32_t max_req) {
  * next request — bounded by POST_SEND_BUDGET to avoid one client
  * monopolising the worker. Returns true if conn was closed. */
 static bool post_send(conn_t* c, int ep, pool_t* pool,
-                      const jumptable_t* jt, uint32_t max_req) {
+                      const jumptable_t* jt, uint32_t max_req,
+                      int64_t batch_now_ms) {
     int budget = POST_SEND_BUDGET;
     while (budget-- > 0) {
         /* Record latency for the request that just completed. Per-worker
@@ -412,11 +437,12 @@ static bool post_send(conn_t* c, int ep, pool_t* pool,
         c->head_ptr    = NULL;
         c->head_len    = 0;
         c->bytes_sent  = 0;
+        c->wire_total  = 0;
         c->send_body   = false;
         c->active_variant = NULL;
         c->state       = ST_READING;
-        /* Refresh idle timer ONLY at request/response boundary. */
-        c->last_active_ms = metal_now_ms();
+        /* Use batched timestamp instead of per-request clock_gettime. */
+        c->last_active_ms = batch_now_ms;
 
         if (c->read_off == 0) {
             /* No buffered next request. If peer half-closed, no more
@@ -425,7 +451,7 @@ static bool post_send(conn_t* c, int ep, pool_t* pool,
                 close_conn(pool, ep, c);
                 return true;
             }
-            ep_mod(ep, c->fd, c, EPOLLIN | EPOLLRDHUP);
+            ep_mod_if(ep, c, EPOLLIN | EPOLLRDHUP);
             return false;
         }
 
@@ -437,14 +463,14 @@ static bool post_send(conn_t* c, int ep, pool_t* pool,
                 close_conn(pool, ep, c);
                 return true;
             }
-            ep_mod(ep, c->fd, c, EPOLLIN | EPOLLRDHUP);
+            ep_mod_if(ep, c, EPOLLIN | EPOLLRDHUP);
             return false;
         }
         /* dr == 1 → ST_WRITING; try to send immediately */
         int sr = try_send(c);
         if (sr < 0) { close_conn(pool, ep, c); return true; }
         if (sr == 0) {
-            ep_mod(ep, c->fd, c, EPOLLOUT | EPOLLRDHUP);
+            ep_mod_if(ep, c, EPOLLOUT | EPOLLRDHUP);
             return false;
         }
         /* sr == 1 → fully sent; loop and check for more leftover work */
@@ -452,7 +478,7 @@ static bool post_send(conn_t* c, int ep, pool_t* pool,
     /* Budget exhausted; yield back to epoll. We're either ST_WRITING
      * waiting for OUT (won't happen since sr==1 to get here) or have
      * leftover bytes to parse next tick. Re-arm IN to get re-dispatched. */
-    ep_mod(ep, c->fd, c, EPOLLIN | EPOLLRDHUP);
+    ep_mod_if(ep, c, EPOLLIN | EPOLLRDHUP);
     return false;
 }
 
@@ -461,7 +487,8 @@ static bool post_send(conn_t* c, int ep, pool_t* pool,
 /* ============================================================== */
 
 static void handle_readable(conn_t* c, int ep, pool_t* pool,
-                            const jumptable_t* jt, uint32_t max_req) {
+                            const jumptable_t* jt, uint32_t max_req,
+                            int64_t batch_now_ms) {
     /* Drain everything currently available — LT epoll permits the
      * minimum of one read, but draining reduces wakeups. */
     bool any_read = false;
@@ -501,21 +528,22 @@ static void handle_readable(conn_t* c, int ep, pool_t* pool,
     int sr = try_send(c);
     if (sr < 0) { close_conn(pool, ep, c); return; }
     if (sr == 0) {
-        ep_mod(ep, c->fd, c, EPOLLOUT | EPOLLRDHUP);
+        ep_mod_if(ep, c, EPOLLOUT | EPOLLRDHUP);
         return;
     }
-    post_send(c, ep, pool, jt, max_req);
+    post_send(c, ep, pool, jt, max_req, batch_now_ms);
 }
 
 static void handle_writable(conn_t* c, int ep, pool_t* pool,
-                            const jumptable_t* jt, uint32_t max_req) {
+                            const jumptable_t* jt, uint32_t max_req,
+                            int64_t batch_now_ms) {
     int rc = try_send(c);
     if (rc < 0) { close_conn(pool, ep, c); return; }
     if (rc == 0) {
-        ep_mod(ep, c->fd, c, EPOLLOUT | EPOLLRDHUP);
+        ep_mod_if(ep, c, EPOLLOUT | EPOLLRDHUP);
         return;
     }
-    post_send(c, ep, pool, jt, max_req);
+    post_send(c, ep, pool, jt, max_req, batch_now_ms);
 }
 
 /* ============================================================== */
@@ -583,11 +611,15 @@ void* epoll_worker_main(void* arg) {
             metal_die("epoll_wait");
         }
 
+        /* Batch timestamp: one clock_gettime per epoll_wait return,
+         * used for idle timers and accept timestamps. */
+        int64_t batch_now_ms = metal_now_ms();
+
         for (int i = 0; i < n; i++) {
             void* ptr = events[i].data.ptr;
             uint32_t ev = events[i].events;
             if (ptr == &g_listen_marker) {
-                try_accept(listen_fd, ep, &pool);
+                try_accept(listen_fd, ep, &pool, batch_now_ms);
                 continue;
             }
             conn_t* c = (conn_t*)ptr;
@@ -622,24 +654,23 @@ void* epoll_worker_main(void* arg) {
                  * pipelined-mid-response). EPOLLOUT or peer-RDHUP are
                  * the only signals that move us forward here. */
                 if (ev & (EPOLLOUT | EPOLLHUP | EPOLLRDHUP)) {
-                    handle_writable(c, ep, &pool, cfg->jt, max_req);
+                    handle_writable(c, ep, &pool, cfg->jt, max_req, batch_now_ms);
                 }
                 continue;
             }
 
             /* ST_READING */
             if (ev & EPOLLIN) {
-                handle_readable(c, ep, &pool, cfg->jt, max_req);
+                handle_readable(c, ep, &pool, cfg->jt, max_req, batch_now_ms);
             } else if (ev & (EPOLLHUP | EPOLLRDHUP)) {
                 /* No data and peer is gone */
                 close_conn(&pool, ep, c);
             }
         }
 
-        int64_t now2 = metal_now_ms();
-        if (now2 - last_sweep >= IDLE_SWEEP_MS) {
-            sweep_idle(&pool, ep, now2, cfg->idle_ms);
-            last_sweep = now2;
+        if (batch_now_ms - last_sweep >= IDLE_SWEEP_MS) {
+            sweep_idle(&pool, ep, batch_now_ms, cfg->idle_ms);
+            last_sweep = batch_now_ms;
         }
     }
     return NULL;
