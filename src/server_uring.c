@@ -321,40 +321,40 @@ static bool submit_close(ring_t* r, int fd, size_t conn_idx) {
  * ignore the extra IORING_CQE_F_NOTIF cqe in the OP_SEND handler. */
 static bool submit_sendmsg(ring_t* r, conn_t* c, size_t conn_idx,
                            size_t total_payload) {
-    const resource_t* res = c->res;
-    bool encoded = (c->active_variant != NULL);
-    const chrome_t* ch = (c->send_body && !encoded) ? res->chrome : NULL;
-    const char* body_ptr = encoded ? c->active_variant->body : res->body;
-    size_t      body_len = encoded ? c->active_variant->body_len : res->body_len;
-
-    const char* seg_ptr[4];
-    size_t      seg_len[4];
-    int seg_n = 0;
-    seg_ptr[seg_n] = c->head_ptr;       seg_len[seg_n] = c->head_len;       seg_n++;
-    if (c->send_body) {
-        if (ch && ch->hdr_len) { seg_ptr[seg_n] = ch->hdr; seg_len[seg_n] = ch->hdr_len; seg_n++; }
-        if (body_len)          { seg_ptr[seg_n] = body_ptr; seg_len[seg_n] = body_len;   seg_n++; }
-        if (ch && ch->ftr_len) { seg_ptr[seg_n] = ch->ftr; seg_len[seg_n] = ch->ftr_len; seg_n++; }
-    }
-
-    /* Skip already-sent prefix; emit the partial leading segment. */
     uring_state_t* us = &g_uring_state[conn_idx];
-    int n = 0;
-    size_t cursor = 0;
-    for (int i = 0; i < seg_n; i++) {
-        size_t end = cursor + seg_len[i];
-        if (end <= c->bytes_sent) { cursor = end; continue; }
-        size_t off = c->bytes_sent > cursor ? c->bytes_sent - cursor : 0;
-        us->iov[n].iov_base = (void*)(uintptr_t)(seg_ptr[i] + off);
-        us->iov[n].iov_len  = seg_len[i] - off;
-        n++;
-        cursor = end;
-    }
-    if (n == 0) return false;   /* nothing to send -> caller handles */
 
-    memset(&us->mh, 0, sizeof(us->mh));
-    us->mh.msg_iov    = us->iov;
-    us->mh.msg_iovlen = (size_t)n;
+    if (__builtin_expect(c->wire_buf != NULL, 1)) {
+        /* Fast path: flat wire buffer, single iovec. */
+        us->iov[0].iov_base = (void*)(uintptr_t)(c->wire_buf + c->bytes_sent);
+        us->iov[0].iov_len  = c->wire_total - c->bytes_sent;
+        if (us->iov[0].iov_len == 0) return false;
+        memset(&us->mh, 0, sizeof(us->mh));
+        us->mh.msg_iov    = us->iov;
+        us->mh.msg_iovlen = 1;
+    } else {
+        /* Slow path for mutable resources (/stats): 2-segment iovec. */
+        const resource_t* res = c->res;
+        int n = 0;
+        size_t head_end = c->head_len;
+        if (c->bytes_sent < head_end) {
+            us->iov[n].iov_base = (void*)(uintptr_t)(c->head_ptr + c->bytes_sent);
+            us->iov[n].iov_len  = head_end - c->bytes_sent;
+            n++;
+        }
+        if (c->send_body && res->body_len) {
+            size_t body_end = head_end + res->body_len;
+            if (c->bytes_sent < body_end) {
+                size_t off = (c->bytes_sent > head_end) ? (c->bytes_sent - head_end) : 0;
+                us->iov[n].iov_base = (void*)(uintptr_t)(res->body + off);
+                us->iov[n].iov_len  = res->body_len - off;
+                n++;
+            }
+        }
+        if (n == 0) return false;
+        memset(&us->mh, 0, sizeof(us->mh));
+        us->mh.msg_iov    = us->iov;
+        us->mh.msg_iovlen = (size_t)n;
+    }
 
     struct io_uring_sqe* sqe = ring_get_sqe(r);
     if (!sqe) return false;
@@ -382,6 +382,7 @@ static void conn_reset_for_next(conn_t* c) {
     c->head_len    = 0;
     c->bytes_sent  = 0;
     c->wire_total  = 0;
+    c->wire_buf    = NULL;
     c->send_body   = false;
     c->active_variant = NULL;
     c->state       = ST_READING;
@@ -397,6 +398,7 @@ static void conn_init_new(conn_t* c, int fd) {
     c->send_body = false;
     c->active_variant = NULL;
     c->wire_total = 0;
+    c->wire_buf = NULL;
     c->bytes_sent = 0;
     c->close_after = false;
     c->req_count = 0;
@@ -411,17 +413,7 @@ static void conn_init_new(conn_t* c, int fd) {
  * or (head + body) for the precomputed compressed variant. Used both
  * to detect "send done" and to pick SENDMSG vs SENDMSG_ZC. */
 static inline size_t conn_total_payload(const conn_t* c) {
-    size_t total = c->head_len;
-    if (c->send_body) {
-        const resource_t* rs = c->res;
-        if (c->active_variant) {
-            total += c->active_variant->body_len;
-        } else {
-            total += rs->body_len;
-            if (rs->chrome) total += rs->chrome->hdr_len + rs->chrome->ftr_len;
-        }
-    }
-    return total;
+    return c->wire_total;
 }
 
 /* Apply parser result + dispatch a response. Returns true on success
@@ -447,12 +439,25 @@ static bool dispatch_one(conn_t* c, const jumptable_t* jt, uint32_t max_req) {
         variant = r->compressed;
 
     c->active_variant = variant;
+
+    /* Select flat wire buffer — same logic as epoll backend. */
     if (variant) {
+        c->wire_buf = close_after ? variant->wire_close : variant->wire_keepalive;
+        c->wire_total = close_after ? variant->wire_close_len : variant->wire_keepalive_len;
         c->head_ptr = close_after ? variant->head_close : variant->head_keepalive;
         c->head_len = close_after ? variant->head_close_len : variant->head_keepalive_len;
-    } else {
+        if (head_only) c->wire_total = c->head_len;
+    } else if (r->wire_keepalive) {
+        c->wire_buf = close_after ? r->wire_close : r->wire_keepalive;
+        c->wire_total = close_after ? r->wire_close_len : r->wire_keepalive_len;
         c->head_ptr = close_after ? r->head_close : r->head_keepalive;
         c->head_len = close_after ? r->head_close_len : r->head_keepalive_len;
+        if (head_only) c->wire_total = c->head_len;
+    } else {
+        c->wire_buf = NULL;
+        c->head_ptr = close_after ? r->head_close : r->head_keepalive;
+        c->head_len = close_after ? r->head_close_len : r->head_keepalive_len;
+        c->wire_total = c->head_len + (head_only ? 0 : r->body_len);
     }
     c->send_body  = !head_only;
     c->bytes_sent = 0;

@@ -29,6 +29,10 @@ typedef struct {
     const char* head_keepalive;  size_t head_keepalive_len;
     const char* head_close;      size_t head_close_len;
     const char* body;            size_t body_len;     /* compressed bytes */
+    /* Flat wire buffers: head || body pre-concatenated at startup.
+     * Eliminates iovec construction and sendmsg overhead on the hot path. */
+    const char* wire_keepalive;  size_t wire_keepalive_len;
+    const char* wire_close;      size_t wire_close_len;
 } __attribute__((aligned(64))) resource_compress_t;
 
 /* A pre-built HTTP response: head (status + headers, ending in \r\n\r\n)
@@ -61,6 +65,11 @@ typedef struct {
     const chrome_t* chrome;      /* NULL if no chrome is applied */
     const resource_compress_t* compressed; /* NULL if no compressed variant */
     const resource_compress_t* brotli;     /* NULL if no Brotli variant */
+    /* Flat wire buffers: head || [chrome.hdr ||] body [|| chrome.ftr]
+     * pre-concatenated at startup. NULL for mutable resources (/stats)
+     * which fall back to the iovec send path. */
+    const char* wire_keepalive;  size_t wire_keepalive_len;
+    const char* wire_close;      size_t wire_close_len;
 } __attribute__((aligned(128))) resource_t;
 
 /* One flat-table slot. value == NULL marks the slot empty.

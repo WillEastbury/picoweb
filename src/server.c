@@ -210,6 +210,7 @@ static void try_accept(int listen_fd, int ep, pool_t* pool, int64_t batch_now_ms
         conn->send_body = false;
         conn->bytes_sent = 0;
         conn->wire_total = 0;
+        conn->wire_buf = NULL;
         conn->close_after = false;
         conn->req_count = 0;
         conn->peer_half_closed = false;
@@ -234,84 +235,90 @@ static void try_accept(int listen_fd, int ep, pool_t* pool, int64_t batch_now_ms
  *   - if no chrome: head || body                       (2 segments)
  *   - if  chrome  : head || chrome.hdr || body || chrome.ftr   (up to 4)
  *
- * The Content-Length baked into head already accounts for the chrome
- * payload, so the receiver sees one logically contiguous body of
- * (hdr+body+ftr) bytes. We walk the segment list against bytes_sent
- * to compute exactly which iovecs to emit on each call; partial sends
- * resume cleanly with no per-conn iovec storage. */
-static int try_send(conn_t* c) {
-    const resource_t* r = c->res;
-    /* When serving a compressed variant, the wire payload is a
-     * single contiguous blob — chrome bytes are baked into it. */
-    bool encoded = (c->active_variant != NULL);
-    const chrome_t* ch = (c->send_body && !encoded) ? r->chrome : NULL;
-    const char* body_ptr = encoded ? c->active_variant->body : r->body;
-    size_t      body_len = encoded ? c->active_variant->body_len : r->body_len;
+ * Most responses use a pre-concatenated flat wire buffer (head + body
+ * in a single contiguous arena allocation). The fast path is a simple
+ * send() loop. For mutable resources (/stats), wire_buf is NULL and
+ * we fall back to the iovec path (head + body as separate segments). */
 
-    /* Build a fixed-size segment table (cheap on the stack). Using a
-     * uniform walker handles both the chrome and no-chrome cases with
-     * no extra branches in the hot loop. */
-    const char* seg_ptr[4];
-    size_t      seg_len[4];
-    int seg_n = 0;
-    seg_ptr[seg_n] = c->head_ptr;     seg_len[seg_n] = c->head_len;     seg_n++;
-    if (c->send_body) {
-        if (ch && ch->hdr_len) {
-            seg_ptr[seg_n] = ch->hdr; seg_len[seg_n] = ch->hdr_len;     seg_n++;
-        }
-        if (body_len) {
-            seg_ptr[seg_n] = body_ptr; seg_len[seg_n] = body_len;       seg_n++;
-        }
-        if (ch && ch->ftr_len) {
-            seg_ptr[seg_n] = ch->ftr; seg_len[seg_n] = ch->ftr_len;     seg_n++;
+/* Slow path for mutable resources (/stats): 2-segment iovec. */
+static int try_send_iovec(conn_t* c) {
+    const resource_t* r = c->res;
+    struct iovec iov[2];
+    int n = 0;
+    size_t cursor = 0;
+
+    /* Segment 0: head */
+    size_t head_end = c->head_len;
+    if (c->bytes_sent < head_end) {
+        size_t off = c->bytes_sent;
+        iov[n].iov_base = (void*)(uintptr_t)(c->head_ptr + off);
+        iov[n].iov_len  = c->head_len - off;
+        n++;
+    }
+    cursor = head_end;
+
+    /* Segment 1: body (if sending) */
+    if (c->send_body && r->body_len) {
+        size_t body_end = cursor + r->body_len;
+        if (c->bytes_sent < body_end) {
+            size_t off = (c->bytes_sent > cursor) ? (c->bytes_sent - cursor) : 0;
+            iov[n].iov_base = (void*)(uintptr_t)(r->body + off);
+            iov[n].iov_len  = r->body_len - off;
+            n++;
         }
     }
 
-    size_t total = c->wire_total;
-
     for (;;) {
-        if (c->bytes_sent >= total) return 1;
-
-        /* Walk segments, skipping fully-sent ones; emit a partial
-         * leading segment if bytes_sent lands mid-segment. */
-        struct iovec iov[4];
-        int n = 0;
-        size_t cursor = 0;
-        for (int i = 0; i < seg_n; i++) {
-            size_t end = cursor + seg_len[i];
-            if (c->bytes_sent >= end) {
-                cursor = end;
-                continue;
-            }
-            size_t off = (c->bytes_sent > cursor) ? (c->bytes_sent - cursor) : 0;
-            iov[n].iov_base = (void*)(uintptr_t)(seg_ptr[i] + off);
-            iov[n].iov_len  = seg_len[i] - off;
-            n++;
-            cursor = end;
-        }
+        if (c->bytes_sent >= c->wire_total) return 1;
+        if (n == 0) return 1;
 
         struct msghdr m = {0};
         m.msg_iov = iov;
         m.msg_iovlen = n;
-        /* MSG_ZEROCOPY pays off only above the configured byte threshold
-         * (kernel docs: roughly >10 KB per send). Below that, the per-
-         * send setup cost regresses throughput. We compute the remaining
-         * payload (total - bytes_sent) so a partial-send tail doesn't
-         * waste setup. The zerocopy_threshold value is set once at
-         * startup and never changes; reading it lockless from many
-         * worker threads is safe. */
-        int sm_flags = MSG_NOSIGNAL;
-        if (g_zc_threshold > 0 && (total - c->bytes_sent) >= g_zc_threshold) {
-            sm_flags |= MSG_ZEROCOPY;
+        ssize_t s = sendmsg(c->fd, &m, MSG_NOSIGNAL);
+        if (s < 0) {
+            if (errno == EINTR) continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
+            return -1;
         }
-        ssize_t s = sendmsg(c->fd, &m, sm_flags);
-        if (s < 0 && errno == ENOBUFS && (sm_flags & MSG_ZEROCOPY)) {
-            /* optmem cap hit — too many in-flight zerocopy sends. Retry
-             * this exact iovec without MSG_ZEROCOPY rather than dropping
-             * the connection. The next loop iteration will try again
-             * once we drain the err queue (signalled via EPOLLERR). */
-            sm_flags &= ~MSG_ZEROCOPY;
-            s = sendmsg(c->fd, &m, sm_flags);
+        if (s == 0) return -1;
+        c->bytes_sent += (size_t)s;
+        if (c->bytes_sent >= c->wire_total) return 1;
+
+        /* Rebuild iovecs for partial send */
+        n = 0;
+        if (c->bytes_sent < head_end) {
+            iov[n].iov_base = (void*)(uintptr_t)(c->head_ptr + c->bytes_sent);
+            iov[n].iov_len  = head_end - c->bytes_sent;
+            n++;
+        }
+        if (c->send_body && r->body_len) {
+            size_t body_end = cursor + r->body_len;
+            if (c->bytes_sent < body_end) {
+                size_t off = (c->bytes_sent > cursor) ? (c->bytes_sent - cursor) : 0;
+                iov[n].iov_base = (void*)(uintptr_t)(r->body + off);
+                iov[n].iov_len  = r->body_len - off;
+                n++;
+            }
+        }
+    }
+}
+
+/* Fast path: flat wire buffer (head + body pre-concatenated). */
+static int try_send(conn_t* c) {
+    if (__builtin_expect(c->wire_buf == NULL, 0))
+        return try_send_iovec(c);
+
+    for (;;) {
+        if (c->bytes_sent >= c->wire_total) return 1;
+        size_t rem = c->wire_total - c->bytes_sent;
+        int flags = MSG_NOSIGNAL;
+        if (g_zc_threshold > 0 && rem >= g_zc_threshold)
+            flags |= MSG_ZEROCOPY;
+        ssize_t s = send(c->fd, c->wire_buf + c->bytes_sent, rem, flags);
+        if (s < 0 && errno == ENOBUFS && (flags & MSG_ZEROCOPY)) {
+            flags &= ~MSG_ZEROCOPY;
+            s = send(c->fd, c->wire_buf + c->bytes_sent, rem, flags);
         }
         if (s < 0) {
             if (errno == EINTR) continue;
@@ -370,32 +377,34 @@ static int dispatch_one(conn_t* c, const jumptable_t* jt, uint32_t max_req) {
         variant = r->compressed;
 
     c->active_variant = variant;
+
+    /* Select flat wire buffer and total. For mutable resources (/stats)
+     * wire_keepalive is NULL — fall back to iovec send path. */
     if (variant) {
+        c->wire_buf = close_after ? variant->wire_close : variant->wire_keepalive;
+        c->wire_total = close_after ? variant->wire_close_len : variant->wire_keepalive_len;
         c->head_ptr = close_after ? variant->head_close      : variant->head_keepalive;
         c->head_len = close_after ? variant->head_close_len  : variant->head_keepalive_len;
-    } else {
+        if (head_only)
+            c->wire_total = c->head_len;
+    } else if (r->wire_keepalive) {
+        c->wire_buf = close_after ? r->wire_close : r->wire_keepalive;
+        c->wire_total = close_after ? r->wire_close_len : r->wire_keepalive_len;
         c->head_ptr = close_after ? r->head_close       : r->head_keepalive;
         c->head_len = close_after ? r->head_close_len   : r->head_keepalive_len;
+        if (head_only)
+            c->wire_total = c->head_len;
+    } else {
+        /* Mutable resource (/stats): no flat wire buffer. */
+        c->wire_buf = NULL;
+        c->head_ptr = close_after ? r->head_close       : r->head_keepalive;
+        c->head_len = close_after ? r->head_close_len   : r->head_keepalive_len;
+        c->wire_total = c->head_len + (head_only ? 0 : r->body_len);
     }
     c->send_body   = !head_only;
     c->bytes_sent  = 0;
     c->close_after = close_after;
     c->state       = ST_WRITING;
-
-    /* Precompute total wire bytes to avoid recomputing in try_send. */
-    {
-        size_t wt = c->head_len;
-        if (!head_only) {
-            if (variant) {
-                wt += variant->body_len;
-            } else {
-                const chrome_t* ch = r->chrome;
-                if (ch) wt += ch->hdr_len + r->body_len + ch->ftr_len;
-                else    wt += r->body_len;
-            }
-        }
-        c->wire_total = wt;
-    }
 
     /* Compact: preserve any leftover bytes (start of next request)
      * at the front of the buffer for after we finish this response. */
@@ -438,6 +447,7 @@ static bool post_send(conn_t* c, int ep, pool_t* pool,
         c->head_len    = 0;
         c->bytes_sent  = 0;
         c->wire_total  = 0;
+        c->wire_buf    = NULL;
         c->send_body   = false;
         c->active_variant = NULL;
         c->state       = ST_READING;

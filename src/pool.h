@@ -28,6 +28,7 @@ typedef struct conn {
     size_t            head_len;
     bool              send_body;
     const resource_compress_t* active_variant; /* non-NULL = serving compressed body */
+    const char*       wire_buf;       /* flat pre-concatenated head+body (NULL for /stats) */
     size_t            wire_total;     /* precomputed total bytes to send */
     size_t            bytes_sent;     /* 0..wire_total */
     bool              close_after;
