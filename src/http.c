@@ -174,6 +174,9 @@ http_result_t http_parse(char* buf, size_t buf_len, http_request_t* out) {
              * (q-values, other tokens) is ignored. */
             if (metal_compress_accepted(tval, tl)) out->accept_pc = true;
             if (brotli_accepted(tval, tl)) out->accept_br = true;
+        } else if (metal_ieq(p, name_len, "If-None-Match", 13)) {
+            out->if_none_match = tval;
+            out->if_none_match_len = tl;
         }
         p = eol + 2;
     }
@@ -236,4 +239,62 @@ const resource_t* http_select(const jumptable_t* jt,
                                            req->path, req->path_len);
     if (!r) return jt->err_404;
     return r;
+}
+
+/* ============================================================== */
+/* ETag / If-None-Match matching (RFC 7232 §3.2)                 */
+/* ============================================================== */
+
+bool etag_matches(const char* inm, size_t inm_len,
+                  const char* etag) {
+    if (!inm || inm_len == 0 || etag[0] == '\0') return false;
+
+    /* Wildcard: matches any current representation. */
+    if (inm_len == 1 && inm[0] == '*') return true;
+
+    /* Extract the opaque-tag from our etag (strip W/ and quotes). */
+    const char* our = etag;
+    size_t our_len = strlen(etag);
+    if (our_len >= 2 && our[0] == 'W' && our[1] == '/') {
+        our += 2; our_len -= 2;
+    }
+    /* our is now "\"<value>\"" — compare including quotes for safety. */
+
+    /* Scan comma-separated tags. */
+    size_t i = 0;
+    while (i < inm_len) {
+        /* Skip OWS and commas. */
+        while (i < inm_len && (inm[i] == ' ' || inm[i] == '\t' ||
+                               inm[i] == ',')) i++;
+        if (i >= inm_len) break;
+
+        /* Parse one entity-tag: optional W/ + quoted-string. */
+        const char* tag_start = inm + i;
+        size_t tag_off = 0;
+
+        /* Skip W/ prefix (weak comparison ignores it). */
+        if (i + 2 <= inm_len && inm[i] == 'W' && inm[i+1] == '/') {
+            i += 2; tag_off += 2;
+        }
+
+        /* Expect opening quote. */
+        if (i >= inm_len || inm[i] != '"') {
+            /* Malformed tag — skip to next comma. */
+            while (i < inm_len && inm[i] != ',') i++;
+            continue;
+        }
+        i++; /* skip opening quote */
+
+        /* Find closing quote. */
+        while (i < inm_len && inm[i] != '"') i++;
+        if (i < inm_len) i++; /* skip closing quote */
+
+        /* The comparable portion is from after W/ to end of quote. */
+        const char* cmp = tag_start + tag_off;
+        size_t cmp_len = (size_t)((inm + i) - cmp);
+
+        if (cmp_len == our_len && memcmp(cmp, our, our_len) == 0)
+            return true;
+    }
+    return false;
 }

@@ -149,6 +149,8 @@ static const char* build_head_local(arena_t* arena,
         "Content-Type: %s\r\n"
         "Content-Length: %zu\r\n"
         "Connection: %s\r\n"
+        "X-Content-Type-Options: nosniff\r\n"
+        "X-Frame-Options: DENY\r\n"
         "%s"
         "\r\n",
         status_line,

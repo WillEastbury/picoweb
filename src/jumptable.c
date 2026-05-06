@@ -403,6 +403,8 @@ static const char* build_head(arena_t* arena,
         "Content-Type: %s\r\n"
         "Content-Length: %zu\r\n"
         "Connection: %s\r\n"
+        "X-Content-Type-Options: nosniff\r\n"
+        "X-Frame-Options: DENY\r\n"
         "%s"
         "\r\n",
         status_line,
@@ -416,6 +418,37 @@ static const char* build_head(arena_t* arena,
     }
     *out_len = (size_t)n;
     /* 64-byte align so head reads land on a fresh cache line. */
+    char* dst = (char*)arena_alloc(arena, (size_t)n, 64);
+    memcpy(dst, buf, (size_t)n);
+    return (const char*)dst;
+}
+
+/* Build a 304 Not Modified response head (no Content-Type/Content-Length).
+ * Includes ETag and any cache/vary metadata from the original response. */
+static const char* build_304_head(arena_t* arena,
+                                  const char* etag,
+                                  const char* cache_vary_header,
+                                  bool keep_alive,
+                                  size_t* out_len) {
+    char buf[512];
+    int n = snprintf(buf, sizeof(buf),
+        "HTTP/1.1 304 Not Modified\r\n"
+        "Server: picoweb\r\n"
+        "Date: %.*s\r\n"
+        "ETag: %s\r\n"
+        "Connection: %s\r\n"
+        "X-Content-Type-Options: nosniff\r\n"
+        "X-Frame-Options: DENY\r\n"
+        "%s"
+        "\r\n",
+        (int)g_date_len, g_date_buf,
+        etag,
+        keep_alive ? "keep-alive" : "close",
+        cache_vary_header ? cache_vary_header : "");
+    if (n <= 0 || (size_t)n >= sizeof(buf)) {
+        metal_die("304 head too long");
+    }
+    *out_len = (size_t)n;
     char* dst = (char*)arena_alloc(arena, (size_t)n, 64);
     memcpy(dst, buf, (size_t)n);
     return (const char*)dst;
@@ -464,6 +497,10 @@ static resource_t* build_resource_chromed(arena_t* arena,
                                    true, extra_header, &r->head_keepalive_len);
     return r;
 }
+
+/* Forward declaration for compute_etag (defined later with wire builders). */
+static void compute_etag(char* out, size_t outsz,
+                         const void* body, size_t body_len);
 
 /* Build a precomputed compressed variant of `r`. Compresses the FULL
  * wire payload (chrome.hdr || body || chrome.ftr) if chromed, else
@@ -514,22 +551,26 @@ static void attach_compressed_variant(arena_t* arena,
     free(tmp);
     if (!body_pc) return;
 
-    /* Step 4: build the variant heads. Only difference vs the normal
-     * head is the extra Content-Encoding line and the new (smaller)
-     * Content-Length. The Vary header tells caches the response
-     * content depends on Accept-Encoding. */
-    static const char kExtra[] =
-        "Content-Encoding: picoweb-compress\r\n"
-        "Vary: Accept-Encoding\r\n";
-
+    /* Step 4: build the variant heads with ETag. */
     resource_compress_t* rc = (resource_compress_t*)
         arena_alloc(arena, sizeof(*rc), 64);
     rc->body = (const char*)body_pc;
     rc->body_len = (size_t)got;
+    memset(rc->etag, 0, sizeof(rc->etag));
+
+    /* Compute ETag from compressed bytes. */
+    compute_etag(rc->etag, sizeof(rc->etag), body_pc, (size_t)got);
+
+    char extra_buf[256];
+    snprintf(extra_buf, sizeof(extra_buf),
+             "Content-Encoding: picoweb-compress\r\n"
+             "Vary: Accept-Encoding\r\n"
+             "ETag: %s\r\n", rc->etag);
+
     rc->head_close = build_head(arena, status_line, mime_type, (size_t)got,
-                                false, kExtra, &rc->head_close_len);
+                                false, extra_buf, &rc->head_close_len);
     rc->head_keepalive = build_head(arena, status_line, mime_type, (size_t)got,
-                                    true, kExtra, &rc->head_keepalive_len);
+                                    true, extra_buf, &rc->head_keepalive_len);
     r->compressed = rc;
 }
 
@@ -571,17 +612,22 @@ static void attach_brotli_variant(arena_t* arena, resource_t* r,
     free(tmp);
     if (!body_br) return;
 
-    /* Build variant headers */
-    char extra[256];
-    snprintf(extra, sizeof(extra),
-             "Content-Encoding: br\r\n"
-             "Vary: Accept-Encoding\r\n"
-             "%s", cache_hdr ? cache_hdr : "");
-
+    /* Build variant headers with ETag */
     resource_compress_t* rc = (resource_compress_t*)
         arena_alloc(arena, sizeof(*rc), 64);
     rc->body = (const char*)body_br;
     rc->body_len = (size_t)got;
+    memset(rc->etag, 0, sizeof(rc->etag));
+
+    compute_etag(rc->etag, sizeof(rc->etag), body_br, (size_t)got);
+
+    char extra[384];
+    snprintf(extra, sizeof(extra),
+             "Content-Encoding: br\r\n"
+             "Vary: Accept-Encoding\r\n"
+             "ETag: %s\r\n"
+             "%s", rc->etag, cache_hdr ? cache_hdr : "");
+
     rc->head_close = build_head(arena, status_line, mime_type, (size_t)got,
                                 false, extra, &rc->head_close_len);
     rc->head_keepalive = build_head(arena, status_line, mime_type, (size_t)got,
@@ -599,6 +645,8 @@ static const char kBody505[] = "<!doctype html><title>505</title><h1>505 HTTP Ve
 /* Forward declarations for wire buffer builders. */
 static void build_wire_resource(arena_t* arena, resource_t* r);
 static void build_wire_variant(arena_t* arena, resource_compress_t* rc);
+static void build_304_resource(arena_t* arena, resource_t* r, const char* cache_vary_header);
+static void build_304_variant(arena_t* arena, resource_compress_t* rc, const char* cache_vary_header);
 
 static void build_canned_errors(jumptable_t* jt) {
     arena_t* a = &jt->arena;
@@ -670,6 +718,19 @@ static int build_url(char* out, size_t outsz,
 }
 
 /* ============================================================== */
+/* ETag computation.                                              */
+/* Format: W/"<body_len_hex>-<fnv64_hex>" — weak validator.       */
+/* Includes body length to reduce collision risk.                 */
+/* ============================================================== */
+
+static void compute_etag(char* out, size_t outsz,
+                         const void* body, size_t body_len) {
+    uint64_t h = metal_fnv1a(body, body_len);
+    snprintf(out, outsz, "W/\"%zx-%016llx\"",
+             body_len, (unsigned long long)h);
+}
+
+/* ============================================================== */
 /* Flat wire buffer construction.                                 */
 /* Pre-concatenate head + body into a single contiguous buffer so */
 /* the hot path can send() from one pointer instead of building   */
@@ -701,6 +762,10 @@ static void build_wire_resource(arena_t* arena, resource_t* r) {
     if (r->chrome && r->chrome->ftr_len) { memcpy(wc + off, r->chrome->ftr, r->chrome->ftr_len); }
     r->wire_close = wc;
     r->wire_close_len = wc_len;
+
+    /* ETag: hash the body portion of the wire buffer (excludes headers). */
+    const char* payload = wk + r->head_keepalive_len;
+    compute_etag(r->etag, sizeof(r->etag), payload, body_total);
 }
 
 static void build_wire_variant(arena_t* arena, resource_compress_t* rc) {
@@ -719,6 +784,30 @@ static void build_wire_variant(arena_t* arena, resource_compress_t* rc) {
     memcpy(wc + rc->head_close_len, rc->body, rc->body_len);
     rc->wire_close = wc;
     rc->wire_close_len = wc_len;
+
+    /* ETag: hash the compressed body bytes. */
+    compute_etag(rc->etag, sizeof(rc->etag), rc->body, rc->body_len);
+}
+
+/* Build pre-rendered 304 Not Modified wire buffers for a resource.
+ * Called after ETags are computed. cache_vary_header is the combined
+ * Cache-Control + Vary lines (or NULL). */
+static void build_304_resource(arena_t* arena, resource_t* r,
+                               const char* cache_vary_header) {
+    if (r->etag[0] == '\0') return;
+    r->wire_304_keepalive = build_304_head(arena, r->etag, cache_vary_header,
+                                           true, &r->wire_304_keepalive_len);
+    r->wire_304_close = build_304_head(arena, r->etag, cache_vary_header,
+                                       false, &r->wire_304_close_len);
+}
+
+static void build_304_variant(arena_t* arena, resource_compress_t* rc,
+                              const char* cache_vary_header) {
+    if (rc->etag[0] == '\0') return;
+    rc->wire_304_keepalive = build_304_head(arena, rc->etag, cache_vary_header,
+                                            true, &rc->wire_304_keepalive_len);
+    rc->wire_304_close = build_304_head(arena, rc->etag, cache_vary_header,
+                                        false, &rc->wire_304_close_len);
 }
 
 /* ============================================================== */
@@ -860,6 +949,39 @@ bool jumptable_build(jumptable_t* jt, const char* wwwroot) {
                     : build_resource(&jt->arena, "HTTP/1.1 200 OK",
                                      mime, body, got, extra_hdr);
 
+                /* Compute ETag from body payload (chrome+body if chromed).
+                 * This is stored in the struct and also needs to be in the
+                 * response headers — but headers are already built above.
+                 * We'll rebuild them with the ETag included. */
+                {
+                    size_t payload_len = got;
+                    const void* payload_ptr = body;
+                    /* For chromed resources, the wire payload includes chrome. */
+                    uint8_t* payload_buf = NULL;
+                    if (is_html && host_chrome) {
+                        payload_len = got + host_chrome->hdr_len + host_chrome->ftr_len;
+                        payload_buf = (uint8_t*)malloc(payload_len);
+                        size_t p = 0;
+                        if (host_chrome->hdr_len) { memcpy(payload_buf + p, host_chrome->hdr, host_chrome->hdr_len); p += host_chrome->hdr_len; }
+                        memcpy(payload_buf + p, body, got); p += got;
+                        if (host_chrome->ftr_len) { memcpy(payload_buf + p, host_chrome->ftr, host_chrome->ftr_len); }
+                        payload_ptr = payload_buf;
+                    }
+                    compute_etag(r->etag, sizeof(r->etag), payload_ptr, payload_len);
+                    if (payload_buf) free(payload_buf);
+
+                    /* Rebuild heads with ETag included. */
+                    char etag_extra[384];
+                    snprintf(etag_extra, sizeof(etag_extra), "ETag: %s\r\n%s",
+                             r->etag, extra_hdr);
+                    r->head_close = build_head(&jt->arena, "HTTP/1.1 200 OK",
+                                              mime, is_html ? (got + (host_chrome ? host_chrome->hdr_len + host_chrome->ftr_len : 0)) : got,
+                                              false, etag_extra, &r->head_close_len);
+                    r->head_keepalive = build_head(&jt->arena, "HTTP/1.1 200 OK",
+                                                  mime, is_html ? (got + (host_chrome ? host_chrome->hdr_len + host_chrome->ftr_len : 0)) : got,
+                                                  true, etag_extra, &r->head_keepalive_len);
+                }
+
                 /* Pre-compress text bodies for clients that opt in
                  * via Accept-Encoding. Variants are dropped silently if
                  * compression doesn't shrink the payload. Computed
@@ -878,6 +1000,22 @@ bool jumptable_build(jumptable_t* jt, const char* wwwroot) {
                     build_wire_variant(&jt->arena, (resource_compress_t*)r->compressed);
                 if (r->brotli)
                     build_wire_variant(&jt->arena, (resource_compress_t*)r->brotli);
+
+                /* Build 304 Not Modified wire buffers for conditional requests. */
+                {
+                    const char* cv_hdr = compressible
+                        ? (is_html ? "Cache-Control: public, max-age=3600\r\nVary: Accept-Encoding\r\n"
+                                   : "Cache-Control: public, max-age=86400\r\nVary: Accept-Encoding\r\n")
+                        : (is_html ? "Cache-Control: public, max-age=3600\r\n"
+                                   : "Cache-Control: public, max-age=86400\r\n");
+                    build_304_resource(&jt->arena, r, cv_hdr);
+                    if (r->compressed)
+                        build_304_variant(&jt->arena, (resource_compress_t*)r->compressed,
+                                          "Cache-Control: public, max-age=86400\r\nVary: Accept-Encoding\r\n");
+                    if (r->brotli)
+                        build_304_variant(&jt->arena, (resource_compress_t*)r->brotli,
+                                          cv_hdr);
+                }
 
                 char url[8192];
                 int ulen = build_url(url, sizeof(url), d->path, d->path_len,

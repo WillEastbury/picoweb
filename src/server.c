@@ -401,6 +401,36 @@ static int dispatch_one(conn_t* c, const jumptable_t* jt, uint32_t max_req) {
         c->head_len = close_after ? r->head_close_len   : r->head_keepalive_len;
         c->wire_total = c->head_len + (head_only ? 0 : r->body_len);
     }
+
+    /* ETag / 304 Not Modified: if the client sent If-None-Match and it
+     * matches the selected variant's ETag, override with the pre-built
+     * 304 wire buffer. Only for successful GET/HEAD on static resources. */
+    if (pr == HTTP_OK && req.if_none_match &&
+        (req.method == M_GET || req.method == M_HEAD)) {
+        const char* etag;
+        const char* w304;
+        size_t w304_len;
+        if (variant) {
+            etag = variant->etag;
+            w304 = close_after ? variant->wire_304_close : variant->wire_304_keepalive;
+            w304_len = close_after ? variant->wire_304_close_len : variant->wire_304_keepalive_len;
+        } else if (r->etag[0] != '\0') {
+            etag = r->etag;
+            w304 = close_after ? r->wire_304_close : r->wire_304_keepalive;
+            w304_len = close_after ? r->wire_304_close_len : r->wire_304_keepalive_len;
+        } else {
+            etag = NULL; w304 = NULL; w304_len = 0;
+        }
+        if (etag && w304 && etag_matches(req.if_none_match,
+                                          req.if_none_match_len, etag)) {
+            c->wire_buf = w304;
+            c->wire_total = w304_len;
+            c->head_ptr = w304;
+            c->head_len = w304_len;
+            head_only = true;  /* no body for 304 */
+        }
+    }
+
     c->send_body   = !head_only;
     c->bytes_sent  = 0;
     c->close_after = close_after;

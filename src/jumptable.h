@@ -33,6 +33,10 @@ typedef struct {
      * Eliminates iovec construction and sendmsg overhead on the hot path. */
     const char* wire_keepalive;  size_t wire_keepalive_len;
     const char* wire_close;      size_t wire_close_len;
+    /* ETag + 304 Not Modified support. */
+    char        etag[32];        /* W/"<len>-<fnv64>" */
+    const char* wire_304_keepalive;  size_t wire_304_keepalive_len;
+    const char* wire_304_close;      size_t wire_304_close_len;
 } __attribute__((aligned(64))) resource_compress_t;
 
 /* A pre-built HTTP response: head (status + headers, ending in \r\n\r\n)
@@ -70,6 +74,10 @@ typedef struct {
      * which fall back to the iovec send path. */
     const char* wire_keepalive;  size_t wire_keepalive_len;
     const char* wire_close;      size_t wire_close_len;
+    /* ETag + 304 Not Modified support. etag[0]=='\0' means no ETag. */
+    char        etag[32];        /* W/"<len>-<fnv64>" */
+    const char* wire_304_keepalive;  size_t wire_304_keepalive_len;
+    const char* wire_304_close;      size_t wire_304_close_len;
 } __attribute__((aligned(128))) resource_t;
 
 /* One flat-table slot. value == NULL marks the slot empty.
