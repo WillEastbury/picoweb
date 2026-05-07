@@ -452,18 +452,20 @@ void* tls_worker_main(void* arg) {
     if (!cfg->tls_ifname || !cfg->tls_ifname[0]) metal_die("tls_worker_main: --tls-ifname is required");
     if (!cfg->tls_cert_path || !cfg->tls_key_path) metal_die("tls_worker_main: resolved TLS cert/key paths are required");
 
-    tls_worker_ctx_t w;
-    memset(&w, 0, sizeof(w));
-    w.cfg = cfg;
-    for (unsigned i = 0; i < TCP_TABLE_SIZE; i++) w.conns[i].in_use = 0;
+    /* Heap-allocate: each conn carries ~90KB of TLS buffers, so the
+     * full context can exceed the 2MB thread stack at modest table sizes. */
+    tls_worker_ctx_t* w = (tls_worker_ctx_t*)calloc(1, sizeof(tls_worker_ctx_t));
+    if (!w) metal_die("tls_worker_main: OOM allocating worker context");
+    w->cfg = cfg;
+    for (unsigned i = 0; i < TCP_TABLE_SIZE; i++) w->conns[i].in_use = 0;
 
-    if (load_cert_material(&w) != 0) {
+    if (load_cert_material(w) != 0) {
         metal_die("tls_worker_main: failed loading TLS cert/key");
     }
-    if (w.key_type != CERT_KEY_ED25519 && w.key_type != CERT_KEY_RSA) {
+    if (w->key_type != CERT_KEY_ED25519 && w->key_type != CERT_KEY_RSA) {
         const char* kt = "unknown";
-        if (w.key_type == CERT_KEY_RSA) kt = "rsa";
-        else if (w.key_type == CERT_KEY_ECDSA_P256) kt = "ecdsa-p256";
+        if (w->key_type == CERT_KEY_RSA) kt = "rsa";
+        else if (w->key_type == CERT_KEY_ECDSA_P256) kt = "ecdsa-p256";
         metal_die("tls_worker_main: key type '%s' loaded but handshake signing for this type is not implemented yet (supported: Ed25519, RSA-PSS)", kt);
     }
 
@@ -480,19 +482,19 @@ void* tls_worker_main(void* arg) {
         metal_die("tls_worker_main: invalid --tls-peer-mac format (expected xx:xx:xx:xx:xx:xx)");
     }
     if (cfg->tls_use_xdp) {
-        w.io_mode = TLS_IO_AF_XDP;
-        if (af_xdp_open(&w.xdp, cfg->tls_ifname, cfg->tls_xdp_queue, local_mac, peer_mac) != 0) {
+        w->io_mode = TLS_IO_AF_XDP;
+        if (af_xdp_open(&w->xdp, cfg->tls_ifname, cfg->tls_xdp_queue, local_mac, peer_mac) != 0) {
             metal_die("tls_worker_main: af_xdp_open(ifname=%s queue=%u)", cfg->tls_ifname, cfg->tls_xdp_queue);
         }
     } else {
-        w.io_mode = TLS_IO_AF_PACKET;
-        if (af_packet_open(&w.afp, cfg->tls_ifname, local_mac, peer_mac) != 0) {
+        w->io_mode = TLS_IO_AF_PACKET;
+        if (af_packet_open(&w->afp, cfg->tls_ifname, local_mac, peer_mac) != 0) {
             metal_die("tls_worker_main: af_packet_open(ifname=%s)", cfg->tls_ifname);
         }
     }
 
-    pw_dispatch_init(&w.dispatch);
-    svc_state_t svc_state = { .w = &w };
+    pw_dispatch_init(&w->dispatch);
+    svc_state_t svc_state = { .w = w };
     pw_service_t svc = {
         .proto = PW_PROTO_TCP,
         .port = (uint16_t)cfg->port,
@@ -501,17 +503,17 @@ void* tls_worker_main(void* arg) {
         .on_data = tls_on_data,
         .on_close = tls_on_close,
     };
-    if (pw_dispatch_register(&w.dispatch, &svc) != 0) {
+    if (pw_dispatch_register(&w->dispatch, &svc) != 0) {
         metal_die("tls_worker_main: dispatch register failed");
     }
-    if (tcp_attach_dispatch(&w.stack, local_ip, &w.dispatch) != 0) {
+    if (tcp_attach_dispatch(&w->stack, local_ip, &w->dispatch) != 0) {
         metal_die("tls_worker_main: tcp_attach_dispatch failed");
     }
 
-    emit_ctx_t emit_ctx = { .w = &w };
+    emit_ctx_t emit_ctx = { .w = w };
     metal_log("worker %d ready: listen=:%d if=%s backend=tls io=%s cert=%s key=%s",
               cfg->worker_index, cfg->port, cfg->tls_ifname,
-              w.io_mode == TLS_IO_AF_XDP ? "af_xdp" : "af_packet",
+              w->io_mode == TLS_IO_AF_XDP ? "af_xdp" : "af_packet",
               cfg->tls_cert_path, cfg->tls_key_path);
 
     uint64_t last_tick_ms = 0;
@@ -520,20 +522,20 @@ void* tls_worker_main(void* arg) {
         const uint8_t* ip = NULL;
         size_t ip_len = 0;
         int csum_not_ready = 0;
-        int rr = (w.io_mode == TLS_IO_AF_XDP)
-                   ? af_xdp_recv(&w.xdp, frame, sizeof(frame), &ip, &ip_len)
-                   : af_packet_recv(&w.afp, frame, sizeof(frame), &ip, &ip_len,
+        int rr = (w->io_mode == TLS_IO_AF_XDP)
+                   ? af_xdp_recv(&w->xdp, frame, sizeof(frame), &ip, &ip_len)
+                   : af_packet_recv(&w->afp, frame, sizeof(frame), &ip, &ip_len,
                                     &csum_not_ready);
         if (rr == 0) {
             tcp_seg_t seg;
             if (ip_tcp_parse_ex(ip, ip_len, &seg, csum_not_ready) == 0) {
                 uint64_t now = (uint64_t)metal_now_ms();
-                tcp_input_at(&w.stack, &seg, now, NULL, NULL, emit_seg, &emit_ctx);
+                tcp_input_at(&w->stack, &seg, now, NULL, NULL, emit_seg, &emit_ctx);
             }
         }
         uint64_t now = (uint64_t)metal_now_ms();
         if (now - last_tick_ms >= 10) {
-            tcp_tick(&w.stack, now, emit_seg, &emit_ctx);
+            tcp_tick(&w->stack, now, emit_seg, &emit_ctx);
             last_tick_ms = now;
         }
     }
