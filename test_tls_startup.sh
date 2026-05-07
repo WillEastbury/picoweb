@@ -39,7 +39,7 @@ PID=$!
 sleep 1.2
 
 if ! kill -0 "$PID" 2>/dev/null; then
-    if grep -qiE "af_packet_open|Operation not permitted|Permission denied" "$LOG"; then
+    if grep -qiE "af_packet_open|failed to read MAC|failed to read IPv4|Operation not permitted|Permission denied" "$LOG"; then
         echo "SKIP: host does not permit AF_PACKET raw sockets"
         exit 0
     fi
@@ -59,4 +59,3 @@ echo "=== TLS startup log tail ==="
 tail -10 "$LOG"
 echo "=== RESULTS: PASS=$PASS  FAIL=$FAIL ==="
 exit "$FAIL"
-

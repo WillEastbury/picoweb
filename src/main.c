@@ -16,7 +16,7 @@
 
 static void usage(const char* argv0) {
     fprintf(stderr,
-        "usage: %s [--io_uring | --dpdk | --tls] [--sqpoll [--sqpoll-cpu=N]] [--tls-cert=PATH --tls-key=PATH --tls-ifname=IFACE [--tls-peer-mac=MAC]] [PORT] [WWWROOT] [WORKERS] [MAXREQS] [ZC_MIN] [POOL_CAP]\n"
+        "usage: %s [--io_uring | --dpdk | --tls] [--sqpoll [--sqpoll-cpu=N]] [--tls-cert=PATH --tls-key=PATH --tls-ifname=IFACE [--tls-peer-mac=MAC] [--tls-xdp [--tls-xdp-queue=N]]] [PORT] [WWWROOT] [WORKERS] [MAXREQS] [ZC_MIN] [POOL_CAP]\n"
         "\n"
         "  --io_uring   use the io_uring worker backend (Linux 5.6+, no liburing)\n"
         "  --dpdk       use the DPDK userspace backend (NOT BUILT — see\n"
@@ -30,6 +30,8 @@ static void usage(const char* argv0) {
         "                   picoweb searches /certs/tls.key then ./certs/tls.key)\n"
         "  --tls-ifname=IFACE  interface for userspace packet I/O (required with --tls)\n"
         "  --tls-peer-mac=MAC  optional fixed L2 peer MAC hint for --tls\n"
+        "  --tls-xdp           use AF_XDP socket I/O for --tls backend (copy mode)\n"
+        "  --tls-xdp-queue=N   AF_XDP queue id (default 0)\n"
         "  --sqpoll     enable IORING_SETUP_SQPOLL: kernel polls our SQ,\n"
         "               eliminating io_uring_enter() syscalls on the submit\n"
         "               path. Costs one kernel thread per worker. Requires\n"
@@ -65,6 +67,8 @@ int main(int argc, char** argv) {
     const char* tls_key_cli = NULL;
     const char* tls_ifname = NULL;
     const char* tls_peer_mac = NULL;
+    bool tls_use_xdp = false;
+    uint32_t tls_xdp_queue = 0;
 
     /* Two-pass parse: lift flags out of argv first, then handle the
      * remaining positional args exactly as before. This keeps the
@@ -147,6 +151,21 @@ int main(int argc, char** argv) {
             }
             continue;
         }
+        if (strcmp(argv[i], "--tls-xdp") == 0) {
+            tls_use_xdp = true;
+            continue;
+        }
+        if (strncmp(argv[i], "--tls-xdp-queue=", 16) == 0) {
+            char* end = NULL;
+            unsigned long q = strtoul(argv[i] + 16, &end, 10);
+            if (end == argv[i] + 16 || *end != '\0' || q > 4096) {
+                fprintf(stderr, "picoweb: invalid --tls-xdp-queue value\n");
+                return 1;
+            }
+            tls_use_xdp = true;
+            tls_xdp_queue = (uint32_t)q;
+            continue;
+        }
         if (npos < (int)(sizeof(pos)/sizeof(pos[0]))) {
             pos[npos++] = argv[i];
         } else {
@@ -201,7 +220,7 @@ int main(int argc, char** argv) {
         fprintf(stderr, "picoweb: --sqpoll requires --io_uring\n");
         return 1;
     }
-    if ((tls_cert_cli || tls_key_cli || tls_ifname || tls_peer_mac) &&
+    if ((tls_cert_cli || tls_key_cli || tls_ifname || tls_peer_mac || tls_use_xdp) &&
         backend != PICOWEB_BACKEND_TLS) {
         fprintf(stderr, "picoweb: --tls-* flags require --tls\n");
         return 1;
@@ -279,6 +298,8 @@ int main(int argc, char** argv) {
         cfgs[i].tls_key_path          = tls_key_path[0] ? tls_key_path : NULL;
         cfgs[i].tls_ifname            = tls_ifname;
         cfgs[i].tls_peer_mac          = tls_peer_mac;
+        cfgs[i].tls_use_xdp           = tls_use_xdp;
+        cfgs[i].tls_xdp_queue         = tls_xdp_queue;
         /* SQPOLL kernel-thread CPU policy: avoid pinning the kernel
          * polling thread to the same core as its userspace worker
          * (worker i is pinned to (i % nproc)) — they'd thrash one

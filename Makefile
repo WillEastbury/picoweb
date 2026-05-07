@@ -18,6 +18,7 @@ USERSPACE_TLS_SRC := \
 	userspace/tcp/ip.c \
 	userspace/tcp/tcp.c \
 	userspace/io/af_packet.c \
+	userspace/io/af_xdp.c \
 	userspace/crypto/util.c \
 	userspace/crypto/cpuid.c \
 	userspace/crypto/sha256.c \
