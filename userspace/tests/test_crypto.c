@@ -3493,7 +3493,9 @@ static void test_engine_handshake_server(void) {
         pw_tls_engine_t* eng = malloc(sizeof(*eng));
         if (!eng) { printf("  FAIL: alloc\n"); g_fail++; return; }
         pw_tls_engine_init(eng);
-        if (pw_tls_engine_configure_server(eng, test_rng, &rng_st, seed,
+        if (pw_tls_engine_configure_server(eng, test_rng, &rng_st,
+                                           TLS13_SIG_SCHEME_ED25519, seed,
+                                           NULL, 0,
                                            fake_cert, fake_lens, 1) == 0)
              { printf("  PASS: configure_server accepted\n"); g_pass++; }
         else { printf("  FAIL: configure_server\n"); g_fail++; free(eng); return; }
@@ -3656,7 +3658,9 @@ static void test_engine_handshake_server(void) {
         pw_tls_engine_t* eng = malloc(sizeof(*eng));
         pw_tls_engine_init(eng);
         rng_st.next = 0;
-        pw_tls_engine_configure_server(eng, test_rng, &rng_st, seed,
+        pw_tls_engine_configure_server(eng, test_rng, &rng_st,
+                                       TLS13_SIG_SCHEME_ED25519, seed,
+                                       NULL, 0,
                                        fake_cert, fake_lens, 1);
 
         uint8_t ch_rec[2048];
@@ -3684,7 +3688,9 @@ static void test_engine_handshake_server(void) {
         pw_tls_engine_t* eng = malloc(sizeof(*eng));
         pw_tls_engine_init(eng);
         rng_st.next = 0;
-        pw_tls_engine_configure_server(eng, test_rng, &rng_st, seed,
+        pw_tls_engine_configure_server(eng, test_rng, &rng_st,
+                                       TLS13_SIG_SCHEME_ED25519, seed,
+                                       NULL, 0,
                                        fake_cert, fake_lens, 1);
 
         uint8_t ch_rec[2048];
@@ -3706,7 +3712,9 @@ static void test_engine_handshake_server(void) {
         pw_tls_engine_t* eng = malloc(sizeof(*eng));
         pw_tls_engine_init(eng);
         rng_st.next = 0;
-        pw_tls_engine_configure_server(eng, test_rng, &rng_st, seed,
+        pw_tls_engine_configure_server(eng, test_rng, &rng_st,
+                                       TLS13_SIG_SCHEME_ED25519, seed,
+                                       NULL, 0,
                                        fake_cert, fake_lens, 1);
 
         uint8_t low_order[32] = {0}; /* point at infinity, X25519 -> 0 */
@@ -3737,7 +3745,9 @@ static void test_engine_handshake_server(void) {
         pw_tls_engine_t* eng = malloc(sizeof(*eng));
         pw_tls_engine_init(eng);
         rng_st.next = 0;
-        pw_tls_engine_configure_server(eng, test_rng, &rng_st, seed,
+        pw_tls_engine_configure_server(eng, test_rng, &rng_st,
+                                       TLS13_SIG_SCHEME_ED25519, seed,
+                                       NULL, 0,
                                        fake_cert, fake_lens, 1);
 
         uint8_t ch_rec[2048];
@@ -3828,7 +3838,9 @@ static void test_engine_handshake_roundtrip(void) {
     pw_tls_engine_t* eng = malloc(sizeof(*eng));
     pw_tls_engine_init(eng);
     test_rng_state_t rng_st = { .next = 0 };
-    if (pw_tls_engine_configure_server(eng, test_rng, &rng_st, srv_seed,
+    if (pw_tls_engine_configure_server(eng, test_rng, &rng_st,
+                                       TLS13_SIG_SCHEME_ED25519, srv_seed,
+                                       NULL, 0,
                                        cert_chain, cert_lens, 1) == 0)
          { printf("  PASS: configure_server\n"); g_pass++; }
     else { printf("  FAIL: configure_server\n"); g_fail++; free(eng); return; }
@@ -4269,7 +4281,9 @@ static void test_engine_tolerates_dummy_ccs_split(void) {
     pw_tls_engine_t* eng = malloc(sizeof(*eng));
     pw_tls_engine_init(eng);
     test_rng_state_t rng_st = { .next = 0 };
-    pw_tls_engine_configure_server(eng, test_rng, &rng_st, srv_seed,
+    pw_tls_engine_configure_server(eng, test_rng, &rng_st,
+                                   TLS13_SIG_SCHEME_ED25519, srv_seed,
+                                   NULL, 0,
                                    cert_chain, cert_lens, 1);
 
     uint8_t srv_eph_priv[32];
@@ -4374,7 +4388,9 @@ static void test_engine_fatal_wipes_tx_and_keys(void) {
     pw_tls_engine_t* eng = malloc(sizeof(*eng));
     pw_tls_engine_init(eng);
     test_rng_state_t rng_st = { .next = 0 };
-    pw_tls_engine_configure_server(eng, test_rng, &rng_st, srv_seed,
+    pw_tls_engine_configure_server(eng, test_rng, &rng_st,
+                                   TLS13_SIG_SCHEME_ED25519, srv_seed,
+                                   NULL, 0,
                                    cert_chain, cert_lens, 1);
 
     /* Drive CH -> AFTER_SF_AWAIT_CF (server flight already in TX). */
@@ -4477,7 +4493,9 @@ static void test_engine_last_error_protocol(void) {
     pw_tls_engine_t* eng = malloc(sizeof(*eng));
     pw_tls_engine_init(eng);
     test_rng_state_t rng_st = { .next = 0 };
-    pw_tls_engine_configure_server(eng, test_rng, &rng_st, srv_seed,
+    pw_tls_engine_configure_server(eng, test_rng, &rng_st,
+                                   TLS13_SIG_SCHEME_ED25519, srv_seed,
+                                   NULL, 0,
                                    cert_chain, cert_lens, 1);
 
     /* Minimum-length malformed record: type=22 OK, version high byte
@@ -4567,7 +4585,9 @@ static void test_engine_tolerates_dummy_ccs(void) {
     pw_tls_engine_t* eng = malloc(sizeof(*eng));
     pw_tls_engine_init(eng);
     test_rng_state_t rng_st = { .next = 0 };
-    pw_tls_engine_configure_server(eng, test_rng, &rng_st, srv_seed,
+    pw_tls_engine_configure_server(eng, test_rng, &rng_st,
+                                   TLS13_SIG_SCHEME_ED25519, srv_seed,
+                                   NULL, 0,
                                    cert_chain, cert_lens, 1);
 
     uint8_t srv_eph_priv[32];
@@ -5136,7 +5156,9 @@ static void test_engine_psk_resumption(void) {
     pw_tls_engine_t* eng = malloc(sizeof(*eng));
     pw_tls_engine_init(eng);
     test_rng_state_t rng = { .next = 0 };
-    if (pw_tls_engine_configure_server(eng, test_rng, &rng, srv_seed,
+    if (pw_tls_engine_configure_server(eng, test_rng, &rng,
+                                       TLS13_SIG_SCHEME_ED25519, srv_seed,
+                                       NULL, 0,
                                        fake_cert, cert_lens, 1) != 0)
          { printf("  FAIL: configure_server\n"); g_fail++; free(eng); return; }
     pw_tls_engine_attach_resumption(eng, &store);
@@ -5291,7 +5313,9 @@ static void test_engine_0rtt_acceptance(void) {
     pw_tls_engine_t* eng = malloc(sizeof(*eng));
     pw_tls_engine_init(eng);
     test_rng_state_t rng = { .next = 0 };
-    if (pw_tls_engine_configure_server(eng, test_rng, &rng, srv_seed,
+    if (pw_tls_engine_configure_server(eng, test_rng, &rng,
+                                       TLS13_SIG_SCHEME_ED25519, srv_seed,
+                                       NULL, 0,
                                        fake_cert, cert_lens, 1) != 0)
          { printf("  FAIL: configure_server\n"); g_fail++; free(eng); return; }
     pw_tls_engine_attach_resumption(eng, &store);

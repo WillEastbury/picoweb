@@ -57,13 +57,11 @@ typedef struct {
     int      offers_x25519;
     uint8_t  ecdhe_pubkey[32];
 
-    /* Whether the client advertised ed25519 (0x0807) in
-     * signature_algorithms (and, if present, in
-     * signature_algorithms_cert). RFC 8446 §4.2.3 / §4.2.3a.
-     * If signature_algorithms_cert is absent (the common case),
-     * signature_algorithms is used for both signing and cert
-     * selection — that is the test we apply here. */
+    /* Signature scheme support from signature_algorithms (and, if
+     * present, signature_algorithms_cert). RFC 8446 §4.2.3 / §4.2.3a. */
     int      offers_ed25519;
+    int      offers_rsa_pss_rsae_sha256;
+    int      offers_ecdsa_secp256r1_sha256;
 
     /* legacy_session_id<0..32>. RFC 8446 §4.1.2. The server MUST
      * echo this back in ServerHello (compat-mode interop with TLS
@@ -246,6 +244,8 @@ int tls13_derive_resumption_psk(const uint8_t resumption_master_secret[32],
  */
 
 #define TLS13_SIG_SCHEME_ED25519 0x0807u
+#define TLS13_SIG_SCHEME_RSA_PSS_RSAE_SHA256 0x0804u
+#define TLS13_SIG_SCHEME_ECDSA_SECP256R1_SHA256 0x0403u
 
 /* ASCII labels — 33 bytes each (no NUL). */
 #define TLS13_CV_LABEL_SERVER "TLS 1.3, server CertificateVerify"
@@ -286,6 +286,18 @@ int tls13_build_certificate_verify_signed_data(uint8_t out[TLS13_CV_SIGNED_LEN],
 int tls13_build_certificate_verify(uint8_t* out, size_t out_cap,
                                    const uint8_t transcript_hash[32],
                                    const uint8_t seed[32]);
+
+/* Generic CertificateVerify builder:
+ *  - Ed25519: uses `seed_ed25519`
+ *  - RSA-PSS-RSAE-SHA256: uses `key_der/key_der_len` (PKCS#1 or PKCS#8 RSA key)
+ * Returns bytes written (>0) or -1 on error / unsupported scheme. */
+int tls13_build_certificate_verify_ex(uint8_t* out, size_t out_cap,
+                                      const uint8_t transcript_hash[32],
+                                      uint16_t sig_scheme,
+                                      const uint8_t seed_ed25519[32],
+                                      const uint8_t* key_der, size_t key_der_len,
+                                      const uint8_t* rsa_pss_salt,
+                                      size_t rsa_pss_salt_len);
 
 /* Compute the TLS 1.3 handshake-phase secrets per RFC 8446 §7.1.
  *

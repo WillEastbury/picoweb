@@ -17,6 +17,7 @@ CRYPTO_SRC := \
     ../crypto/sha256_armv8.c     \
     ../crypto/sha512.c           \
     ../crypto/ed25519.c          \
+    ../crypto/rsa.c              \
     ../crypto/pool.c             \
     ../crypto/hmac.c             \
     ../crypto/hkdf.c             \

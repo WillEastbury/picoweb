@@ -26,6 +26,7 @@ USERSPACE_TLS_SRC := \
 	userspace/crypto/sha256_armv8.c \
 	userspace/crypto/sha512.c \
 	userspace/crypto/ed25519.c \
+	userspace/crypto/rsa.c \
 	userspace/crypto/hmac.c \
 	userspace/crypto/hkdf.c \
 	userspace/crypto/chacha20.c \

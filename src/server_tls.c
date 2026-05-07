@@ -63,6 +63,9 @@ struct tls_worker_ctx {
     unsigned n_certs;
     cert_key_type_t key_type;
     uint8_t  ed25519_seed[32];
+    uint8_t* key_der;
+    size_t   key_der_len;
+    uint16_t cert_sig_scheme;
 };
 
 static int rng_fill(void* user, uint8_t* dst, size_t n) {
@@ -164,14 +167,18 @@ static int load_cert_material(tls_worker_ctx_t* w) {
     w->key_type = e.key_type;
     if (w->key_type == CERT_KEY_ED25519) {
         if (cert_extract_ed25519_seed(&e, w->ed25519_seed) != 0) goto fail;
+        w->cert_sig_scheme = TLS13_SIG_SCHEME_ED25519;
+    } else if (w->key_type == CERT_KEY_RSA) {
+        w->cert_sig_scheme = TLS13_SIG_SCHEME_RSA_PSS_RSAE_SHA256;
     }
 
     w->cert_chain_der = chain;
     w->cert_chain_len = (size_t)chain_len;
+    w->key_der = key_der;
+    w->key_der_len = (size_t)key_len;
 
     free(cert_pem);
     free(key_pem);
-    free(key_der);
     return 0;
 fail:
     free(cert_pem);
@@ -320,7 +327,10 @@ static void* tls_on_open(void* svc_state, const pw_conn_info_t* info) {
         tls_bridge_init(&c->bridge, w->cfg->jt);
         pw_tls_engine_init(&c->eng);
         if (pw_tls_engine_configure_server(&c->eng, rng_fill, NULL,
+                                           w->cert_sig_scheme,
                                            w->ed25519_seed,
+                                           w->key_der,
+                                           w->key_der_len,
                                            w->cert_chain_der,
                                            w->cert_lens,
                                            w->n_certs) != 0) {
@@ -446,13 +456,13 @@ void* tls_worker_main(void* arg) {
     for (unsigned i = 0; i < TCP_TABLE_SIZE; i++) w.conns[i].in_use = 0;
 
     if (load_cert_material(&w) != 0) {
-        metal_die("tls_worker_main: failed loading TLS cert/key (need Ed25519 PKCS#8 key)");
+        metal_die("tls_worker_main: failed loading TLS cert/key");
     }
-    if (w.key_type != CERT_KEY_ED25519) {
+    if (w.key_type != CERT_KEY_ED25519 && w.key_type != CERT_KEY_RSA) {
         const char* kt = "unknown";
         if (w.key_type == CERT_KEY_RSA) kt = "rsa";
         else if (w.key_type == CERT_KEY_ECDSA_P256) kt = "ecdsa-p256";
-        metal_die("tls_worker_main: key type '%s' loaded but handshake signing for this type is not implemented yet (current: Ed25519 only)", kt);
+        metal_die("tls_worker_main: key type '%s' loaded but handshake signing for this type is not implemented yet (supported: Ed25519, RSA-PSS)", kt);
     }
 
     uint8_t local_mac[6];
