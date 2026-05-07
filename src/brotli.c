@@ -825,36 +825,8 @@ size_t brotli_bound(size_t input_len) {
 }
 
 bool brotli_accepted(const char* ae, size_t len) {
-    for (size_t i = 0; i + 2 <= len; i++) {
-        if (ae[i] == 'b' && ae[i + 1] == 'r') {
-            /* Check left boundary */
-            if (i > 0 && ae[i-1] != ',' && ae[i-1] != ' ' && ae[i-1] != '\t')
-                continue;
-            /* Check right boundary */
-            if (i + 2 < len && ae[i+2] != ',' && ae[i+2] != ' ' &&
-                ae[i+2] != '\t' && ae[i+2] != ';')
-                continue;
-            /* Check for q=0 */
-            size_t j = i + 2;
-            while (j < len && (ae[j] == ' ' || ae[j] == '\t')) j++;
-            if (j < len && ae[j] == ';') {
-                j++;
-                while (j < len && (ae[j] == ' ' || ae[j] == '\t')) j++;
-                if (j + 1 < len && ae[j] == 'q' && ae[j+1] == '=') {
-                    j += 2;
-                    if (j < len && ae[j] == '0') {
-                        size_t k = j + 1;
-                        bool is_zero = true;
-                        if (k < len && ae[k] == '.') {
-                            for (k++; k < len && ae[k] >= '0' && ae[k] <= '9'; k++)
-                                if (ae[k] != '0') is_zero = false;
-                        }
-                        if (is_zero) continue;
-                    }
-                }
-            }
-            return true;
-        }
-    }
+    /* Brotli encoder disabled — stream validation pending.
+     * Browsers receive identity or gzip (via reverse proxy). */
+    (void)ae; (void)len;
     return false;
 }

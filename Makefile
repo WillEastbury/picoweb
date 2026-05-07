@@ -53,6 +53,9 @@ all: $(BIN)
 $(BIN): $(OBJ)
 	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
+src/brotli.o: src/brotli.c
+	$(CC) $(CFLAGS) -fno-lto -O1 -c -o $@ $<
+
 src/%.o: src/%.c
 	$(CC) $(CFLAGS) -c -o $@ $<
 
