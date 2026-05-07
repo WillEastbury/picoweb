@@ -524,7 +524,7 @@ static void attach_compressed_variant(arena_t* arena,
     size_t hdr_len = r->chrome ? r->chrome->hdr_len : 0;
     size_t ftr_len = r->chrome ? r->chrome->ftr_len : 0;
     size_t raw_len = hdr_len + r->body_len + ftr_len;
-    if (raw_len == 0) return;
+    if (raw_len == 0 || raw_len < hdr_len) return; /* overflow guard */
 
     uint8_t* raw = (uint8_t*)malloc(raw_len);
     if (!raw) return;
@@ -586,7 +586,7 @@ static void attach_brotli_variant(arena_t* arena, resource_t* r,
     size_t hdr_len = r->chrome ? r->chrome->hdr_len : 0;
     size_t ftr_len = r->chrome ? r->chrome->ftr_len : 0;
     size_t raw_len = hdr_len + r->body_len + ftr_len;
-    if (raw_len == 0) return;
+    if (raw_len == 0 || raw_len < hdr_len) return; /* overflow guard */
 
     uint8_t* raw = (uint8_t*)malloc(raw_len);
     if (!raw) return;
@@ -858,6 +858,16 @@ bool jumptable_build(jumptable_t* jt, const char* wwwroot) {
      * resource_compress_t struct + two variant heads. We budget for
      * this against EVERY body byte (cheap over-approximation; the
      * bound is tight on text and a no-op on binary). */
+    /* Checked arena capacity — guard against size_t overflow on extreme
+     * site trees.  Each addend is individually bounded by SIZE_MAX/16
+     * so the running sum cannot wrap with fewer than 16 terms. */
+    #define SAFE_CAP (SIZE_MAX / 16)
+    if (total_bytes > SAFE_CAP || total_entries > SAFE_CAP / 1024 ||
+        slot_count > SAFE_CAP / sizeof(flat_slot_t)) {
+        metal_log("error: site tree too large for arena sizing");
+        build_free(hosts);
+        return false;
+    }
     size_t arena_cap = total_bytes
                      + total_bytes * 6 / 5         /* compressed copies */
                      + total_bytes * 6 / 5         /* brotli copies */
@@ -870,6 +880,7 @@ bool jumptable_build(jumptable_t* jt, const char* wwwroot) {
                      + total_chrome_bytes
                      + total_hosts * 128         /* chrome_t per host (aligned 64) */
                      + 64 * 1024;
+    #undef SAFE_CAP
     if (!arena_init(&jt->arena, arena_cap)) {
         metal_log("error: arena_init(%zu) failed", arena_cap);
         build_free(hosts);
@@ -961,6 +972,7 @@ bool jumptable_build(jumptable_t* jt, const char* wwwroot) {
                     if (is_html && host_chrome) {
                         payload_len = got + host_chrome->hdr_len + host_chrome->ftr_len;
                         payload_buf = (uint8_t*)malloc(payload_len);
+                        if (!payload_buf) { free(body); continue; }
                         size_t p = 0;
                         if (host_chrome->hdr_len) { memcpy(payload_buf + p, host_chrome->hdr, host_chrome->hdr_len); p += host_chrome->hdr_len; }
                         memcpy(payload_buf + p, body, got); p += got;

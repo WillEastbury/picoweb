@@ -386,7 +386,7 @@ static void conn_reset_for_next(conn_t* c) {
     c->send_body   = false;
     c->active_variant = NULL;
     c->state       = ST_READING;
-    c->last_active_ms = metal_now_ms();
+    c->last_active_ms = metal_now_ms_coarse();
 }
 
 static void conn_init_new(conn_t* c, int fd) {
@@ -404,7 +404,7 @@ static void conn_init_new(conn_t* c, int fd) {
     c->req_count = 0;
     c->peer_half_closed = false;
     c->req_start_tsc = 0;
-    c->last_active_ms = metal_now_ms();
+    c->last_active_ms = metal_now_ms_coarse();
     c->epoll_mask = 0;
 }
 
@@ -622,7 +622,7 @@ void* uring_worker_main(void* arg) {
                     continue;
                 }
                 c->read_off += (size_t)res;
-                c->last_active_ms = metal_now_ms();
+                c->last_active_ms = metal_now_ms_coarse();
 
                 if (!dispatch_one(c, cfg->jt, cfg->max_requests_per_conn)) {
                     if (submit_close(&r, c->fd, idx)) to_submit++;
