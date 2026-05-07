@@ -5,21 +5,31 @@
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
+#include <limits.h>
 
 #include "jumptable.h"
 #include "metrics.h"
 #include "server.h"
 #include "simd.h"
+#include "tls_certs.h"
 #include "util.h"
 
 static void usage(const char* argv0) {
     fprintf(stderr,
-        "usage: %s [--io_uring | --dpdk] [--sqpoll [--sqpoll-cpu=N]] [PORT] [WWWROOT] [WORKERS] [MAXREQS] [ZC_MIN] [POOL_CAP]\n"
+        "usage: %s [--io_uring | --dpdk | --tls] [--sqpoll [--sqpoll-cpu=N]] [--tls-cert=PATH --tls-key=PATH --tls-ifname=IFACE [--tls-peer-mac=MAC]] [PORT] [WWWROOT] [WORKERS] [MAXREQS] [ZC_MIN] [POOL_CAP]\n"
         "\n"
         "  --io_uring   use the io_uring worker backend (Linux 5.6+, no liburing)\n"
         "  --dpdk       use the DPDK userspace backend (NOT BUILT — see\n"
         "               userspace/DESIGN.md; the flag is reserved and will\n"
         "               error out at startup until the integration ships)\n"
+        "  --tls        use userspace TCP+TLS backend scaffold (AF_PACKET path;\n"
+        "               requires --tls-ifname and cert/key resolution)\n"
+        "  --tls-cert=PATH  TLS certificate PEM path (optional; if omitted\n"
+        "                   picoweb searches /certs/tls.crt then ./certs/tls.crt)\n"
+        "  --tls-key=PATH   TLS private key PEM path (optional; if omitted\n"
+        "                   picoweb searches /certs/tls.key then ./certs/tls.key)\n"
+        "  --tls-ifname=IFACE  interface for userspace packet I/O (required with --tls)\n"
+        "  --tls-peer-mac=MAC  optional fixed L2 peer MAC hint for --tls\n"
         "  --sqpoll     enable IORING_SETUP_SQPOLL: kernel polls our SQ,\n"
         "               eliminating io_uring_enter() syscalls on the submit\n"
         "               path. Costs one kernel thread per worker. Requires\n"
@@ -36,7 +46,7 @@ static void usage(const char* argv0) {
         "  POOL_CAP  max concurrent connections per worker (default 4096;\n"
         "            each slot costs ~8KB RSS — use 64-256 for low-traffic sites)\n"
         "\n"
-        "Default backend is epoll. --io_uring and --dpdk are mutually exclusive.\n",
+        "Default backend is epoll. --io_uring / --dpdk / --tls are mutually exclusive.\n",
         argv0);
 }
 
@@ -51,6 +61,10 @@ int main(int argc, char** argv) {
     picoweb_backend_t backend = PICOWEB_BACKEND_EPOLL;
     bool sqpoll = false;
     int  sqpoll_cpu = -1;
+    const char* tls_cert_cli = NULL;
+    const char* tls_key_cli = NULL;
+    const char* tls_ifname = NULL;
+    const char* tls_peer_mac = NULL;
 
     /* Two-pass parse: lift flags out of argv first, then handle the
      * remaining positional args exactly as before. This keeps the
@@ -64,7 +78,7 @@ int main(int argc, char** argv) {
         if (strcmp(argv[i], "--io_uring") == 0 ||
             strcmp(argv[i], "--io-uring") == 0) {
             if (backend != PICOWEB_BACKEND_EPOLL) {
-                fprintf(stderr, "picoweb: --io_uring and --dpdk are mutually exclusive\n");
+                fprintf(stderr, "picoweb: --io_uring / --dpdk / --tls are mutually exclusive\n");
                 return 1;
             }
             backend = PICOWEB_BACKEND_URING;
@@ -72,10 +86,18 @@ int main(int argc, char** argv) {
         }
         if (strcmp(argv[i], "--dpdk") == 0) {
             if (backend != PICOWEB_BACKEND_EPOLL) {
-                fprintf(stderr, "picoweb: --io_uring and --dpdk are mutually exclusive\n");
+                fprintf(stderr, "picoweb: --io_uring / --dpdk / --tls are mutually exclusive\n");
                 return 1;
             }
             backend = PICOWEB_BACKEND_DPDK;
+            continue;
+        }
+        if (strcmp(argv[i], "--tls") == 0) {
+            if (backend != PICOWEB_BACKEND_EPOLL) {
+                fprintf(stderr, "picoweb: --io_uring / --dpdk / --tls are mutually exclusive\n");
+                return 1;
+            }
+            backend = PICOWEB_BACKEND_TLS;
             continue;
         }
         if (strcmp(argv[i], "--sqpoll") == 0) {
@@ -91,6 +113,38 @@ int main(int argc, char** argv) {
             }
             sqpoll = true;
             sqpoll_cpu = (int)c;
+            continue;
+        }
+        if (strncmp(argv[i], "--tls-cert=", 11) == 0) {
+            tls_cert_cli = argv[i] + 11;
+            if (!tls_cert_cli[0]) {
+                fprintf(stderr, "picoweb: --tls-cert requires a non-empty path\n");
+                return 1;
+            }
+            continue;
+        }
+        if (strncmp(argv[i], "--tls-key=", 10) == 0) {
+            tls_key_cli = argv[i] + 10;
+            if (!tls_key_cli[0]) {
+                fprintf(stderr, "picoweb: --tls-key requires a non-empty path\n");
+                return 1;
+            }
+            continue;
+        }
+        if (strncmp(argv[i], "--tls-ifname=", 13) == 0) {
+            tls_ifname = argv[i] + 13;
+            if (!tls_ifname[0]) {
+                fprintf(stderr, "picoweb: --tls-ifname requires a non-empty interface name\n");
+                return 1;
+            }
+            continue;
+        }
+        if (strncmp(argv[i], "--tls-peer-mac=", 15) == 0) {
+            tls_peer_mac = argv[i] + 15;
+            if (!tls_peer_mac[0]) {
+                fprintf(stderr, "picoweb: --tls-peer-mac requires a non-empty MAC string\n");
+                return 1;
+            }
             continue;
         }
         if (npos < (int)(sizeof(pos)/sizeof(pos[0]))) {
@@ -147,6 +201,11 @@ int main(int argc, char** argv) {
         fprintf(stderr, "picoweb: --sqpoll requires --io_uring\n");
         return 1;
     }
+    if ((tls_cert_cli || tls_key_cli || tls_ifname || tls_peer_mac) &&
+        backend != PICOWEB_BACKEND_TLS) {
+        fprintf(stderr, "picoweb: --tls-* flags require --tls\n");
+        return 1;
+    }
 
     /* Reject --dpdk early — before spawning workers and binding ports
      * — so operators get a clean error instead of partially-started
@@ -160,6 +219,22 @@ int main(int argc, char** argv) {
         return 2;
     }
 
+    char tls_cert_path[PATH_MAX];
+    char tls_key_path[PATH_MAX];
+    tls_cert_path[0] = '\0';
+    tls_key_path[0] = '\0';
+    if (backend == PICOWEB_BACKEND_TLS) {
+        if (!tls_ifname || !tls_ifname[0]) {
+            fprintf(stderr, "picoweb: --tls requires --tls-ifname=IFACE\n");
+            return 1;
+        }
+        if (picoweb_tls_locate_certs(tls_cert_cli, tls_key_cli,
+                                     tls_cert_path, tls_key_path,
+                                     sizeof(tls_cert_path), NULL) != 0) {
+            return 1;
+        }
+    }
+
     /* Pick the worker entrypoint up-front so each worker is launched
      * with the right loop. */
     void* (*worker_fn)(void*) = NULL;
@@ -168,6 +243,7 @@ int main(int argc, char** argv) {
     case PICOWEB_BACKEND_EPOLL: worker_fn = epoll_worker_main; backend_name = "epoll"; break;
     case PICOWEB_BACKEND_URING: worker_fn = uring_worker_main; backend_name = "io_uring"; break;
     case PICOWEB_BACKEND_DPDK:  worker_fn = dpdk_worker_main;  backend_name = "dpdk";  break;
+    case PICOWEB_BACKEND_TLS:   worker_fn = tls_worker_main;   backend_name = "tls";   break;
     }
 
     /* SIGPIPE: ignore so writes to a peer-closed socket return EPIPE
@@ -199,6 +275,10 @@ int main(int argc, char** argv) {
         cfgs[i].worker_index          = (int)i;
         cfgs[i].zerocopy_threshold    = (size_t)zc_min;
         cfgs[i].sqpoll                = sqpoll;
+        cfgs[i].tls_cert_path         = tls_cert_path[0] ? tls_cert_path : NULL;
+        cfgs[i].tls_key_path          = tls_key_path[0] ? tls_key_path : NULL;
+        cfgs[i].tls_ifname            = tls_ifname;
+        cfgs[i].tls_peer_mac          = tls_peer_mac;
         /* SQPOLL kernel-thread CPU policy: avoid pinning the kernel
          * polling thread to the same core as its userspace worker
          * (worker i is pinned to (i % nproc)) — they'd thrash one
