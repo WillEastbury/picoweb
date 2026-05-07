@@ -234,14 +234,25 @@ static void try_accept(int listen_fd, int ep, pool_t* pool, int64_t batch_now_ms
 /* Send                                                           */
 /* ============================================================== */
 
+/* Shared connection-tail segments. The head buffer does NOT contain
+ * a Connection header or the final blank line (\r\n\r\n). These
+ * static tails are appended as a separate iovec segment at send time.
+ *
+ * HTTP/1.1 defaults to keep-alive, so the common path sends only the
+ * blank-line terminator. Connection: close is explicit when needed. */
+static const char CONN_KA[]    = "\r\n";                          /* 2 bytes */
+static const char CONN_CLOSE[] = "Connection: close\r\n\r\n";    /* 24 bytes */
+#define CONN_KA_LEN    (sizeof(CONN_KA) - 1)
+#define CONN_CLOSE_LEN (sizeof(CONN_CLOSE) - 1)
+
 /* Push as much of the prepared response out as possible. Returns:
  *   1  - response fully sent
  *   0  - partial / EAGAIN (still ST_WRITING)
  *  -1  - socket error / closed; caller should close_conn()
  *
  * Wire layout:
- *   - if no chrome: head || body                       (2 segments)
- *   - if  chrome  : head || chrome.hdr || body || chrome.ftr   (up to 4)
+ *   - if no chrome: head || conn_tail || body                 (3 segments)
+ *   - if  chrome  : head || conn_tail || chrome.hdr || body || chrome.ftr (up to 5)
  *
  * All responses use iovec-based sendmsg. Body data is stored ONCE
  * in the arena — no pre-concatenated wire buffers. Partial sends
@@ -269,7 +280,7 @@ static __attribute__((hot)) int try_send(conn_t* c) {
     for (;;) {
         if (c->bytes_sent >= c->wire_total) return 1;
 
-        struct iovec iov[4];
+        struct iovec iov[METAL_MAX_SEGS];
         int n = build_iov(c, iov);
         if (n == 0) return 1;
 
@@ -342,22 +353,25 @@ static __attribute__((hot)) int dispatch_one(conn_t* c, const jumptable_t* jt, u
 
     c->active_variant = variant;
 
-    /* Build iovec segments: head + body pieces.
-     * Compressed variants: 2 segments (head + compressed_body).
-     * Identity chromed:    4 segments (head + chrome.hdr + body + chrome.ftr).
-     * Identity plain:      2 segments (head + body).
-     * 304 / HEAD:          1 segment  (head only). */
+    /* Build iovec segments: head + conn_tail + body pieces.
+     * Compressed variants: 3 segments (head + conn_tail + compressed_body).
+     * Identity chromed:    5 segments (head + conn_tail + chrome.hdr + body + chrome.ftr).
+     * Identity plain:      3 segments (head + conn_tail + body).
+     * 304 / HEAD:          2 segments (head + conn_tail). */
     {
-        const char* head = close_after
-            ? (variant ? variant->head_close       : r->head_close)
-            : (variant ? variant->head_keepalive   : r->head_keepalive);
-        size_t head_len = close_after
-            ? (variant ? variant->head_close_len   : r->head_close_len)
-            : (variant ? variant->head_keepalive_len : r->head_keepalive_len);
+        const char* head = variant ? variant->head : r->head;
+        size_t head_len  = variant ? variant->head_len : r->head_len;
 
         int ns = 0;
         c->segs[ns].ptr = head;
         c->segs[ns].len = head_len;
+        ns++;
+
+        /* Connection tail: HTTP/1.1 defaults to keep-alive, so the
+         * common path sends only "\r\n" (header terminator). Only
+         * "Connection: close\r\n\r\n" when closing. */
+        c->segs[ns].ptr = close_after ? CONN_CLOSE : CONN_KA;
+        c->segs[ns].len = close_after ? CONN_CLOSE_LEN : CONN_KA_LEN;
         ns++;
 
         if (!head_only) {
@@ -394,7 +408,7 @@ static __attribute__((hot)) int dispatch_one(conn_t* c, const jumptable_t* jt, u
 
     /* ETag / 304 Not Modified: if the client sent If-None-Match and it
      * matches the selected variant's ETag, override with the pre-built
-     * 304 wire buffer (single segment, no body). */
+     * 304 wire buffer + conn tail (two segments, no body). */
     if (pr == HTTP_OK && req.if_none_match &&
         (req.method == M_GET || req.method == M_HEAD)) {
         const char* etag;
@@ -402,12 +416,12 @@ static __attribute__((hot)) int dispatch_one(conn_t* c, const jumptable_t* jt, u
         size_t w304_len;
         if (variant) {
             etag = variant->etag;
-            w304 = close_after ? variant->wire_304_close : variant->wire_304_keepalive;
-            w304_len = close_after ? variant->wire_304_close_len : variant->wire_304_keepalive_len;
+            w304 = variant->wire_304;
+            w304_len = variant->wire_304_len;
         } else if (r->etag[0] != '\0') {
             etag = r->etag;
-            w304 = close_after ? r->wire_304_close : r->wire_304_keepalive;
-            w304_len = close_after ? r->wire_304_close_len : r->wire_304_keepalive_len;
+            w304 = r->wire_304;
+            w304_len = r->wire_304_len;
         } else {
             etag = NULL; w304 = NULL; w304_len = 0;
         }
@@ -415,8 +429,10 @@ static __attribute__((hot)) int dispatch_one(conn_t* c, const jumptable_t* jt, u
                                           req.if_none_match_len, etag)) {
             c->segs[0].ptr = w304;
             c->segs[0].len = w304_len;
-            c->seg_count = 1;
-            c->wire_total = w304_len;
+            c->segs[1].ptr = close_after ? CONN_CLOSE : CONN_KA;
+            c->segs[1].len = close_after ? CONN_CLOSE_LEN : CONN_KA_LEN;
+            c->seg_count = 2;
+            c->wire_total = w304_len + c->segs[1].len;
             head_only = true;
         }
     }

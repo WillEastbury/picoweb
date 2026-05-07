@@ -7,6 +7,11 @@
 
 #include "arena.h"
 
+/* Maximum iovec segments per response. Used for conn_t.segs[],
+ * uring_state_t.iov[], and stack iov[] arrays. Max layout is:
+ *   head + conn_tail + chrome.hdr + body + chrome.ftr = 5. */
+#define METAL_MAX_SEGS 6
+
 /* A per-host header/footer "chrome" pair. Bytes live in the immutable
  * arena. Shared across every HTML resource for the host, so the
  * memory cost is per-host, not per-resource. */
@@ -18,54 +23,54 @@ typedef struct {
 /* A pre-built compressed variant of a resource. The compressed payload
  * is the FULL response body (chrome.hdr || body || chrome.ftr if chromed,
  * else just body) compressed once at startup. At send time the response
- * is assembled as iovec(head, body) — two segments, no copies.
+ * is assembled as iovec(head, conn_tail, body) — three segments.
+ *
+ * The head buffer does NOT contain a Connection header or final CRLF;
+ * the caller appends a shared connection-tail segment at send time.
+ * This eliminates the keepalive/close header duplication.
  *
  * Lives in the immutable arena. Built only for compressible MIME
  * types (text slash any, application/json, application/javascript,
  * application/xml, image/svg+xml) and only kept if it actually
  * shrinks the payload. */
 typedef struct {
-    const char* head_keepalive;  size_t head_keepalive_len;
-    const char* head_close;      size_t head_close_len;
+    const char* head;            size_t head_len;
     const char* body;            size_t body_len;     /* compressed bytes */
     /* ETag + 304 Not Modified support. */
     char        etag[32];        /* W/"<len>-<fnv64>" */
-    const char* wire_304_keepalive;  size_t wire_304_keepalive_len;
-    const char* wire_304_close;      size_t wire_304_close_len;
+    const char* wire_304;        size_t wire_304_len;
 } __attribute__((aligned(64))) resource_compress_t;
 
-/* A pre-built HTTP response: head (status + headers, ending in \r\n\r\n)
- * in two flavours, plus an optional body and optional chrome.
+/* A pre-built HTTP response. The head contains status + headers ending
+ * in \r\n but WITHOUT a Connection header or the final blank line.
+ * At send time the caller appends a shared connection-tail segment:
+ *   keep-alive: "\r\n"              (HTTP/1.1 default, no explicit header)
+ *   close:      "Connection: close\r\n\r\n"
  *
- * For a chrome'd HTML page the wire payload is up to four iovec
- * segments: head || chrome->hdr || body || chrome->ftr. Total length
- * (= what Content-Length: in the head bakes in) is precomputed at
- * build time. No body copies — all pointers reference immutable arena.
+ * For a chrome'd HTML page the wire payload is up to five iovec
+ * segments: head || conn_tail || chrome->hdr || body || chrome->ftr.
+ * Total Content-Length (in the head) = body + chrome; it does NOT
+ * include head or conn_tail.
  *
  * For non-HTML or no-chrome resources, chrome == NULL and the iovec
- * collapses to 2 entries (head + body).
+ * collapses to 3 entries (head + conn_tail + body).
  *
- * The optional `compressed` pointer references a precomputed
- * `resource_compress_t` for clients that send Accept-Encoding:
- * picoweb-compress (or BareMetal.Compress legacy alias). NULL if
- * compression wasn't worth it (e.g. binary payload, or compressed
- * size exceeded original).
+ * The optional `compressed` / `brotli` pointers reference precomputed
+ * compressed variants. NULL if compression wasn't worth it.
  *
  * All pointers reference either immutable arena memory or, for the
  * /stats endpoint specifically, a fixed-length writable region that
  * the metrics updater rewrites in place. Aligned to 128B so the hot
  * fields share cache lines. */
 typedef struct {
-    const char* head_keepalive;  size_t head_keepalive_len;
-    const char* head_close;      size_t head_close_len;
+    const char* head;            size_t head_len;
     const char* body;            size_t body_len;
     const chrome_t* chrome;      /* NULL if no chrome is applied */
     const resource_compress_t* compressed; /* NULL if no compressed variant */
     const resource_compress_t* brotli;     /* NULL if no Brotli variant */
     /* ETag + 304 Not Modified support. etag[0]=='\0' means no ETag. */
     char        etag[32];        /* W/"<len>-<fnv64>" */
-    const char* wire_304_keepalive;  size_t wire_304_keepalive_len;
-    const char* wire_304_close;      size_t wire_304_close_len;
+    const char* wire_304;        size_t wire_304_len;
 } __attribute__((aligned(128))) resource_t;
 
 /* One flat-table slot. value == NULL marks the slot empty.

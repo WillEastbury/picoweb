@@ -22,9 +22,9 @@
  *
  * Same business logic as the epoll worker:
  *   - http_parse → http_select → swap to compressed variant if accepted
- *   - sendmsg with up to 4 iovecs (head + chrome.hdr + body + chrome.ftr)
- *     which collapses to (head_pc + body_pc) when serving the precomputed
- *     compressed variant.
+ *   - sendmsg with up to METAL_MAX_SEGS iovecs (head + conn_tail +
+ *     chrome.hdr + body + chrome.ftr) which collapses to (head + conn_tail
+ *     + body_br) when serving the precomputed compressed variant.
  *
  * What's NOT in the spike (call out in README):
  *   - Multishot accept / recv (works on 5.19+; we use one-shot for
@@ -77,6 +77,12 @@
 extern metrics_t* g_metrics;
 extern int        g_n_workers;
 extern __thread metrics_t* g_worker_metrics;
+
+/* Shared connection-tail segments — same as server.c. */
+static const char CONN_KA[]    = "\r\n";
+static const char CONN_CLOSE[] = "Connection: close\r\n\r\n";
+#define CONN_KA_LEN    (sizeof(CONN_KA) - 1)
+#define CONN_CLOSE_LEN (sizeof(CONN_CLOSE) - 1)
 
 /* ============================================================== */
 /* Raw io_uring syscalls.                                         */
@@ -259,7 +265,7 @@ static inline uint64_t ud_idx(uint64_t ud) { return ud & 0x00ffffffffffffffULL; 
 /* ============================================================== */
 
 typedef struct {
-    struct iovec  iov[4];
+    struct iovec  iov[METAL_MAX_SEGS];
     struct msghdr mh;
     uint8_t       in_flight;     /* OP_* of the current submitted op (0 = none) */
     uint8_t       last_was_zc;   /* did the most recent send use SENDMSG_ZC?    */
@@ -422,18 +428,19 @@ static bool dispatch_one(conn_t* c, const jumptable_t* jt, uint32_t max_req) {
 
     c->active_variant = variant;
 
-    /* Build iovec segments — same logic as epoll backend. */
+    /* Build iovec segments — same logic as epoll backend.
+     * head + conn_tail + body pieces. */
     {
-        const char* head = close_after
-            ? (variant ? variant->head_close       : r->head_close)
-            : (variant ? variant->head_keepalive   : r->head_keepalive);
-        size_t head_len = close_after
-            ? (variant ? variant->head_close_len   : r->head_close_len)
-            : (variant ? variant->head_keepalive_len : r->head_keepalive_len);
+        const char* head = variant ? variant->head : r->head;
+        size_t head_len  = variant ? variant->head_len : r->head_len;
 
         int ns = 0;
         c->segs[ns].ptr = head;
         c->segs[ns].len = head_len;
+        ns++;
+
+        c->segs[ns].ptr = close_after ? CONN_CLOSE : CONN_KA;
+        c->segs[ns].len = close_after ? CONN_CLOSE_LEN : CONN_KA_LEN;
         ns++;
 
         if (!head_only) {
@@ -474,12 +481,12 @@ static bool dispatch_one(conn_t* c, const jumptable_t* jt, uint32_t max_req) {
         size_t w304_len;
         if (variant) {
             etag = variant->etag;
-            w304 = close_after ? variant->wire_304_close : variant->wire_304_keepalive;
-            w304_len = close_after ? variant->wire_304_close_len : variant->wire_304_keepalive_len;
+            w304 = variant->wire_304;
+            w304_len = variant->wire_304_len;
         } else if (r->etag[0] != '\0') {
             etag = r->etag;
-            w304 = close_after ? r->wire_304_close : r->wire_304_keepalive;
-            w304_len = close_after ? r->wire_304_close_len : r->wire_304_keepalive_len;
+            w304 = r->wire_304;
+            w304_len = r->wire_304_len;
         } else {
             etag = NULL; w304 = NULL; w304_len = 0;
         }
@@ -487,8 +494,10 @@ static bool dispatch_one(conn_t* c, const jumptable_t* jt, uint32_t max_req) {
                                           req.if_none_match_len, etag)) {
             c->segs[0].ptr = w304;
             c->segs[0].len = w304_len;
-            c->seg_count = 1;
-            c->wire_total = w304_len;
+            c->segs[1].ptr = close_after ? CONN_CLOSE : CONN_KA;
+            c->segs[1].len = close_after ? CONN_CLOSE_LEN : CONN_KA_LEN;
+            c->seg_count = 2;
+            c->wire_total = w304_len + c->segs[1].len;
             head_only = true;
         }
     }

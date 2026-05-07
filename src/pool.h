@@ -24,10 +24,10 @@ typedef struct conn {
 
     /* Write side — segment pointers into immutable arena memory.
      * Assembled in dispatch_one; consumed by writev-based try_send.
-     * Up to 4 segments: head + [chrome.hdr +] body [+ chrome.ftr].
-     * Compressed variants collapse to 2 (head + compressed body). */
+     * Up to 5 segments: head + conn_tail + [chrome.hdr +] body [+ chrome.ftr].
+     * Compressed variants collapse to 3 (head + conn_tail + body). */
     const resource_t* res;
-    struct { const char* ptr; size_t len; } segs[4];
+    struct { const char* ptr; size_t len; } segs[METAL_MAX_SEGS];
     uint8_t           seg_count;
     bool              send_body;
     const resource_compress_t* active_variant; /* non-NULL = serving compressed body */

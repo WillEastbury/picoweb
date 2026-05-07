@@ -392,7 +392,6 @@ static const char* build_head(arena_t* arena,
                               const char* status_line,
                               const char* mime_type,
                               size_t body_len,
-                              bool keep_alive,
                               const char* extra_header,
                               size_t* out_len) {
     char buf[1024];
@@ -402,16 +401,13 @@ static const char* build_head(arena_t* arena,
         "Date: %.*s\r\n"
         "Content-Type: %s\r\n"
         "Content-Length: %zu\r\n"
-        "Connection: %s\r\n"
         "X-Content-Type-Options: nosniff\r\n"
         "X-Frame-Options: DENY\r\n"
-        "%s"
-        "\r\n",
+        "%s",
         status_line,
         (int)g_date_len, g_date_buf,
         mime_type,
         body_len,
-        keep_alive ? "keep-alive" : "close",
         extra_header ? extra_header : "");
     if (n <= 0 || (size_t)n >= sizeof(buf)) {
         metal_die("response head too long for status %s", status_line);
@@ -424,11 +420,12 @@ static const char* build_head(arena_t* arena,
 }
 
 /* Build a 304 Not Modified response head (no Content-Type/Content-Length).
- * Includes ETag and any cache/vary metadata from the original response. */
+ * Includes ETag and any cache/vary metadata from the original response.
+ * Does NOT include Connection header or final blank line — caller
+ * appends a shared connection-tail segment at send time. */
 static const char* build_304_head(arena_t* arena,
                                   const char* etag,
                                   const char* cache_vary_header,
-                                  bool keep_alive,
                                   size_t* out_len) {
     char buf[512];
     int n = snprintf(buf, sizeof(buf),
@@ -436,14 +433,11 @@ static const char* build_304_head(arena_t* arena,
         "Server: picoweb\r\n"
         "Date: %.*s\r\n"
         "ETag: %s\r\n"
-        "Connection: %s\r\n"
         "X-Content-Type-Options: nosniff\r\n"
         "X-Frame-Options: DENY\r\n"
-        "%s"
-        "\r\n",
+        "%s",
         (int)g_date_len, g_date_buf,
         etag,
-        keep_alive ? "keep-alive" : "close",
         cache_vary_header ? cache_vary_header : "");
     if (n <= 0 || (size_t)n >= sizeof(buf)) {
         metal_die("304 head too long");
@@ -465,10 +459,8 @@ static resource_t* build_resource(arena_t* arena,
     r->chrome = NULL;
     r->compressed = NULL;
     r->brotli = NULL;
-    r->head_close = build_head(arena, status_line, mime_type, body_len,
-                               false, extra_header, &r->head_close_len);
-    r->head_keepalive = build_head(arena, status_line, mime_type, body_len,
-                                   true, extra_header, &r->head_keepalive_len);
+    r->head = build_head(arena, status_line, mime_type, body_len,
+                         extra_header, &r->head_len);
     return r;
 }
 
@@ -491,10 +483,8 @@ static resource_t* build_resource_chromed(arena_t* arena,
     r->chrome = chrome;
     r->compressed = NULL;
     r->brotli = NULL;
-    r->head_close = build_head(arena, status_line, mime_type, total_payload,
-                               false, extra_header, &r->head_close_len);
-    r->head_keepalive = build_head(arena, status_line, mime_type, total_payload,
-                                   true, extra_header, &r->head_keepalive_len);
+    r->head = build_head(arena, status_line, mime_type, total_payload,
+                         extra_header, &r->head_len);
     return r;
 }
 
@@ -567,10 +557,8 @@ static void attach_compressed_variant(arena_t* arena,
              "Vary: Accept-Encoding\r\n"
              "ETag: %s\r\n", rc->etag);
 
-    rc->head_close = build_head(arena, status_line, mime_type, (size_t)got,
-                                false, extra_buf, &rc->head_close_len);
-    rc->head_keepalive = build_head(arena, status_line, mime_type, (size_t)got,
-                                    true, extra_buf, &rc->head_keepalive_len);
+    rc->head = build_head(arena, status_line, mime_type, (size_t)got,
+                          extra_buf, &rc->head_len);
     r->compressed = rc;
 }
 
@@ -628,10 +616,8 @@ static void attach_brotli_variant(arena_t* arena, resource_t* r,
              "ETag: %s\r\n"
              "%s", rc->etag, cache_hdr ? cache_hdr : "");
 
-    rc->head_close = build_head(arena, status_line, mime_type, (size_t)got,
-                                false, extra, &rc->head_close_len);
-    rc->head_keepalive = build_head(arena, status_line, mime_type, (size_t)got,
-                                    true, extra, &rc->head_keepalive_len);
+    rc->head = build_head(arena, status_line, mime_type, (size_t)got,
+                          extra, &rc->head_len);
     r->brotli = rc;
 }
 
@@ -735,19 +721,15 @@ static void compute_etag(char* out, size_t outsz,
 static void build_304_resource(arena_t* arena, resource_t* r,
                                const char* cache_vary_header) {
     if (r->etag[0] == '\0') return;
-    r->wire_304_keepalive = build_304_head(arena, r->etag, cache_vary_header,
-                                           true, &r->wire_304_keepalive_len);
-    r->wire_304_close = build_304_head(arena, r->etag, cache_vary_header,
-                                       false, &r->wire_304_close_len);
+    r->wire_304 = build_304_head(arena, r->etag, cache_vary_header,
+                                 &r->wire_304_len);
 }
 
 static void build_304_variant(arena_t* arena, resource_compress_t* rc,
                               const char* cache_vary_header) {
     if (rc->etag[0] == '\0') return;
-    rc->wire_304_keepalive = build_304_head(arena, rc->etag, cache_vary_header,
-                                            true, &rc->wire_304_keepalive_len);
-    rc->wire_304_close = build_304_head(arena, rc->etag, cache_vary_header,
-                                        false, &rc->wire_304_close_len);
+    rc->wire_304 = build_304_head(arena, rc->etag, cache_vary_header,
+                                  &rc->wire_304_len);
 }
 
 /* ============================================================== */
@@ -932,12 +914,9 @@ bool jumptable_build(jumptable_t* jt, const char* wwwroot) {
                     char etag_extra[384];
                     snprintf(etag_extra, sizeof(etag_extra), "ETag: %s\r\n%s",
                              r->etag, extra_hdr);
-                    r->head_close = build_head(&jt->arena, "HTTP/1.1 200 OK",
+                    r->head = build_head(&jt->arena, "HTTP/1.1 200 OK",
                                               mime, is_html ? (got + (host_chrome ? host_chrome->hdr_len + host_chrome->ftr_len : 0)) : got,
-                                              false, etag_extra, &r->head_close_len);
-                    r->head_keepalive = build_head(&jt->arena, "HTTP/1.1 200 OK",
-                                                  mime, is_html ? (got + (host_chrome ? host_chrome->hdr_len + host_chrome->ftr_len : 0)) : got,
-                                                  true, etag_extra, &r->head_keepalive_len);
+                                              etag_extra, &r->head_len);
                 }
 
                 /* Pre-compress text bodies for clients that opt in

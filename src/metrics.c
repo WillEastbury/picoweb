@@ -132,12 +132,13 @@ void metrics_init(int n_workers) {
  * =========================================================== */
 
 /* Build a head string in arena. Same shape as jumptable.c's build_head
- * but inlined here so we don't have to expose the static helper. */
+ * but inlined here so we don't have to expose the static helper.
+ * Does NOT include Connection header or final blank line — the caller
+ * appends a shared connection-tail segment at send time. */
 static const char* build_head_local(arena_t* arena,
                                     const char* status_line,
                                     const char* mime,
                                     size_t body_len,
-                                    bool keep_alive,
                                     const char* date_buf, size_t date_len,
                                     const char* extra_header,
                                     size_t* out_len) {
@@ -148,16 +149,13 @@ static const char* build_head_local(arena_t* arena,
         "Date: %.*s\r\n"
         "Content-Type: %s\r\n"
         "Content-Length: %zu\r\n"
-        "Connection: %s\r\n"
         "X-Content-Type-Options: nosniff\r\n"
         "X-Frame-Options: DENY\r\n"
-        "%s"
-        "\r\n",
+        "%s",
         status_line,
         (int)date_len, date_buf,
         mime,
         body_len,
-        keep_alive ? "keep-alive" : "close",
         extra_header ? extra_header : "");
     if (n <= 0 || (size_t)n >= sizeof(buf)) {
         metal_die("metrics head too long for %s", status_line);
@@ -184,12 +182,9 @@ void metrics_build_resources(arena_t* arena,
         memset(r, 0, sizeof(*r));
         r->body = health_body;
         r->body_len = 2;
-        r->head_close = build_head_local(arena, "HTTP/1.1 200 OK",
-            "text/plain; charset=utf-8", 2, false, date_buf, date_len,
-            "Cache-Control: no-store\r\n", &r->head_close_len);
-        r->head_keepalive = build_head_local(arena, "HTTP/1.1 200 OK",
-            "text/plain; charset=utf-8", 2, true, date_buf, date_len,
-            "Cache-Control: no-store\r\n", &r->head_keepalive_len);
+        r->head = build_head_local(arena, "HTTP/1.1 200 OK",
+            "text/plain; charset=utf-8", 2, date_buf, date_len,
+            "Cache-Control: no-store\r\n", &r->head_len);
         metrics_health_resource = r;
     }
 
@@ -199,14 +194,10 @@ void metrics_build_resources(arena_t* arena,
         memset(r, 0, sizeof(*r));
         r->body = g_stats_body;          /* writable mmap region */
         r->body_len = STATS_BODY_LEN;
-        r->head_close = build_head_local(arena, "HTTP/1.1 200 OK",
-            "text/plain; charset=utf-8", STATS_BODY_LEN, false,
+        r->head = build_head_local(arena, "HTTP/1.1 200 OK",
+            "text/plain; charset=utf-8", STATS_BODY_LEN,
             date_buf, date_len, "Cache-Control: no-store\r\n",
-            &r->head_close_len);
-        r->head_keepalive = build_head_local(arena, "HTTP/1.1 200 OK",
-            "text/plain; charset=utf-8", STATS_BODY_LEN, true,
-            date_buf, date_len, "Cache-Control: no-store\r\n",
-            &r->head_keepalive_len);
+            &r->head_len);
         metrics_stats_resource = r;
     }
 }
