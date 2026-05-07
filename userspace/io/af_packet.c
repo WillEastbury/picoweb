@@ -69,6 +69,13 @@ int af_packet_recv(af_packet_t* a,
     if (n < (ssize_t)ETH_HDR_LEN) return -1;
     uint16_t ethertype = ((uint16_t)buf[12] << 8) | buf[13];
     if (ethertype != ETH_TYPE_IPV4) return -1;
+    if (a->peer_mac[0] == 0 && a->peer_mac[1] == 0 &&
+        a->peer_mac[2] == 0 && a->peer_mac[3] == 0 &&
+        a->peer_mac[4] == 0 && a->peer_mac[5] == 0) {
+        /* Learn peer MAC from first inbound frame if caller didn't
+         * preconfigure one. Good enough for a single client spike. */
+        memcpy(a->peer_mac, buf + 6, 6);
+    }
     *ip_out = buf + ETH_HDR_LEN;
     *ip_len_out = (size_t)n - ETH_HDR_LEN;
     return 0;
