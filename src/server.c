@@ -65,6 +65,17 @@ static int make_listen_socket(int port) {
         metal_die("bind :%d", port);
     if (listen(fd, LISTEN_BACKLOG) != 0)
         metal_die("listen");
+
+    /* TCP_DEFER_ACCEPT: kernel holds the accepted socket until data
+     * arrives (or timeout), eliminating an empty-accept wakeup. */
+    int defer_secs = 1;
+    setsockopt(fd, IPPROTO_TCP, TCP_DEFER_ACCEPT, &defer_secs, sizeof(defer_secs));
+
+    /* TCP_FASTOPEN: allow data in the SYN, saving one RTT on new
+     * connections from TFO-capable clients. Queue length = 128. */
+    int tfo_qlen = 128;
+    setsockopt(fd, IPPROTO_TCP, TCP_FASTOPEN, &tfo_qlen, sizeof(tfo_qlen));
+
     return fd;
 }
 
@@ -162,9 +173,7 @@ static int g_listen_marker;
 
 static void try_accept(int listen_fd, int ep, pool_t* pool, int64_t batch_now_ms) {
     for (;;) {
-        struct sockaddr_in peer;
-        socklen_t plen = sizeof(peer);
-        int c = accept4(listen_fd, (struct sockaddr*)&peer, &plen,
+        int c = accept4(listen_fd, NULL, NULL,
                         SOCK_NONBLOCK | SOCK_CLOEXEC);
         if (c < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) return;
@@ -305,7 +314,7 @@ static int try_send_iovec(conn_t* c) {
 }
 
 /* Fast path: flat wire buffer (head + body pre-concatenated). */
-static int try_send(conn_t* c) {
+static __attribute__((hot)) int try_send(conn_t* c) {
     if (__builtin_expect(c->wire_buf == NULL, 0))
         return try_send_iovec(c);
 
@@ -339,7 +348,7 @@ static int try_send(conn_t* c) {
  *   1  - request parsed & response primed; state = ST_WRITING
  *   0  - need more data; still ST_READING
  *  -1  - unrecoverable; caller should close (only for transient cases) */
-static int dispatch_one(conn_t* c, const jumptable_t* jt, uint32_t max_req) {
+static __attribute__((hot)) int dispatch_one(conn_t* c, const jumptable_t* jt, uint32_t max_req) {
     http_request_t req;
     http_result_t pr = http_parse(c->read_buf, c->read_off, &req);
     if (pr == HTTP_NEED_MORE) {
@@ -453,7 +462,7 @@ static int dispatch_one(conn_t* c, const jumptable_t* jt, uint32_t max_req) {
  * transition back to ST_READING and try to dispatch any already-buffered
  * next request — bounded by POST_SEND_BUDGET to avoid one client
  * monopolising the worker. Returns true if conn was closed. */
-static bool post_send(conn_t* c, int ep, pool_t* pool,
+static __attribute__((hot)) bool post_send(conn_t* c, int ep, pool_t* pool,
                       const jumptable_t* jt, uint32_t max_req,
                       int64_t batch_now_ms) {
     int budget = POST_SEND_BUDGET;
@@ -526,7 +535,7 @@ static bool post_send(conn_t* c, int ep, pool_t* pool,
 /* Event handlers                                                 */
 /* ============================================================== */
 
-static void handle_readable(conn_t* c, int ep, pool_t* pool,
+static __attribute__((hot)) void handle_readable(conn_t* c, int ep, pool_t* pool,
                             const jumptable_t* jt, uint32_t max_req,
                             int64_t batch_now_ms) {
     /* Drain everything currently available — LT epoll permits the
@@ -637,23 +646,26 @@ void* epoll_worker_main(void* arg) {
               (long long)cfg->idle_ms, cfg->max_requests_per_conn);
 
     struct epoll_event events[EPOLL_BATCH];
-    int64_t last_sweep = metal_now_ms();
+    int64_t last_sweep = metal_now_ms_coarse();
     uint32_t max_req = cfg->max_requests_per_conn;
+    int64_t batch_now_ms = last_sweep;
 
     for (;;) {
-        int64_t now = metal_now_ms();
-        int wait_ms = (int)(IDLE_SWEEP_MS - (now - last_sweep));
+        int wait_ms = (int)(IDLE_SWEEP_MS - (batch_now_ms - last_sweep));
         if (wait_ms < 0) wait_ms = 0;
 
         int n = epoll_wait(ep, events, EPOLL_BATCH, wait_ms);
         if (n < 0) {
-            if (errno == EINTR) continue;
+            if (errno == EINTR) {
+                batch_now_ms = metal_now_ms_coarse();
+                continue;
+            }
             metal_die("epoll_wait");
         }
 
         /* Batch timestamp: one clock_gettime per epoll_wait return,
          * used for idle timers and accept timestamps. */
-        int64_t batch_now_ms = metal_now_ms();
+        batch_now_ms = metal_now_ms_coarse();
 
         for (int i = 0; i < n; i++) {
             void* ptr = events[i].data.ptr;

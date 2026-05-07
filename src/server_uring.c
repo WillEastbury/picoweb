@@ -537,6 +537,11 @@ void* uring_worker_main(void* arg) {
     if (listen(lfd, 4096) < 0)
         metal_die("listen: %s", strerror(errno));
 
+    int defer_secs = 1;
+    setsockopt(lfd, IPPROTO_TCP, TCP_DEFER_ACCEPT, &defer_secs, sizeof(defer_secs));
+    int tfo_qlen = 128;
+    setsockopt(lfd, IPPROTO_TCP, TCP_FASTOPEN, &tfo_qlen, sizeof(tfo_qlen));
+
     /* io_uring with 1024 SQ entries — matches the conn pool depth.
      * The CQ defaults to 2x SQ which gives us slack for batched
      * accept+recv+send completions. */

@@ -35,6 +35,12 @@ int64_t metal_now_ms(void) {
     return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
+int64_t metal_now_ms_coarse(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC_COARSE, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
 uint64_t metal_fnv1a_init(void) { return 1469598103934665603ULL; }
 
 uint64_t metal_fnv1a_step(uint64_t h, const void* data, size_t len) {
@@ -90,6 +96,17 @@ bool metal_ieq(const char* a, size_t alen, const char* b, size_t blen) {
             memcpy(&va2, a + 8, 2);
             memcpy(&vb2, b + 8, 2);
             return (va2 | 0x2020u) == (vb2 | 0x2020u);
+        }
+        case 13: {
+            uint64_t va8, vb8;
+            memcpy(&va8, a, 8);
+            memcpy(&vb8, b, 8);
+            if ((va8 | 0x2020202020202020ULL) != (vb8 | 0x2020202020202020ULL)) return false;
+            uint32_t va4, vb4;
+            memcpy(&va4, a + 8, 4);
+            memcpy(&vb4, b + 8, 4);
+            if ((va4 | 0x20202020u) != (vb4 | 0x20202020u)) return false;
+            return ((unsigned char)a[12] | 0x20) == ((unsigned char)b[12] | 0x20);
         }
         case 14: {
             uint64_t va8, vb8;

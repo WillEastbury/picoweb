@@ -127,56 +127,72 @@ http_result_t http_parse(char* buf, size_t buf_len, http_request_t* out) {
         size_t tl = 0;
         const char* tval = trim_ows(val, val_len, &tl);
 
-        if (metal_ieq(p, name_len, "Host", 4)) {
-            if (host_seen++) return HTTP_ERR_400;
-            /* Strip :port */
-            const char* colon2 = (const char*)memchr(tval, ':', tl);
-            size_t hostlen = colon2 ? (size_t)(colon2 - tval) : tl;
-            if (hostlen == 0 || hostlen > 253) return HTTP_ERR_400;
-            /* Lowercase in place. tval points into buf (writable). */
-            metal_lower_inplace((char*)(uintptr_t)tval, hostlen);
-            /* Validate hostname charset */
-            for (size_t i = 0; i < hostlen; i++) {
-                char c = tval[i];
-                bool ok = (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')
-                       || c == '.' || c == '-';
-                if (!ok) return HTTP_ERR_400;
+        /* Dispatch by header name length to skip mismatched metal_ieq calls. */
+        switch (name_len) {
+        case 4:
+            if (metal_ieq(p, 4, "Host", 4)) {
+                if (host_seen++) return HTTP_ERR_400;
+                /* Strip :port */
+                const char* colon2 = (const char*)memchr(tval, ':', tl);
+                size_t hostlen = colon2 ? (size_t)(colon2 - tval) : tl;
+                if (hostlen == 0 || hostlen > 253) return HTTP_ERR_400;
+                /* Lowercase in place. tval points into buf (writable). */
+                metal_lower_inplace((char*)(uintptr_t)tval, hostlen);
+                /* Validate hostname charset */
+                for (size_t i = 0; i < hostlen; i++) {
+                    char c = tval[i];
+                    bool ok = (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')
+                           || c == '.' || c == '-';
+                    if (!ok) return HTTP_ERR_400;
+                }
+                out->host = (char*)(uintptr_t)tval;
+                out->host_len = hostlen;
             }
-            out->host = (char*)(uintptr_t)tval;
-            out->host_len = hostlen;
-        } else if (metal_ieq(p, name_len, "Content-Length", 14)) {
-            /* Reject any non-zero CL — we don't drain bodies in v1. */
-            for (size_t i = 0; i < tl; i++) {
-                if (tval[i] != '0') { body_present = true; break; }
-            }
-            if (tl == 0) body_present = true;
-        } else if (metal_ieq(p, name_len, "Transfer-Encoding", 17)) {
-            body_present = true;
-        } else if (metal_ieq(p, name_len, "Connection", 10)) {
-            /* Connection is a comma-separated token list; honour any
-             * "close" token in case-insensitive form. */
-            size_t k = 0;
-            while (k < tl) {
-                while (k < tl && (tval[k] == ' ' || tval[k] == '\t' ||
-                                  tval[k] == ',')) k++;
-                size_t s = k;
-                while (k < tl && tval[k] != ',') k++;
-                size_t e = k;
-                while (e > s && (tval[e - 1] == ' ' || tval[e - 1] == '\t')) e--;
-                if (e - s == 5 && metal_ieq(tval + s, 5, "close", 5)) {
-                    out->client_close = true;
-                    break;
+            break;
+        case 10:
+            if (metal_ieq(p, 10, "Connection", 10)) {
+                size_t k = 0;
+                while (k < tl) {
+                    while (k < tl && (tval[k] == ' ' || tval[k] == '\t' ||
+                                      tval[k] == ',')) k++;
+                    size_t s = k;
+                    while (k < tl && tval[k] != ',') k++;
+                    size_t e = k;
+                    while (e > s && (tval[e - 1] == ' ' || tval[e - 1] == '\t')) e--;
+                    if (e - s == 5 && metal_ieq(tval + s, 5, "close", 5)) {
+                        out->client_close = true;
+                        break;
+                    }
                 }
             }
-        } else if (metal_ieq(p, name_len, "Accept-Encoding", 15)) {
-            /* Substring scan for tokens we serve. Token names are
-             * exact-form (case-sensitive); the rest of the value
-             * (q-values, other tokens) is ignored. */
-            if (metal_compress_accepted(tval, tl)) out->accept_pc = true;
-            if (brotli_accepted(tval, tl)) out->accept_br = true;
-        } else if (metal_ieq(p, name_len, "If-None-Match", 13)) {
-            out->if_none_match = tval;
-            out->if_none_match_len = tl;
+            break;
+        case 13:
+            if (metal_ieq(p, 13, "If-None-Match", 13)) {
+                out->if_none_match = tval;
+                out->if_none_match_len = tl;
+            }
+            break;
+        case 14:
+            if (metal_ieq(p, 14, "Content-Length", 14)) {
+                for (size_t i = 0; i < tl; i++) {
+                    if (tval[i] != '0') { body_present = true; break; }
+                }
+                if (tl == 0) body_present = true;
+            }
+            break;
+        case 15:
+            if (metal_ieq(p, 15, "Accept-Encoding", 15)) {
+                if (metal_compress_accepted(tval, tl)) out->accept_pc = true;
+                if (brotli_accepted(tval, tl)) out->accept_br = true;
+            }
+            break;
+        case 17:
+            if (metal_ieq(p, 17, "Transfer-Encoding", 17)) {
+                body_present = true;
+            }
+            break;
+        default:
+            break;
         }
         p = eol + 2;
     }
