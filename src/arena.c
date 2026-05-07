@@ -16,9 +16,20 @@ bool arena_init(arena_t* a, size_t cap_bytes) {
     size_t ps = page_size_cached();
     size_t cap = metal_align_up(cap_bytes, ps);
     if (cap == 0) cap = ps;
-    void* p = mmap(NULL, cap, PROT_READ | PROT_WRITE,
-                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    /* MAP_POPULATE prefaults every page so the first response on the
+     * hot path never takes a minor page fault. Free latency win. */
+    int flags = MAP_PRIVATE | MAP_ANONYMOUS;
+#ifdef MAP_POPULATE
+    flags |= MAP_POPULATE;
+#endif
+    void* p = mmap(NULL, cap, PROT_READ | PROT_WRITE, flags, -1, 0);
     if (p == MAP_FAILED) return false;
+#ifdef MADV_HUGEPAGE
+    /* Hint THP. Kernel will promote to 2MB pages when alignment
+     * permits, eliminating TLB walks on body access. Best-effort —
+     * we don't care if the kernel ignores it. */
+    (void)madvise(p, cap, MADV_HUGEPAGE);
+#endif
     a->base = (char*)p;
     a->cap = cap;
     a->off = 0;

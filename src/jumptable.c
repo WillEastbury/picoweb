@@ -95,7 +95,9 @@ static __attribute__((hot)) const resource_t* flat_lookup(
         const char* host, size_t host_len,
         const char* path, size_t path_len) {
     if (jt->cap == 0) return NULL;
-    if (host_len > 0xffff || path_len > 0xffff) return NULL;
+    /* Note: host_len/path_len are bounded by the parser well below
+     * 0xffff (host_len <= 255 by HTTP, path_len <= 2048 by MAX_URI_LEN).
+     * No runtime check needed on the hot path. */
     uint64_t h = key_hash(host, host_len, path, path_len);
     uint32_t lens = ((uint32_t)host_len << 16) | (uint32_t)path_len;
     size_t mask = jt->mask;

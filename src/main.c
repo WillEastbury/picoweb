@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <errno.h>
 
 #include "jumptable.h"
 #include "metrics.h"
@@ -172,6 +173,23 @@ int main(int argc, char** argv) {
         if (pthread_create(&threads[i], NULL, worker_fn, &cfgs[i]) != 0) {
             metal_die("pthread_create #%ld", i);
         }
+        /* Pin worker N to core (N % nproc). With SO_REUSEPORT each
+         * worker has its own listen socket and per-worker state, so
+         * keeping each on a fixed core preserves L1/L2 cache locality
+         * and matches the kernel's RPS hashing for steady throughput.
+         * Best-effort: failure is logged and ignored. */
+#ifdef __linux__
+        long nproc = sysconf(_SC_NPROCESSORS_ONLN);
+        if (nproc >= 1) {
+            cpu_set_t cpus;
+            CPU_ZERO(&cpus);
+            CPU_SET((int)(i % nproc), &cpus);
+            if (pthread_setaffinity_np(threads[i], sizeof(cpus), &cpus) != 0) {
+                metal_log("pthread_setaffinity_np worker %ld -> cpu %ld: %s",
+                          i, i % nproc, strerror(errno));
+            }
+        }
+#endif
     }
 
     /* Background thread that rebuilds the /stats body once per second. */
