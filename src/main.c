@@ -13,19 +13,21 @@
 
 static void usage(const char* argv0) {
     fprintf(stderr,
-        "usage: %s [--io_uring | --dpdk] [PORT] [WWWROOT] [WORKERS] [MAXREQS] [ZC_MIN]\n"
+        "usage: %s [--io_uring | --dpdk] [PORT] [WWWROOT] [WORKERS] [MAXREQS] [ZC_MIN] [POOL_CAP]\n"
         "\n"
         "  --io_uring   use the io_uring worker backend (Linux 5.6+, no liburing)\n"
         "  --dpdk       use the DPDK userspace backend (NOT BUILT — see\n"
         "               userspace/DESIGN.md; the flag is reserved and will\n"
         "               error out at startup until the integration ships)\n"
         "\n"
-        "  PORT     listen port (default 8080)\n"
-        "  WWWROOT  content root (default ./wwwroot)\n"
-        "  WORKERS  worker threads (default = nproc)\n"
-        "  MAXREQS  max requests per connection (default 100; 0 = unlimited)\n"
-        "  ZC_MIN   MSG_ZEROCOPY threshold in bytes (default 0 = off;\n"
-        "           recommended 16384 if enabled — small payloads regress)\n"
+        "  PORT      listen port (default 8080)\n"
+        "  WWWROOT   content root (default ./wwwroot)\n"
+        "  WORKERS   worker threads (default = nproc)\n"
+        "  MAXREQS   max requests per connection (default 100; 0 = unlimited)\n"
+        "  ZC_MIN    MSG_ZEROCOPY threshold in bytes (default 0 = off;\n"
+        "            recommended 16384 if enabled — small payloads regress)\n"
+        "  POOL_CAP  max concurrent connections per worker (default 4096;\n"
+        "            each slot costs ~8KB RSS — use 64-256 for low-traffic sites)\n"
         "\n"
         "Default backend is epoll. --io_uring and --dpdk are mutually exclusive.\n",
         argv0);
@@ -38,6 +40,7 @@ int main(int argc, char** argv) {
     if (workers < 1) workers = 1;
     long max_reqs = 100;
     long zc_min = 0;
+    long pool_cap = 4096;
     picoweb_backend_t backend = PICOWEB_BACKEND_EPOLL;
 
     /* Two-pass parse: lift flags out of argv first, then handle the
@@ -107,6 +110,14 @@ int main(int argc, char** argv) {
         }
         zc_min = z;
     }
+    if (npos > 5) {
+        char* end = NULL;
+        long pc = strtol(pos[5], &end, 10);
+        if (end == pos[5] || *end != '\0' || pc < 1 || pc > 65536) {
+            usage(argv[0]); return 1;
+        }
+        pool_cap = pc;
+    }
 
     /* Reject --dpdk early — before spawning workers and binding ports
      * — so operators get a clean error instead of partially-started
@@ -153,7 +164,7 @@ int main(int argc, char** argv) {
     for (long i = 0; i < workers; i++) {
         cfgs[i].jt                    = &jt;
         cfgs[i].port                  = port;
-        cfgs[i].pool_cap              = 4096;
+        cfgs[i].pool_cap              = (size_t)pool_cap;
         cfgs[i].idle_ms               = 10000;  /* 10s any-inactivity cap */
         cfgs[i].max_requests_per_conn = (uint32_t)max_reqs;
         cfgs[i].worker_index          = (int)i;
@@ -167,8 +178,8 @@ int main(int argc, char** argv) {
     metrics_start_updater();
 
     metal_log("picoweb: %ld worker(s) on :%d, root=%s, maxreqs=%ld, "
-              "backend=%s, zerocopy=%s, simd=%s",
-              workers, port, wwwroot, max_reqs, backend_name,
+              "pool=%ld, backend=%s, zerocopy=%s, simd=%s",
+              workers, port, wwwroot, max_reqs, pool_cap, backend_name,
               zc_min > 0 ? "on" : "off", metal_simd_describe());
     if (zc_min > 0) {
         metal_log("picoweb: MSG_ZEROCOPY threshold = %ld bytes", zc_min);
