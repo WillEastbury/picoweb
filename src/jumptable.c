@@ -633,6 +633,7 @@ static const char kBody505[] = "<!doctype html><title>505</title><h1>505 HTTP Ve
 static void build_304_resource(arena_t* arena, resource_t* r, const char* cache_vary_header);
 static void build_304_variant(arena_t* arena, resource_compress_t* rc, const char* cache_vary_header);
 
+__attribute__((cold))
 static void build_canned_errors(jumptable_t* jt) {
     arena_t* a = &jt->arena;
     static const char kNoCache[] = "Cache-Control: no-cache\r\n";
@@ -736,6 +737,7 @@ static void build_304_variant(arena_t* arena, resource_compress_t* rc,
 /* Build phase                                                    */
 /* ============================================================== */
 
+__attribute__((cold))
 bool jumptable_build(jumptable_t* jt, const char* wwwroot) {
     memset(jt, 0, sizeof(*jt));
     format_date_now();
@@ -824,11 +826,11 @@ bool jumptable_build(jumptable_t* jt, const char* wwwroot) {
         }
 
         /* Register in known_hosts for virtual-host validation. */
-        if (jt->known_host_count < 128) {
-            jt->known_hosts[jt->known_host_count].name = host_key;
-            jt->known_hosts[jt->known_host_count].len = h->name_len;
-            jt->known_host_count++;
-        }
+        if (jt->known_host_count >= 128)
+            metal_die("too many virtual hosts (max 128)");
+        jt->known_hosts[jt->known_host_count].name = host_key;
+        jt->known_hosts[jt->known_host_count].len = h->name_len;
+        jt->known_host_count++;
 
         /* Materialize per-host chrome. Header and footer bytes are copied
          * into the (immutable) arena ONCE per host and shared by every
@@ -1093,11 +1095,11 @@ bool jumptable_build(jumptable_t* jt, const char* wwwroot) {
                     }
 
                     /* Register alias in known_hosts. */
-                    if (jt->known_host_count < 128) {
-                        jt->known_hosts[jt->known_host_count].name = alias_key;
-                        jt->known_hosts[jt->known_host_count].len = alias_len;
-                        jt->known_host_count++;
-                    }
+                    if (jt->known_host_count >= 128)
+                        metal_die("too many virtual hosts (max 128)");
+                    jt->known_hosts[jt->known_host_count].name = alias_key;
+                    jt->known_hosts[jt->known_host_count].len = alias_len;
+                    jt->known_host_count++;
 
                     metal_log("  alias '%s' -> '%s': %zu resource(s) duplicated",
                               alias, target, duped);
@@ -1129,6 +1131,7 @@ const resource_t* jumptable_lookup(const jumptable_t* jt,
     return flat_lookup(jt, host, host_len, path, path_len);
 }
 
+__attribute__((cold))
 bool jumptable_host_exists(const jumptable_t* jt,
                            const char* host, size_t host_len) {
     for (size_t i = 0; i < jt->known_host_count; i++) {

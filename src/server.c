@@ -320,7 +320,7 @@ static __attribute__((hot)) int dispatch_one(conn_t* c, const jumptable_t* jt, u
     if (pr == HTTP_NEED_MORE) {
         /* Buffer-full guard applies to current request only (we
          * compact between requests). */
-        if (c->read_off >= sizeof(c->read_buf)) {
+        if (__builtin_expect(c->read_off >= sizeof(c->read_buf), 0)) {
             pr = HTTP_ERR_413;
         } else {
             return 0;

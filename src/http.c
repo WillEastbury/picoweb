@@ -245,23 +245,27 @@ const resource_t* http_select(const jumptable_t* jt,
          * request was framed properly (no body declared). */
         return jt->err_405;
     }
-    if (req->method != M_GET && req->method != M_HEAD) {
+    if (__builtin_expect(req->method != M_GET && req->method != M_HEAD, 0)) {
         *out_close_after = true;
         return jt->err_405;
     }
 
     *out_head_only = (req->method == M_HEAD);
 
-    /* Virtual-host check: reject requests for unknown hosts with 409. */
+    /* Lookup-first: the flat table is authoritative. On a hit (the
+     * overwhelming common case), we skip the linear host scan entirely.
+     * On a miss, we distinguish 404 (known host, missing path) from
+     * 409 (unknown host) via the known_hosts array. */
+    const resource_t* r = jumptable_lookup(jt, req->host, req->host_len,
+                                           req->path, req->path_len);
+    if (__builtin_expect(r != NULL, 1)) return r;
+
+    /* Miss — check if host is known at all. */
     if (!jumptable_host_exists(jt, req->host, req->host_len)) {
         *out_close_after = true;
         return jt->err_409;
     }
-
-    const resource_t* r = jumptable_lookup(jt, req->host, req->host_len,
-                                           req->path, req->path_len);
-    if (!r) return jt->err_404;
-    return r;
+    return jt->err_404;
 }
 
 /* ============================================================== */

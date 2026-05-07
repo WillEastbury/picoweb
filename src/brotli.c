@@ -690,6 +690,7 @@ static int encode_stored(const uint8_t* in, size_t len,
  * Main encoder
  * ================================================================ */
 
+__attribute__((cold))
 int brotli_encode(const uint8_t* input, size_t input_len,
                   uint8_t* output, size_t output_cap) {
     if (input_len == 0) {

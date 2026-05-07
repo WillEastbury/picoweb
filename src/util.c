@@ -8,6 +8,7 @@
 #include <string.h>
 #include <time.h>
 
+__attribute__((cold))
 void metal_log(const char* fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
@@ -16,6 +17,7 @@ void metal_log(const char* fmt, ...) {
     fputc('\n', stderr);
 }
 
+__attribute__((cold))
 void metal_die(const char* fmt, ...) {
     int saved_errno = errno;
     va_list ap;
