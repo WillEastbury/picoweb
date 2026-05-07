@@ -40,6 +40,12 @@ int af_packet_open(af_packet_t* a, const char* ifname,
     a->fd = socket(AF_PACKET, SOCK_RAW, htons(ETH_TYPE_IPV4));
     if (a->fd < 0) return -1;
 
+    /* Enable auxiliary data so recvmsg() delivers TP_STATUS flags
+     * (we need TP_STATUS_CSUMNOTREADY for veth/virtual interfaces
+     * where TX checksum offload leaves the field incomplete). */
+    int val = 1;
+    setsockopt(a->fd, SOL_PACKET, PACKET_AUXDATA, &val, sizeof(val));
+
     struct ifreq ifr;
     memset(&ifr, 0, sizeof(ifr));
     strncpy(ifr.ifr_name, ifname, IFNAMSIZ - 1);
@@ -60,20 +66,47 @@ int af_packet_open(af_packet_t* a, const char* ifname,
 
 int af_packet_recv(af_packet_t* a,
                    uint8_t* buf, size_t buf_cap,
-                   const uint8_t** ip_out, size_t* ip_len_out) {
+                   const uint8_t** ip_out, size_t* ip_len_out,
+                   int* csum_not_ready) {
 #if !defined(__linux__)
     (void)a; (void)buf; (void)buf_cap; (void)ip_out; (void)ip_len_out;
+    (void)csum_not_ready;
     return -1;
 #else
-    ssize_t n = recv(a->fd, buf, buf_cap, 0);
+    *csum_not_ready = 0;
+
+    struct iovec iov = { .iov_base = buf, .iov_len = buf_cap };
+    union {
+        struct cmsghdr cmsg;
+        uint8_t buf[CMSG_SPACE(sizeof(struct tpacket_auxdata))];
+    } cmsg_buf;
+    struct msghdr msg = {
+        .msg_iov = &iov,
+        .msg_iovlen = 1,
+        .msg_control = &cmsg_buf,
+        .msg_controllen = sizeof(cmsg_buf),
+    };
+
+    ssize_t n = recvmsg(a->fd, &msg, 0);
     if (n < (ssize_t)ETH_HDR_LEN) return -1;
+
+    /* Check for TP_STATUS_CSUMNOTREADY in auxiliary data. */
+    for (struct cmsghdr* cm = CMSG_FIRSTHDR(&msg); cm;
+         cm = CMSG_NXTHDR(&msg, cm)) {
+        if (cm->cmsg_level == SOL_PACKET &&
+            cm->cmsg_type  == PACKET_AUXDATA) {
+            struct tpacket_auxdata* aux =
+                (struct tpacket_auxdata*)CMSG_DATA(cm);
+            if (aux->tp_status & TP_STATUS_CSUMNOTREADY)
+                *csum_not_ready = 1;
+        }
+    }
+
     uint16_t ethertype = ((uint16_t)buf[12] << 8) | buf[13];
     if (ethertype != ETH_TYPE_IPV4) return -1;
     if (a->peer_mac[0] == 0 && a->peer_mac[1] == 0 &&
         a->peer_mac[2] == 0 && a->peer_mac[3] == 0 &&
         a->peer_mac[4] == 0 && a->peer_mac[5] == 0) {
-        /* Learn peer MAC from first inbound frame if caller didn't
-         * preconfigure one. Good enough for a single client spike. */
         memcpy(a->peer_mac, buf + 6, 6);
     }
     *ip_out = buf + ETH_HDR_LEN;

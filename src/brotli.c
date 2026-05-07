@@ -76,8 +76,11 @@ static int count_used(const uint32_t* freq, int n) {
     return c;
 }
 
-/* Build code lengths via the two-queue Huffman algorithm */
-static int build_lengths(const uint32_t* freq, int nsym, uint8_t* lens) {
+/* Build code lengths via the two-queue Huffman algorithm.
+ * max_bits caps the maximum code length (e.g. 5 for CLCL codes,
+ * MAX_HUFF_BITS for data prefix codes). */
+static int build_lengths_ex(const uint32_t* freq, int nsym, uint8_t* lens,
+                            int max_bits) {
     memset(lens, 0, nsym);
 
     int nused = 0;
@@ -126,38 +129,43 @@ static int build_lengths(const uint32_t* freq, int nsym, uint8_t* lens) {
         nn++;
     }
 
-    /* Compute depth of each leaf */
+    /* Compute depth of each leaf, clamped to max_bits */
     int max_len = 0;
     for (int i = 0; i < nused; i++) {
         int d = 0, cur = i;
         while (par[cur] != -1) { cur = par[cur]; d++; }
-        if (d > MAX_HUFF_BITS) d = MAX_HUFF_BITS;
+        if (d > max_bits) d = max_bits;
         lens[sorted[i]] = (uint8_t)d;
         if (d > max_len) max_len = d;
     }
 
-    /* Enforce max length via Kraft inequality adjustment */
+    /* Enforce max length via Kraft inequality adjustment.
+     * Capping depths can oversubscribe the code; we fix by
+     * lengthening the shortest codes. Under-subscription (from
+     * rounding) is fixed by shortening the longest codes. */
     for (int iter = 0; iter < 50; iter++) {
         uint32_t kraft = 0;
         for (int i = 0; i < nsym; i++)
-            if (lens[i]) kraft += (1u << (MAX_HUFF_BITS - lens[i]));
-        uint32_t target = (1u << MAX_HUFF_BITS);
+            if (lens[i]) kraft += (1u << (max_bits - lens[i]));
+        uint32_t target = (1u << max_bits);
         if (kraft == target) break;
         if (kraft > target) {
-            for (int l = MAX_HUFF_BITS; l > 1 && kraft > target; l--)
+            /* Oversubscribed: lengthen shortest codes first */
+            for (int l = 1; l < max_bits && kraft > target; l++)
                 for (int i = 0; i < nsym && kraft > target; i++)
                     if (lens[i] == l) {
-                        lens[i]--;
-                        kraft -= (1u << (MAX_HUFF_BITS - l));
-                        kraft += (1u << (MAX_HUFF_BITS - l + 1));
+                        lens[i]++;
+                        kraft -= (1u << (max_bits - l));
+                        kraft += (1u << (max_bits - l - 1));
                     }
         } else {
-            for (int l = 1; l < MAX_HUFF_BITS && kraft < target; l++)
+            /* Undersubscribed: shorten longest codes first */
+            for (int l = max_bits; l > 1 && kraft < target; l--)
                 for (int i = nsym - 1; i >= 0 && kraft < target; i--)
                     if (lens[i] == l) {
-                        lens[i]++;
-                        kraft -= (1u << (MAX_HUFF_BITS - l));
-                        kraft += (1u << (MAX_HUFF_BITS - l - 1));
+                        lens[i]--;
+                        kraft -= (1u << (max_bits - l));
+                        kraft += (1u << (max_bits - l + 1));
                     }
         }
     }
@@ -166,6 +174,10 @@ static int build_lengths(const uint32_t* freq, int nsym, uint8_t* lens) {
     for (int i = 0; i < nsym; i++)
         if (lens[i] > max_len) max_len = lens[i];
     return max_len;
+}
+
+static int build_lengths(const uint32_t* freq, int nsym, uint8_t* lens) {
+    return build_lengths_ex(freq, nsym, lens, MAX_HUFF_BITS);
 }
 
 /* Assign canonical codes from lengths and write a symbol */
@@ -207,8 +219,10 @@ static const uint8_t kCLOrder[18] = {
     1, 2, 3, 4, 0, 5, 17, 6, 16, 7, 8, 9, 10, 11, 12, 13, 14, 15
 };
 
-/* Fixed encoding for code_length_code_lengths values 0-5
- * (from brotli reference: kCodeLengthPrefixValue/Length) */
+/* Fixed prefix code for code_length_code_lengths values 0-5.
+ * Verified against brotli reference decoder kCodeLengthPrefixValue[]:
+ *   00   → sym 0    01   → sym 4    10   → sym 3
+ *   110  → sym 2    1110 → sym 1    1111 → sym 5 */
 static const uint8_t kCLCL_val[6] = {0, 7, 3, 2, 1, 15};
 static const uint8_t kCLCL_len[6] = {2, 4, 3, 2, 2, 4};
 
@@ -240,10 +254,18 @@ static void write_complex_code(bitw_t* w, const uint8_t* lens, int nsym) {
     uint8_t cl_extra[2048];
     int cl_n = 0;
 
-    for (int i = 0; i < nsym; ) {
+    /* The brotli decoder stops reading code lengths when the Kraft space
+     * reaches 0, which happens right after the last non-zero code length.
+     * Any trailing zero entries would NOT be consumed and would corrupt
+     * the next structure in the bitstream. Truncate at last non-zero. */
+    int last_nz = nsym - 1;
+    while (last_nz > 0 && lens[last_nz] == 0) last_nz--;
+    int cl_end = last_nz + 1;
+
+    for (int i = 0; i < cl_end; ) {
         if (lens[i] == 0) {
             int run = 0;
-            while (i + run < nsym && lens[i + run] == 0) run++;
+            while (i + run < cl_end && lens[i + run] == 0) run++;
             /* The brotli decoder accumulates consecutive sym17 entries
              * exponentially. To avoid this, never emit two sym17 entries
              * in a row: interleave with an explicit sym0 to reset the
@@ -289,10 +311,10 @@ static void write_complex_code(bitw_t* w, const uint8_t* lens, int nsym) {
         }
     }
 
-    /* Build Huffman for code-length alphabet */
+    /* Build Huffman for code-length alphabet (max 5-bit codes) */
     uint8_t cl_lens[18];
     memset(cl_lens, 0, sizeof(cl_lens));
-    build_lengths(cl_freq, 18, cl_lens);
+    build_lengths_ex(cl_freq, 18, cl_lens, 5);
 
     hcode_t cl_codes[18];
     assign_codes(cl_lens, 18, cl_codes);
@@ -350,13 +372,11 @@ static void write_complex_code(bitw_t* w, const uint8_t* lens, int nsym) {
      */
     for (int i = hskip; i < num_cl; i++) {
         uint8_t v = cl_lens[kCLOrder[i]];
-        if (v > 5) v = 5;  /* shouldn't happen with 18 symbols */
         bw_put(w, kCLCL_val[v], kCLCL_len[v]);
     }
 
-    /* Trim trailing 0/17 from code length sequence (RFC requirement) */
-    while (cl_n > 0 && (cl_syms[cl_n - 1] == 0 || cl_syms[cl_n - 1] == 17))
-        cl_n--;
+    /* Do NOT trim trailing zeros — the decoder reads exactly nsym
+     * code lengths and needs every entry, including trailing zeros. */
 
     /* Write the code length sequence using the code-length Huffman codes */
     for (int i = 0; i < cl_n; i++) {

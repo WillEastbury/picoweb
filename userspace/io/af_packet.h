@@ -33,10 +33,13 @@ int af_packet_open(af_packet_t* a, const char* ifname,
 
 /* Receive next frame; returns L3 (IPv4) start pointer + length, or
  * -1 on error / non-IPv4 frame. The caller's buffer must be at
- * least 1518 bytes. */
+ * least 1518 bytes. *csum_not_ready is set to 1 when the kernel
+ * flags TP_STATUS_CSUMNOTREADY (TX offload left checksum
+ * incomplete — caller should skip verification). */
 int af_packet_recv(af_packet_t* a,
                    uint8_t* buf, size_t buf_cap,
-                   const uint8_t** ip_out, size_t* ip_len_out);
+                   const uint8_t** ip_out, size_t* ip_len_out,
+                   int* csum_not_ready);
 
 /* Send one IPv4 frame: prepends Ethernet header. */
 int af_packet_send_ipv4(af_packet_t* a,
