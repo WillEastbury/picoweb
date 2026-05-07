@@ -32,7 +32,7 @@
 #include "../iov.h"
 #include "../dispatch.h"
 
-#define TCP_TABLE_SIZE 8u
+#define TCP_TABLE_SIZE 64u
 
 /* Maximum number of unacked outbound segments tracked per conn for
  * retransmit. Spike-sized; production stacks track many more. The
