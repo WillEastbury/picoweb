@@ -318,9 +318,17 @@ int main(int argc, char** argv) {
         } else {
             cfgs[i].sqpoll_cpu = -1;
         }
-        if (pthread_create(&threads[i], NULL, worker_fn, &cfgs[i]) != 0) {
+        pthread_attr_t attr;
+        pthread_attr_t* attr_p = NULL;
+        if (backend == PICOWEB_BACKEND_TLS) {
+            pthread_attr_init(&attr);
+            pthread_attr_setstacksize(&attr, 2 * 1024 * 1024); /* 2MB for TLS ctx */
+            attr_p = &attr;
+        }
+        if (pthread_create(&threads[i], attr_p, worker_fn, &cfgs[i]) != 0) {
             metal_die("pthread_create #%ld", i);
         }
+        if (attr_p) pthread_attr_destroy(&attr);
         /* Pin worker N to core (N % nproc). With SO_REUSEPORT each
          * worker has its own listen socket and per-worker state, so
          * keeping each on a fixed core preserves L1/L2 cache locality
