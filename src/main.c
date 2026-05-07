@@ -14,12 +14,18 @@
 
 static void usage(const char* argv0) {
     fprintf(stderr,
-        "usage: %s [--io_uring | --dpdk] [PORT] [WWWROOT] [WORKERS] [MAXREQS] [ZC_MIN] [POOL_CAP]\n"
+        "usage: %s [--io_uring | --dpdk] [--sqpoll [--sqpoll-cpu=N]] [PORT] [WWWROOT] [WORKERS] [MAXREQS] [ZC_MIN] [POOL_CAP]\n"
         "\n"
         "  --io_uring   use the io_uring worker backend (Linux 5.6+, no liburing)\n"
         "  --dpdk       use the DPDK userspace backend (NOT BUILT — see\n"
         "               userspace/DESIGN.md; the flag is reserved and will\n"
         "               error out at startup until the integration ships)\n"
+        "  --sqpoll     enable IORING_SETUP_SQPOLL: kernel polls our SQ,\n"
+        "               eliminating io_uring_enter() syscalls on the submit\n"
+        "               path. Costs one kernel thread per worker. Requires\n"
+        "               --io_uring. Best for sustained high-throughput loads.\n"
+        "  --sqpoll-cpu=N  pin SQPOLL kernel threads starting at CPU N\n"
+        "                  (worker i -> CPU (N+i) mod nproc). Implies --sqpoll.\n"
         "\n"
         "  PORT      listen port (default 8080)\n"
         "  WWWROOT   content root (default ./wwwroot)\n"
@@ -43,6 +49,8 @@ int main(int argc, char** argv) {
     long zc_min = 0;
     long pool_cap = 4096;
     picoweb_backend_t backend = PICOWEB_BACKEND_EPOLL;
+    bool sqpoll = false;
+    int  sqpoll_cpu = -1;
 
     /* Two-pass parse: lift flags out of argv first, then handle the
      * remaining positional args exactly as before. This keeps the
@@ -68,6 +76,21 @@ int main(int argc, char** argv) {
                 return 1;
             }
             backend = PICOWEB_BACKEND_DPDK;
+            continue;
+        }
+        if (strcmp(argv[i], "--sqpoll") == 0) {
+            sqpoll = true;
+            continue;
+        }
+        if (strncmp(argv[i], "--sqpoll-cpu=", 13) == 0) {
+            char* end = NULL;
+            long c = strtol(argv[i] + 13, &end, 10);
+            if (end == argv[i] + 13 || *end != '\0' || c < 0 || c > 1023) {
+                fprintf(stderr, "picoweb: invalid --sqpoll-cpu value\n");
+                return 1;
+            }
+            sqpoll = true;
+            sqpoll_cpu = (int)c;
             continue;
         }
         if (npos < (int)(sizeof(pos)/sizeof(pos[0]))) {
@@ -120,6 +143,11 @@ int main(int argc, char** argv) {
         pool_cap = pc;
     }
 
+    if (sqpoll && backend != PICOWEB_BACKEND_URING) {
+        fprintf(stderr, "picoweb: --sqpoll requires --io_uring\n");
+        return 1;
+    }
+
     /* Reject --dpdk early — before spawning workers and binding ports
      * — so operators get a clean error instead of partially-started
      * workers all printing the stub message. */
@@ -170,6 +198,25 @@ int main(int argc, char** argv) {
         cfgs[i].max_requests_per_conn = (uint32_t)max_reqs;
         cfgs[i].worker_index          = (int)i;
         cfgs[i].zerocopy_threshold    = (size_t)zc_min;
+        cfgs[i].sqpoll                = sqpoll;
+        /* SQPOLL kernel-thread CPU policy: avoid pinning the kernel
+         * polling thread to the same core as its userspace worker
+         * (worker i is pinned to (i % nproc)) — they'd thrash one
+         * core's L1.
+         *
+         *   --sqpoll alone (no cpu arg): kernel chooses any CPU
+         *      (passes -1 → no SQ_AFF). Best for general use.
+         *
+         *   --sqpoll-cpu=N: pin worker i's SQPOLL thread to
+         *      ((N + i) mod nproc). N=workers (or N=nproc/2) puts
+         *      the kernel threads on a disjoint core set from the
+         *      workers when nproc >= 2 * workers. */
+        if (sqpoll && sqpoll_cpu >= 0) {
+            long nproc = sysconf(_SC_NPROCESSORS_ONLN);
+            cfgs[i].sqpoll_cpu = (int)((sqpoll_cpu + i) % (nproc > 0 ? nproc : 1));
+        } else {
+            cfgs[i].sqpoll_cpu = -1;
+        }
         if (pthread_create(&threads[i], NULL, worker_fn, &cfgs[i]) != 0) {
             metal_die("pthread_create #%ld", i);
         }

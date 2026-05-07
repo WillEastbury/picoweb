@@ -109,6 +109,7 @@ typedef struct {
     /* Submission ring */
     unsigned*  sq_head;
     unsigned*  sq_tail;
+    unsigned*  sq_flags;       /* IORING_SQ_NEED_WAKEUP / IORING_SQ_CQ_OVERFLOW */
     unsigned   sq_ring_mask;
     unsigned   sq_ring_entries;
     unsigned*  sq_array;
@@ -127,18 +128,59 @@ typedef struct {
     struct io_uring_cqe* cqes;
     void*      cq_ring_ptr;
     size_t     cq_ring_sz;
+
+    /* Mode */
+    bool       sqpoll;        /* IORING_SETUP_SQPOLL active */
 } ring_t;
 
-static bool ring_init(ring_t* r, unsigned entries) {
+static bool ring_init(ring_t* r, unsigned entries, bool sqpoll, int sqpoll_cpu) {
     struct io_uring_params p;
-    memset(&p, 0, sizeof(p));
-    int fd = io_uring_setup(entries, &p);
+    int fd = -1;
+    bool effective_sqpoll = sqpoll;
+
+    /* Tiered setup so that an unsupported sub-feature degrades the
+     * single feature, not the whole thing:
+     *   1) SQPOLL + SQ_AFF (if cpu given)
+     *   2) SQPOLL only      (drop CPU pin)
+     *   3) plain io_uring   (drop SQPOLL too)
+     * Each step retries with a fresh io_uring_params; on success we
+     * use the params from THAT call to compute mmap offsets. */
+    if (sqpoll && sqpoll_cpu >= 0) {
+        memset(&p, 0, sizeof(p));
+        p.flags |= IORING_SETUP_SQPOLL | IORING_SETUP_SQ_AFF;
+        p.sq_thread_idle = 1000;
+        p.sq_thread_cpu  = (uint32_t)sqpoll_cpu;
+        fd = io_uring_setup(entries, &p);
+        if (fd < 0 && (errno == EINVAL || errno == EPERM)) {
+            metal_log("io_uring SQPOLL+AFF unavailable (%s); retrying SQPOLL alone",
+                      strerror(errno));
+            fd = -1;
+        }
+    }
+    if (fd < 0 && sqpoll) {
+        memset(&p, 0, sizeof(p));
+        p.flags |= IORING_SETUP_SQPOLL;
+        p.sq_thread_idle = 1000;
+        fd = io_uring_setup(entries, &p);
+        if (fd < 0 && (errno == EINVAL || errno == EPERM)) {
+            metal_log("io_uring SQPOLL unavailable (%s); falling back to plain io_uring",
+                      strerror(errno));
+            fd = -1;
+            effective_sqpoll = false;
+        }
+    }
+    if (fd < 0) {
+        memset(&p, 0, sizeof(p));
+        fd = io_uring_setup(entries, &p);
+        effective_sqpoll = false;
+    }
     if (fd < 0) {
         metal_log("io_uring_setup(%u) failed: %s", entries, strerror(errno));
         return false;
     }
     memset(r, 0, sizeof(*r));
     r->fd = fd;
+    r->sqpoll = effective_sqpoll;
 
     r->sq_ring_sz = p.sq_off.array + p.sq_entries * sizeof(unsigned);
     r->cq_ring_sz = p.cq_off.cqes + p.cq_entries * sizeof(struct io_uring_cqe);
@@ -182,6 +224,7 @@ static bool ring_init(ring_t* r, unsigned entries) {
      * gave us. From here on we treat them like a fixed-size SPMC ring. */
     r->sq_head        = (unsigned*)((char*)r->sq_ring_ptr + p.sq_off.head);
     r->sq_tail        = (unsigned*)((char*)r->sq_ring_ptr + p.sq_off.tail);
+    r->sq_flags       = (unsigned*)((char*)r->sq_ring_ptr + p.sq_off.flags);
     r->sq_ring_mask   = *(unsigned*)((char*)r->sq_ring_ptr + p.sq_off.ring_mask);
     r->sq_ring_entries= *(unsigned*)((char*)r->sq_ring_ptr + p.sq_off.ring_entries);
     r->sq_array       = (unsigned*)((char*)r->sq_ring_ptr + p.sq_off.array);
@@ -195,14 +238,27 @@ static bool ring_init(ring_t* r, unsigned entries) {
     return true;
 }
 
-/* SPSC SQE handout. Returns NULL if the SQ is full — caller must
- * io_uring_enter to drain. The acquire/release pattern here matches
- * the kernel's published memory-order rules. */
+/* SPSC SQE handout. Returns NULL only after kicking SQPOLL (so the
+ * kernel thread starts draining) and one retry. With the once-per-loop
+ * kick model the SQ can fill mid-drain; without this retry, callers
+ * silently drop accepts/recvs/sends. The retry is a single sq_head
+ * reload — no syscall in the common case (kick is a no-op when SQPOLL
+ * is awake or disabled). */
+static struct io_uring_sqe* ring_get_sqe(ring_t* r);  /* fwd */
+static inline void ring_kick_sqpoll(ring_t* r);       /* fwd */
+
 static struct io_uring_sqe* ring_get_sqe(ring_t* r) {
     unsigned head = atomic_load_explicit((_Atomic unsigned*)r->sq_head,
                                          memory_order_acquire);
     unsigned tail = *r->sq_tail;
-    if (tail - head >= r->sq_ring_entries) return NULL;
+    if (__builtin_expect(tail - head >= r->sq_ring_entries, 0)) {
+        /* SQ appears full. Wake SQPOLL so the kernel drains it (no-op
+         * in plain mode), then reload sq_head and try once more. */
+        ring_kick_sqpoll(r);
+        head = atomic_load_explicit((_Atomic unsigned*)r->sq_head,
+                                    memory_order_acquire);
+        if (tail - head >= r->sq_ring_entries) return NULL;
+    }
     unsigned idx = tail & r->sq_ring_mask;
     return &r->sqes[idx];
 }
@@ -214,6 +270,34 @@ static void ring_publish(ring_t* r) {
     r->sq_array[idx] = idx;
     atomic_store_explicit((_Atomic unsigned*)r->sq_tail, tail + 1,
                           memory_order_release);
+}
+
+/* When SQPOLL is enabled, the kernel poll thread sleeps after
+ * sq_thread_idle ms of no submits. While sleeping it sets
+ * IORING_SQ_NEED_WAKEUP in sq_flags; we must wake it via
+ * io_uring_enter(IORING_ENTER_SQ_WAKEUP) for it to see our SQEs.
+ * In the fast path (steady traffic) the kernel thread is awake and
+ * NEED_WAKEUP is clear — so this becomes a single load + branch
+ * with no syscall. That's the entire point of SQPOLL. */
+#ifndef IORING_SQ_NEED_WAKEUP
+#  define IORING_SQ_NEED_WAKEUP (1U << 0)
+#endif
+/* Thin helper that returns the current sq_flags load. Used by both
+ * the standalone ring_kick_sqpoll() (publish path) and the main loop
+ * (which folds wakeup into its blocking io_uring_enter). */
+static inline unsigned ring_sq_flags(const ring_t* r) {
+    return atomic_load_explicit((const _Atomic unsigned*)r->sq_flags,
+                                memory_order_acquire);
+}
+
+static inline void ring_kick_sqpoll(ring_t* r) {
+    if (!r->sqpoll) return;
+    if (ring_sq_flags(r) & IORING_SQ_NEED_WAKEUP) {
+        /* Best-effort wake; the main loop also folds wakeup into its
+         * blocking enter, so a transient EINTR here is recovered on
+         * the next iteration. */
+        (void)io_uring_enter(r->fd, 0, 0, IORING_ENTER_SQ_WAKEUP, NULL);
+    }
 }
 
 /* IORING_OP_SENDMSG_ZC was added in Linux 6.0; CQE flag F_NOTIF
@@ -561,7 +645,8 @@ void* uring_worker_main(void* arg) {
      * The CQ defaults to 2x SQ which gives us slack for batched
      * accept+recv+send completions. */
     ring_t r;
-    if (!ring_init(&r, 1024)) metal_die("ring_init failed");
+    if (!ring_init(&r, 1024, cfg->sqpoll, cfg->sqpoll_cpu))
+        metal_die("ring_init failed");
 
     pool_t pool;
     if (!pool_init(&pool, cfg->pool_cap)) metal_die("pool_init failed");
@@ -570,17 +655,33 @@ void* uring_worker_main(void* arg) {
     g_uring_state = (uring_state_t*)calloc(g_uring_state_n, sizeof(uring_state_t));
     if (!g_uring_state) metal_die("uring_state alloc failed");
 
-    metal_log("worker %d ready (io_uring): listen=:%d pool=%zu maxreqs=%u",
-              cfg->worker_index, cfg->port, pool.cap, cfg->max_requests_per_conn);
+    metal_log("worker %d ready (io_uring%s): listen=:%d pool=%zu maxreqs=%u",
+              cfg->worker_index, r.sqpoll ? "+sqpoll" : "",
+              cfg->port, pool.cap, cfg->max_requests_per_conn);
 
     /* Prime: post one accept so the loop has work. */
     if (!submit_accept(&r, lfd)) metal_die("initial accept submit failed");
     unsigned pending_submit = 1;
 
     for (;;) {
-        /* Submit anything queued, then block until at least 1 CQE. */
-        int submitted = io_uring_enter(r.fd, pending_submit, 1,
+        int submitted;
+        if (r.sqpoll) {
+            /* SQPOLL: kernel polls the SQ; we never count submits.
+             * Fold the SQ_WAKEUP flag into the blocking GETEVENTS
+             * enter so we have exactly one syscall per loop iteration
+             * (and no race window where a kick syscall fails between
+             * the wake and the wait). */
+            unsigned ef = IORING_ENTER_GETEVENTS;
+            if (ring_sq_flags(&r) & IORING_SQ_NEED_WAKEUP)
+                ef |= IORING_ENTER_SQ_WAKEUP;
+            submitted = io_uring_enter(r.fd, 0, 1, ef, NULL);
+            (void)pending_submit;
+        } else {
+            /* Plain mode: submit pending SQEs and block on a CQ event
+             * in one syscall. */
+            submitted = io_uring_enter(r.fd, pending_submit, 1,
                                        IORING_ENTER_GETEVENTS, NULL);
+        }
         if (submitted < 0) {
             if (errno == EINTR) continue;
             metal_log("io_uring_enter wait: %s", strerror(errno));
