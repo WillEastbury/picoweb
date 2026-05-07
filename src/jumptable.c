@@ -395,7 +395,7 @@ static const char* build_head(arena_t* arena,
                               bool keep_alive,
                               const char* extra_header,
                               size_t* out_len) {
-    char buf[1024];
+    char buf[1280];
     int n = snprintf(buf, sizeof(buf),
         "%s\r\n"
         "Server: picoweb\r\n"
@@ -403,6 +403,8 @@ static const char* build_head(arena_t* arena,
         "Content-Type: %s\r\n"
         "Content-Length: %zu\r\n"
         "Connection: %s\r\n"
+        "X-Content-Type-Options: nosniff\r\n"
+        "X-Frame-Options: DENY\r\n"
         "%s"
         "\r\n",
         status_line,
@@ -432,6 +434,10 @@ static resource_t* build_resource(arena_t* arena,
     r->chrome = NULL;
     r->compressed = NULL;
     r->brotli = NULL;
+    r->etag = NULL;
+    r->etag_len = 0;
+    r->head_304_keepalive = NULL; r->head_304_keepalive_len = 0;
+    r->head_304_close = NULL;     r->head_304_close_len = 0;
     r->head_close = build_head(arena, status_line, mime_type, body_len,
                                false, extra_header, &r->head_close_len);
     r->head_keepalive = build_head(arena, status_line, mime_type, body_len,
@@ -458,11 +464,141 @@ static resource_t* build_resource_chromed(arena_t* arena,
     r->chrome = chrome;
     r->compressed = NULL;
     r->brotli = NULL;
+    r->etag = NULL;
+    r->etag_len = 0;
+    r->head_304_keepalive = NULL; r->head_304_keepalive_len = 0;
+    r->head_304_close = NULL;     r->head_304_close_len = 0;
     r->head_close = build_head(arena, status_line, mime_type, total_payload,
                                false, extra_header, &r->head_close_len);
     r->head_keepalive = build_head(arena, status_line, mime_type, total_payload,
                                    true, extra_header, &r->head_keepalive_len);
     return r;
+}
+
+/* Build a 304 Not Modified response head. Includes ETag, Cache-Control,
+ * Vary (if applicable), Date, Server, Connection — no Content-Length,
+ * no Content-Type, no Content-Encoding (RFC 7232 §4.1). */
+static const char* build_head_304(arena_t* arena,
+                                  const char* etag_str,
+                                  const char* cache_hdr,
+                                  bool keep_alive,
+                                  size_t* out_len) {
+    char buf[512];
+    int n = snprintf(buf, sizeof(buf),
+        "HTTP/1.1 304 Not Modified\r\n"
+        "Server: picoweb\r\n"
+        "Date: %.*s\r\n"
+        "ETag: %s\r\n"
+        "Connection: %s\r\n"
+        "X-Content-Type-Options: nosniff\r\n"
+        "X-Frame-Options: DENY\r\n"
+        "%s"
+        "\r\n",
+        (int)g_date_len, g_date_buf,
+        etag_str,
+        keep_alive ? "keep-alive" : "close",
+        cache_hdr ? cache_hdr : "");
+    if (n <= 0 || (size_t)n >= sizeof(buf))
+        metal_die("304 head too long");
+    *out_len = (size_t)n;
+    char* dst = (char*)arena_alloc(arena, (size_t)n, 64);
+    memcpy(dst, buf, (size_t)n);
+    return (const char*)dst;
+}
+
+static const char kHex[] = "0123456789abcdef";
+
+/* Compute a weak ETag from body content and attach 304 heads.
+ * For chromed resources, hashes the full wire payload (hdr+body+ftr).
+ * Also rebuilds the main response heads with the ETag header included.
+ * Only called for immutable 200 resources (not /stats, /health, errors). */
+static void attach_etag(arena_t* arena, resource_t* r,
+                        const char* cache_hdr) {
+    /* Hash the full payload the client would see */
+    uint64_t h = metal_fnv1a_init();
+    if (r->chrome && r->chrome->hdr_len)
+        h = metal_fnv1a_step(h, r->chrome->hdr, r->chrome->hdr_len);
+    h = metal_fnv1a_step(h, r->body, r->body_len);
+    if (r->chrome && r->chrome->ftr_len)
+        h = metal_fnv1a_step(h, r->chrome->ftr, r->chrome->ftr_len);
+
+    /* Format as W/"0a1b2c3d4e5f6789" (weak ETag, 20 chars) */
+    char tag[24];
+    tag[0] = 'W'; tag[1] = '/'; tag[2] = '"';
+    for (int i = 0; i < 8; i++) {
+        uint8_t byte = (uint8_t)(h >> (56 - i * 8));
+        tag[3 + i * 2]     = kHex[byte >> 4];
+        tag[3 + i * 2 + 1] = kHex[byte & 0xf];
+    }
+    tag[19] = '"'; tag[20] = '\0';
+
+    r->etag = (const char*)arena_dup(arena, tag, 20);
+    r->etag_len = 20;
+
+    /* Inject ETag into the existing response heads by appending it
+     * to the head string right before the final \r\n.
+     * Pattern: find last \r\n\r\n in head, insert ETag: line before it. */
+    char etag_line[64];
+    int el = snprintf(etag_line, sizeof(etag_line), "ETag: %s\r\n", tag);
+    size_t elen = (size_t)el;
+
+    /* Rebuild keepalive head with ETag inserted before terminal \r\n */
+    {
+        size_t new_len = r->head_keepalive_len + elen;
+        char* dst = (char*)arena_alloc(arena, new_len, 64);
+        /* Copy everything except the final \r\n, insert ETag, re-add \r\n */
+        size_t prefix = r->head_keepalive_len - 2; /* before final \r\n */
+        memcpy(dst, r->head_keepalive, prefix);
+        memcpy(dst + prefix, etag_line, elen);
+        memcpy(dst + prefix + elen, "\r\n", 2);
+        r->head_keepalive = dst;
+        r->head_keepalive_len = new_len;
+    }
+    /* Same for close head */
+    {
+        size_t new_len = r->head_close_len + elen;
+        char* dst = (char*)arena_alloc(arena, new_len, 64);
+        size_t prefix = r->head_close_len - 2;
+        memcpy(dst, r->head_close, prefix);
+        memcpy(dst + prefix, etag_line, elen);
+        memcpy(dst + prefix + elen, "\r\n", 2);
+        r->head_close = dst;
+        r->head_close_len = new_len;
+    }
+
+    /* Build 304 heads */
+    r->head_304_close = build_head_304(arena, tag, cache_hdr,
+                                       false, &r->head_304_close_len);
+    r->head_304_keepalive = build_head_304(arena, tag, cache_hdr,
+                                           true, &r->head_304_keepalive_len);
+
+    /* Inject ETag into compressed variant heads too (if they exist) */
+    resource_compress_t* variants[] = {
+        (resource_compress_t*)r->compressed,
+        (resource_compress_t*)r->brotli
+    };
+    for (int v = 0; v < 2; v++) {
+        resource_compress_t* rc = variants[v];
+        if (!rc) continue;
+        /* keepalive */
+        size_t new_len = rc->head_keepalive_len + elen;
+        char* dst = (char*)arena_alloc(arena, new_len, 64);
+        size_t prefix = rc->head_keepalive_len - 2;
+        memcpy(dst, rc->head_keepalive, prefix);
+        memcpy(dst + prefix, etag_line, elen);
+        memcpy(dst + prefix + elen, "\r\n", 2);
+        rc->head_keepalive = dst;
+        rc->head_keepalive_len = new_len;
+        /* close */
+        new_len = rc->head_close_len + elen;
+        dst = (char*)arena_alloc(arena, new_len, 64);
+        prefix = rc->head_close_len - 2;
+        memcpy(dst, rc->head_close, prefix);
+        memcpy(dst + prefix, etag_line, elen);
+        memcpy(dst + prefix + elen, "\r\n", 2);
+        rc->head_close = dst;
+        rc->head_close_len = new_len;
+    }
 }
 
 /* Build a precomputed compressed variant of `r`. Compresses the FULL
@@ -711,6 +847,7 @@ bool jumptable_build(jumptable_t* jt, const char* wwwroot) {
                      + total_bytes * 6 / 5         /* brotli copies */
                      + total_entries * 768
                      + total_entries * 512         /* resource_compress_t*2 + variant heads */
+                     + total_entries * 768         /* ETag strings + 304 heads + ETag in variant heads */
                      + slot_count * sizeof(flat_slot_t)
                      + total_hosts * 512
                      + 2 * 768                   /* /health + /stats heads */
@@ -806,6 +943,9 @@ bool jumptable_build(jumptable_t* jt, const char* wwwroot) {
                     attach_brotli_variant(&jt->arena, r,
                                           "HTTP/1.1 200 OK", mime, cache_hdr);
                 }
+
+                /* Attach weak ETag + prebuilt 304 heads for conditional GET */
+                attach_etag(&jt->arena, r, cache_hdr);
 
                 char url[8192];
                 int ulen = build_url(url, sizeof(url), d->path, d->path_len,

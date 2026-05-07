@@ -141,7 +141,7 @@ static const char* build_head_local(arena_t* arena,
                                     const char* date_buf, size_t date_len,
                                     const char* extra_header,
                                     size_t* out_len) {
-    char buf[1024];
+    char buf[1280];
     int n = snprintf(buf, sizeof(buf),
         "%s\r\n"
         "Server: picoweb\r\n"
@@ -149,6 +149,8 @@ static const char* build_head_local(arena_t* arena,
         "Content-Type: %s\r\n"
         "Content-Length: %zu\r\n"
         "Connection: %s\r\n"
+        "X-Content-Type-Options: nosniff\r\n"
+        "X-Frame-Options: DENY\r\n"
         "%s"
         "\r\n",
         status_line,

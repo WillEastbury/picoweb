@@ -29,6 +29,8 @@ typedef struct {
     bool   client_close;  /* Connection: close */
     bool   accept_pc;     /* Accept-Encoding contains picoweb-compress / BareMetal.Compress */
     bool   accept_br;     /* Accept-Encoding contains br (Brotli) */
+    const char* if_none_match;    /* raw If-None-Match header value (points into read_buf) */
+    size_t if_none_match_len;
     bool   has_leftover;  /* extra bytes after \r\n\r\n */
     size_t consumed;      /* total bytes consumed from buf */
 } http_request_t;
@@ -37,6 +39,11 @@ typedef struct {
  * should read more bytes and call again. The buffer may be modified
  * in-place (host header lowercased, etc). */
 http_result_t http_parse(char* buf, size_t buf_len, http_request_t* out);
+
+/* Weak ETag comparison for conditional GET. Returns true if `etag`
+ * matches any token in the If-None-Match header value `inm`. */
+bool http_etag_matches(const char* inm, size_t inm_len,
+                       const char* etag, size_t etag_len);
 
 /* Pick a response for a parse result + parsed request.
  *  *out_close_after  - the connection should close after this response

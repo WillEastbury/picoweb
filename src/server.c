@@ -65,6 +65,17 @@ static int make_listen_socket(int port) {
         metal_die("bind :%d", port);
     if (listen(fd, LISTEN_BACKLOG) != 0)
         metal_die("listen");
+
+    /* TCP_DEFER_ACCEPT: kernel holds the accepted socket until data
+     * arrives (or timeout), eliminating an empty-accept wakeup. */
+    int defer_secs = 1;
+    setsockopt(fd, IPPROTO_TCP, TCP_DEFER_ACCEPT, &defer_secs, sizeof(defer_secs));
+
+    /* TCP_FASTOPEN: allow data in the SYN, saving one RTT on new
+     * connections from TFO-capable clients. Queue length = 128. */
+    int tfo_qlen = 128;
+    setsockopt(fd, IPPROTO_TCP, TCP_FASTOPEN, &tfo_qlen, sizeof(tfo_qlen));
+
     return fd;
 }
 
@@ -360,13 +371,24 @@ static int dispatch_one(conn_t* c, const jumptable_t* jt, uint32_t max_req) {
     else if (req.accept_pc && r->compressed != NULL)
         variant = r->compressed;
 
-    c->active_variant = variant;
-    if (variant) {
-        c->head_ptr = close_after ? variant->head_close      : variant->head_keepalive;
-        c->head_len = close_after ? variant->head_close_len  : variant->head_keepalive_len;
+    /* Conditional GET: if the resource has an ETag and If-None-Match
+     * matches, serve a 304 Not Modified (no body, no compression). */
+    if (r->etag && req.if_none_match &&
+        http_etag_matches(req.if_none_match, req.if_none_match_len,
+                          r->etag, r->etag_len)) {
+        c->active_variant = NULL;
+        c->head_ptr = close_after ? r->head_304_close      : r->head_304_keepalive;
+        c->head_len = close_after ? r->head_304_close_len  : r->head_304_keepalive_len;
+        head_only = true; /* suppress body */
     } else {
-        c->head_ptr = close_after ? r->head_close       : r->head_keepalive;
-        c->head_len = close_after ? r->head_close_len   : r->head_keepalive_len;
+        c->active_variant = variant;
+        if (variant) {
+            c->head_ptr = close_after ? variant->head_close      : variant->head_keepalive;
+            c->head_len = close_after ? variant->head_close_len  : variant->head_keepalive_len;
+        } else {
+            c->head_ptr = close_after ? r->head_close       : r->head_keepalive;
+            c->head_len = close_after ? r->head_close_len   : r->head_keepalive_len;
+        }
     }
     c->send_body   = !head_only;
     c->bytes_sent  = 0;

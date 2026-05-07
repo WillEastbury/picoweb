@@ -50,6 +50,67 @@ static const char* trim_ows(const char* s, size_t len, size_t* out_len) {
     return s + i;
 }
 
+/* Weak ETag comparison for If-None-Match (RFC 7232 §2.3.2).
+ * Checks whether `etag` (e.g. W/"abcdef0123456789") appears as a
+ * comma-separated token in the If-None-Match header value `inm`.
+ * Also matches the wildcard `*`. Strips W/ prefix for weak comparison. */
+bool http_etag_matches(const char* inm, size_t inm_len,
+                       const char* etag, size_t etag_len) {
+    if (!inm || !inm_len || !etag || !etag_len) return false;
+
+    /* Wildcard */
+    for (size_t i = 0; i < inm_len; i++) {
+        if (inm[i] == '*') return true;
+    }
+
+    /* Extract opaque-tag from our ETag (strip W/ prefix if present) */
+    const char* our_tag = etag;
+    size_t our_len = etag_len;
+    if (our_len >= 2 && our_tag[0] == 'W' && our_tag[1] == '/') {
+        our_tag += 2; our_len -= 2;
+    }
+
+    /* Scan comma-separated tokens in If-None-Match */
+    size_t pos = 0;
+    while (pos < inm_len) {
+        /* Skip OWS and commas */
+        while (pos < inm_len && (inm[pos] == ' ' || inm[pos] == '\t'
+                                 || inm[pos] == ',')) pos++;
+        if (pos >= inm_len) break;
+
+        /* Find end of this token */
+        size_t start = pos;
+        /* If quoted, find closing quote (ETags are always quoted) */
+        const char* tp = inm + start;
+        size_t tl;
+        if (tp[0] == 'W' && start + 1 < inm_len && tp[1] == '/') {
+            tp += 2; start += 2;
+        }
+        /* Now tp should point at '"...' */
+        if (start < inm_len && tp[0] == '"') {
+            const char* close = (const char*)memchr(tp + 1, '"',
+                                                    inm_len - start - 1);
+            if (close) {
+                tl = (size_t)(close - tp) + 1; /* include both quotes */
+                pos = (size_t)(close - inm) + 1;
+            } else {
+                break; /* malformed */
+            }
+        } else {
+            /* Unquoted token — skip to comma */
+            while (pos < inm_len && inm[pos] != ',') pos++;
+            tl = (size_t)(inm + pos - tp);
+            /* trim trailing OWS */
+            while (tl > 0 && (tp[tl-1] == ' ' || tp[tl-1] == '\t')) tl--;
+        }
+
+        /* Weak comparison: compare opaque-tags */
+        if (tl == our_len && memcmp(tp, our_tag, our_len) == 0)
+            return true;
+    }
+    return false;
+}
+
 /* ============================================================== */
 /* Parser                                                         */
 /* ============================================================== */
@@ -174,6 +235,9 @@ http_result_t http_parse(char* buf, size_t buf_len, http_request_t* out) {
              * (q-values, other tokens) is ignored. */
             if (metal_compress_accepted(tval, tl)) out->accept_pc = true;
             if (brotli_accepted(tval, tl)) out->accept_br = true;
+        } else if (metal_ieq(p, name_len, "If-None-Match", 13)) {
+            out->if_none_match = tval;
+            out->if_none_match_len = tl;
         }
         p = eol + 2;
     }

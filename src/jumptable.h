@@ -61,6 +61,13 @@ typedef struct {
     const chrome_t* chrome;      /* NULL if no chrome is applied */
     const resource_compress_t* compressed; /* NULL if no compressed variant */
     const resource_compress_t* brotli;     /* NULL if no Brotli variant */
+    /* Conditional GET: weak ETag computed at startup from body hash.
+     * etag points into arena (e.g. W/"0a1b2c3d4e5f6789").
+     * head_304_* are prebuilt 304 Not Modified response heads.
+     * NULL for dynamic resources (/stats, /health) and errors. */
+    const char* etag;            size_t etag_len;
+    const char* head_304_keepalive; size_t head_304_keepalive_len;
+    const char* head_304_close;     size_t head_304_close_len;
 } __attribute__((aligned(128))) resource_t;
 
 /* One flat-table slot. value == NULL marks the slot empty.

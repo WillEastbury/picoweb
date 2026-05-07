@@ -322,9 +322,10 @@ static bool submit_close(ring_t* r, int fd, size_t conn_idx) {
 static bool submit_sendmsg(ring_t* r, conn_t* c, size_t conn_idx,
                            size_t total_payload) {
     const resource_t* res = c->res;
-    const chrome_t* ch = (c->send_body && !c->serve_compressed) ? res->chrome : NULL;
-    const char* body_ptr = c->serve_compressed ? res->compressed->body : res->body;
-    size_t      body_len = c->serve_compressed ? res->compressed->body_len : res->body_len;
+    bool encoded = (c->active_variant != NULL);
+    const chrome_t* ch = (c->send_body && !encoded) ? res->chrome : NULL;
+    const char* body_ptr = encoded ? c->active_variant->body : res->body;
+    size_t      body_len = encoded ? c->active_variant->body_len : res->body_len;
 
     const char* seg_ptr[4];
     size_t      seg_len[4];
@@ -381,7 +382,7 @@ static void conn_reset_for_next(conn_t* c) {
     c->head_len    = 0;
     c->bytes_sent  = 0;
     c->send_body   = false;
-    c->serve_compressed = false;
+    c->active_variant = NULL;
     c->state       = ST_READING;
     c->last_active_ms = metal_now_ms();
 }
@@ -393,7 +394,7 @@ static void conn_init_new(conn_t* c, int fd) {
     c->res = NULL;
     c->head_ptr = NULL; c->head_len = 0;
     c->send_body = false;
-    c->serve_compressed = false;
+    c->active_variant = NULL;
     c->bytes_sent = 0;
     c->close_after = false;
     c->req_count = 0;
@@ -410,8 +411,8 @@ static inline size_t conn_total_payload(const conn_t* c) {
     size_t total = c->head_len;
     if (c->send_body) {
         const resource_t* rs = c->res;
-        if (c->serve_compressed) {
-            total += rs->compressed->body_len;
+        if (c->active_variant != NULL) {
+            total += c->active_variant->body_len;
         } else {
             total += rs->body_len;
             if (rs->chrome) total += rs->chrome->hdr_len + rs->chrome->ftr_len;
@@ -436,15 +437,29 @@ static bool dispatch_one(conn_t* c, const jumptable_t* jt, uint32_t max_req) {
     if (max_req && c->req_count >= max_req) close_after = true;
 
     c->res = r;
-    bool use_pc = (req.accept_pc && r->compressed != NULL);
-    c->serve_compressed = use_pc;
-    if (use_pc) {
-        const resource_compress_t* rc = r->compressed;
-        c->head_ptr = close_after ? rc->head_close : rc->head_keepalive;
-        c->head_len = close_after ? rc->head_close_len : rc->head_keepalive_len;
+    const resource_compress_t* variant = NULL;
+    if (req.accept_br && r->brotli != NULL)
+        variant = r->brotli;
+    else if (req.accept_pc && r->compressed != NULL)
+        variant = r->compressed;
+
+    /* Conditional GET: 304 Not Modified */
+    if (r->etag && req.if_none_match &&
+        http_etag_matches(req.if_none_match, req.if_none_match_len,
+                          r->etag, r->etag_len)) {
+        c->active_variant = NULL;
+        c->head_ptr = close_after ? r->head_304_close      : r->head_304_keepalive;
+        c->head_len = close_after ? r->head_304_close_len  : r->head_304_keepalive_len;
+        head_only = true;
     } else {
-        c->head_ptr = close_after ? r->head_close : r->head_keepalive;
-        c->head_len = close_after ? r->head_close_len : r->head_keepalive_len;
+        c->active_variant = variant;
+        if (variant) {
+            c->head_ptr = close_after ? variant->head_close      : variant->head_keepalive;
+            c->head_len = close_after ? variant->head_close_len  : variant->head_keepalive_len;
+        } else {
+            c->head_ptr = close_after ? r->head_close : r->head_keepalive;
+            c->head_len = close_after ? r->head_close_len : r->head_keepalive_len;
+        }
     }
     c->send_body  = !head_only;
     c->bytes_sent = 0;
@@ -495,6 +510,11 @@ void* uring_worker_main(void* arg) {
         metal_die("bind :%d: %s", cfg->port, strerror(errno));
     if (listen(lfd, 4096) < 0)
         metal_die("listen: %s", strerror(errno));
+
+    int defer_secs = 1;
+    setsockopt(lfd, IPPROTO_TCP, TCP_DEFER_ACCEPT, &defer_secs, sizeof(defer_secs));
+    int tfo_qlen = 128;
+    setsockopt(lfd, IPPROTO_TCP, TCP_FASTOPEN, &tfo_qlen, sizeof(tfo_qlen));
 
     /* io_uring with 1024 SQ entries — matches the conn pool depth.
      * The CQ defaults to 2x SQ which gives us slack for batched
