@@ -61,6 +61,7 @@ struct tls_worker_ctx {
     size_t   cert_chain_len;
     size_t   cert_lens[8];
     unsigned n_certs;
+    cert_key_type_t key_type;
     uint8_t  ed25519_seed[32];
 };
 
@@ -150,13 +151,20 @@ static int load_cert_material(tls_worker_ctx_t* w) {
 
     int key_len = pem_decode((const char*)key_pem, key_pem_len, "PRIVATE KEY",
                              key_der, key_pem_len);
+    if (key_len <= 0) {
+        key_len = pem_decode((const char*)key_pem, key_pem_len, "RSA PRIVATE KEY",
+                             key_der, key_pem_len);
+    }
     if (key_len <= 0) goto fail;
 
     cert_entry_t e = {0};
-    e.key_type = CERT_KEY_ED25519;
+    e.key_type = cert_detect_key_type(key_der, (size_t)key_len);
     e.key_der = key_der;
     e.key_der_len = (size_t)key_len;
-    if (cert_extract_ed25519_seed(&e, w->ed25519_seed) != 0) goto fail;
+    w->key_type = e.key_type;
+    if (w->key_type == CERT_KEY_ED25519) {
+        if (cert_extract_ed25519_seed(&e, w->ed25519_seed) != 0) goto fail;
+    }
 
     w->cert_chain_der = chain;
     w->cert_chain_len = (size_t)chain_len;
@@ -439,6 +447,12 @@ void* tls_worker_main(void* arg) {
 
     if (load_cert_material(&w) != 0) {
         metal_die("tls_worker_main: failed loading TLS cert/key (need Ed25519 PKCS#8 key)");
+    }
+    if (w.key_type != CERT_KEY_ED25519) {
+        const char* kt = "unknown";
+        if (w.key_type == CERT_KEY_RSA) kt = "rsa";
+        else if (w.key_type == CERT_KEY_ECDSA_P256) kt = "ecdsa-p256";
+        metal_die("tls_worker_main: key type '%s' loaded but handshake signing for this type is not implemented yet (current: Ed25519 only)", kt);
     }
 
     uint8_t local_mac[6];
