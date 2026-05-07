@@ -351,7 +351,7 @@ static pw_disp_status_t tls_on_data(void* per_conn_state,
             http_request_t dummy = {0};
             pw_iov_t resp[PW_IOV_MAX_FRAGS];
             unsigned rn = 0;
-                if (build_http_response_iov(c, HTTP_ERR_413, &dummy, resp, &rn, &close_after) != 0) {
+            if (build_http_response_iov(c, HTTP_ERR_413, &dummy, resp, &rn, &close_after) != 0) {
                 pw_tls_app_in_ack(&c->eng, app_len);
                 return PW_DISP_RESET;
             }
@@ -364,17 +364,33 @@ static pw_disp_status_t tls_on_data(void* per_conn_state,
             memcpy(c->plain + c->plain_len, app, app_len);
             c->plain_len += app_len;
             tls_bridge_t* b = &c->bridge;
-            int prc = tls_bridge_parse_request(b, (const uint8_t*)c->plain, c->plain_len);
-            if (prc == 1 || prc == -1) {
+            /* Parse and seal as many full requests as we can from the
+             * buffered plaintext. This prevents a pipeline stall when
+             * one TLS record carries multiple HTTP requests. */
+            while (c->plain_len > 0) {
+                int prc = tls_bridge_parse_request(b, (const uint8_t*)c->plain, c->plain_len);
+                if (prc == 0) break;   /* incomplete request, wait for more */
+
                 http_request_t req = b->req;
                 http_result_t pr = (prc == 1) ? HTTP_OK : b->parse_status;
                 pw_iov_t resp[PW_IOV_MAX_FRAGS];
                 unsigned rn = 0;
-                if (build_http_response_iov(c, pr, &req, resp, &rn, &close_after) != 0 ||
-                    pw_tls_app_seal_iov(&c->eng, resp, rn) != 0) {
+                if (build_http_response_iov(c, pr, &req, resp, &rn, &close_after) != 0) {
                     pw_tls_app_in_ack(&c->eng, app_len);
                     return PW_DISP_RESET;
                 }
+
+                if (pw_tls_app_seal_iov(&c->eng, resp, rn) != 0) {
+                    /* TX buffer pressure while additional pipelined
+                     * requests are buffered. We cannot safely keep the
+                     * connection open (no callback is guaranteed on pure
+                     * ACK traffic), so flush what we already sealed and
+                     * close. */
+                    close_after = true;
+                    c->plain_len = 0;
+                    break;
+                }
+
                 if (pr == HTTP_OK && req.consumed > 0 && c->plain_len > req.consumed) {
                     size_t left = c->plain_len - req.consumed;
                     memmove(c->plain, c->plain + req.consumed, left);
@@ -382,6 +398,8 @@ static pw_disp_status_t tls_on_data(void* per_conn_state,
                 } else {
                     c->plain_len = 0;
                 }
+
+                if (close_after) break;
             }
         }
         pw_tls_app_in_ack(&c->eng, app_len);
