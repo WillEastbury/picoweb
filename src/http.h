@@ -11,6 +11,7 @@ typedef enum {
     HTTP_OK,
     HTTP_ERR_400,
     HTTP_ERR_405,
+    HTTP_ERR_409,
     HTTP_ERR_413,
     HTTP_ERR_414,
     HTTP_ERR_505,

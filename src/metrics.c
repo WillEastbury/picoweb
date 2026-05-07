@@ -190,21 +190,6 @@ void metrics_build_resources(arena_t* arena,
         r->head_keepalive = build_head_local(arena, "HTTP/1.1 200 OK",
             "text/plain; charset=utf-8", 2, true, date_buf, date_len,
             "Cache-Control: no-store\r\n", &r->head_keepalive_len);
-        /* Flatten wire buffers (head + "OK" body). */
-        {
-            size_t wk_len = r->head_keepalive_len + r->body_len;
-            char* wk = (char*)arena_alloc(arena, wk_len, 64);
-            memcpy(wk, r->head_keepalive, r->head_keepalive_len);
-            memcpy(wk + r->head_keepalive_len, r->body, r->body_len);
-            r->wire_keepalive = wk;
-            r->wire_keepalive_len = wk_len;
-            size_t wc_len = r->head_close_len + r->body_len;
-            char* wc = (char*)arena_alloc(arena, wc_len, 64);
-            memcpy(wc, r->head_close, r->head_close_len);
-            memcpy(wc + r->head_close_len, r->body, r->body_len);
-            r->wire_close = wc;
-            r->wire_close_len = wc_len;
-        }
         metrics_health_resource = r;
     }
 

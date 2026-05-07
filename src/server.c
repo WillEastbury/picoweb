@@ -14,6 +14,7 @@
 #include <sys/epoll.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <sys/uio.h>
 #include <unistd.h>
 
 #ifdef __linux__
@@ -214,12 +215,10 @@ static void try_accept(int listen_fd, int ep, pool_t* pool, int64_t batch_now_ms
         conn->state = ST_READING;
         conn->read_off = 0;
         conn->res = NULL;
-        conn->head_ptr = NULL;
-        conn->head_len = 0;
+        conn->seg_count = 0;
         conn->send_body = false;
         conn->bytes_sent = 0;
         conn->wire_total = 0;
-        conn->wire_buf = NULL;
         conn->close_after = false;
         conn->req_count = 0;
         conn->peer_half_closed = false;
@@ -244,90 +243,46 @@ static void try_accept(int listen_fd, int ep, pool_t* pool, int64_t batch_now_ms
  *   - if no chrome: head || body                       (2 segments)
  *   - if  chrome  : head || chrome.hdr || body || chrome.ftr   (up to 4)
  *
- * Most responses use a pre-concatenated flat wire buffer (head + body
- * in a single contiguous arena allocation). The fast path is a simple
- * send() loop. For mutable resources (/stats), wire_buf is NULL and
- * we fall back to the iovec path (head + body as separate segments). */
+ * All responses use iovec-based sendmsg. Body data is stored ONCE
+ * in the arena — no pre-concatenated wire buffers. Partial sends
+ * are handled by recomputing the iovec from segs[] + bytes_sent. */
 
-/* Slow path for mutable resources (/stats): 2-segment iovec. */
-static int try_send_iovec(conn_t* c) {
-    const resource_t* r = c->res;
-    struct iovec iov[2];
+/* Build a writev iovec from the connection's seg[] array, skipping
+ * past bytes_sent. Returns the segment count. */
+static inline int build_iov(conn_t* c, struct iovec* iov) {
     int n = 0;
-    size_t cursor = 0;
-
-    /* Segment 0: head */
-    size_t head_end = c->head_len;
-    if (c->bytes_sent < head_end) {
-        size_t off = c->bytes_sent;
-        iov[n].iov_base = (void*)(uintptr_t)(c->head_ptr + off);
-        iov[n].iov_len  = c->head_len - off;
+    size_t skip = c->bytes_sent;
+    for (int i = 0; i < c->seg_count; i++) {
+        if (skip >= c->segs[i].len) {
+            skip -= c->segs[i].len;
+            continue;
+        }
+        iov[n].iov_base = (void*)(c->segs[i].ptr + skip);
+        iov[n].iov_len = c->segs[i].len - skip;
+        skip = 0;
         n++;
     }
-    cursor = head_end;
+    return n;
+}
 
-    /* Segment 1: body (if sending) */
-    if (c->send_body && r->body_len) {
-        size_t body_end = cursor + r->body_len;
-        if (c->bytes_sent < body_end) {
-            size_t off = (c->bytes_sent > cursor) ? (c->bytes_sent - cursor) : 0;
-            iov[n].iov_base = (void*)(uintptr_t)(r->body + off);
-            iov[n].iov_len  = r->body_len - off;
-            n++;
-        }
-    }
-
+static __attribute__((hot)) int try_send(conn_t* c) {
     for (;;) {
         if (c->bytes_sent >= c->wire_total) return 1;
+
+        struct iovec iov[4];
+        int n = build_iov(c, iov);
         if (n == 0) return 1;
 
         struct msghdr m = {0};
         m.msg_iov = iov;
-        m.msg_iovlen = n;
-        ssize_t s = sendmsg(c->fd, &m, MSG_NOSIGNAL);
-        if (s < 0) {
-            if (errno == EINTR) continue;
-            if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
-            return -1;
-        }
-        if (s == 0) return -1;
-        c->bytes_sent += (size_t)s;
-        if (c->bytes_sent >= c->wire_total) return 1;
-
-        /* Rebuild iovecs for partial send */
-        n = 0;
-        if (c->bytes_sent < head_end) {
-            iov[n].iov_base = (void*)(uintptr_t)(c->head_ptr + c->bytes_sent);
-            iov[n].iov_len  = head_end - c->bytes_sent;
-            n++;
-        }
-        if (c->send_body && r->body_len) {
-            size_t body_end = cursor + r->body_len;
-            if (c->bytes_sent < body_end) {
-                size_t off = (c->bytes_sent > cursor) ? (c->bytes_sent - cursor) : 0;
-                iov[n].iov_base = (void*)(uintptr_t)(r->body + off);
-                iov[n].iov_len  = r->body_len - off;
-                n++;
-            }
-        }
-    }
-}
-
-/* Fast path: flat wire buffer (head + body pre-concatenated). */
-static __attribute__((hot)) int try_send(conn_t* c) {
-    if (__builtin_expect(c->wire_buf == NULL, 0))
-        return try_send_iovec(c);
-
-    for (;;) {
-        if (c->bytes_sent >= c->wire_total) return 1;
-        size_t rem = c->wire_total - c->bytes_sent;
+        m.msg_iovlen = (size_t)n;
         int flags = MSG_NOSIGNAL;
-        if (g_zc_threshold > 0 && rem >= g_zc_threshold)
+        if (g_zc_threshold > 0 && (c->wire_total - c->bytes_sent) >= g_zc_threshold)
             flags |= MSG_ZEROCOPY;
-        ssize_t s = send(c->fd, c->wire_buf + c->bytes_sent, rem, flags);
+        ssize_t s = sendmsg(c->fd, &m, flags);
         if (s < 0 && errno == ENOBUFS && (flags & MSG_ZEROCOPY)) {
             flags &= ~MSG_ZEROCOPY;
-            s = send(c->fd, c->wire_buf + c->bytes_sent, rem, flags);
+            s = sendmsg(c->fd, &m, flags);
         }
         if (s < 0) {
             if (errno == EINTR) continue;
@@ -387,33 +342,59 @@ static __attribute__((hot)) int dispatch_one(conn_t* c, const jumptable_t* jt, u
 
     c->active_variant = variant;
 
-    /* Select flat wire buffer and total. For mutable resources (/stats)
-     * wire_keepalive is NULL — fall back to iovec send path. */
-    if (variant) {
-        c->wire_buf = close_after ? variant->wire_close : variant->wire_keepalive;
-        c->wire_total = close_after ? variant->wire_close_len : variant->wire_keepalive_len;
-        c->head_ptr = close_after ? variant->head_close      : variant->head_keepalive;
-        c->head_len = close_after ? variant->head_close_len  : variant->head_keepalive_len;
-        if (head_only)
-            c->wire_total = c->head_len;
-    } else if (r->wire_keepalive) {
-        c->wire_buf = close_after ? r->wire_close : r->wire_keepalive;
-        c->wire_total = close_after ? r->wire_close_len : r->wire_keepalive_len;
-        c->head_ptr = close_after ? r->head_close       : r->head_keepalive;
-        c->head_len = close_after ? r->head_close_len   : r->head_keepalive_len;
-        if (head_only)
-            c->wire_total = c->head_len;
-    } else {
-        /* Mutable resource (/stats): no flat wire buffer. */
-        c->wire_buf = NULL;
-        c->head_ptr = close_after ? r->head_close       : r->head_keepalive;
-        c->head_len = close_after ? r->head_close_len   : r->head_keepalive_len;
-        c->wire_total = c->head_len + (head_only ? 0 : r->body_len);
+    /* Build iovec segments: head + body pieces.
+     * Compressed variants: 2 segments (head + compressed_body).
+     * Identity chromed:    4 segments (head + chrome.hdr + body + chrome.ftr).
+     * Identity plain:      2 segments (head + body).
+     * 304 / HEAD:          1 segment  (head only). */
+    {
+        const char* head = close_after
+            ? (variant ? variant->head_close       : r->head_close)
+            : (variant ? variant->head_keepalive   : r->head_keepalive);
+        size_t head_len = close_after
+            ? (variant ? variant->head_close_len   : r->head_close_len)
+            : (variant ? variant->head_keepalive_len : r->head_keepalive_len);
+
+        int ns = 0;
+        c->segs[ns].ptr = head;
+        c->segs[ns].len = head_len;
+        ns++;
+
+        if (!head_only) {
+            if (variant) {
+                /* Compressed: chrome baked into compressed body. */
+                c->segs[ns].ptr = variant->body;
+                c->segs[ns].len = variant->body_len;
+                ns++;
+            } else {
+                /* Identity: chrome segments + raw body. */
+                if (r->chrome && r->chrome->hdr_len) {
+                    c->segs[ns].ptr = r->chrome->hdr;
+                    c->segs[ns].len = r->chrome->hdr_len;
+                    ns++;
+                }
+                if (r->body_len) {
+                    c->segs[ns].ptr = r->body;
+                    c->segs[ns].len = r->body_len;
+                    ns++;
+                }
+                if (r->chrome && r->chrome->ftr_len) {
+                    c->segs[ns].ptr = r->chrome->ftr;
+                    c->segs[ns].len = r->chrome->ftr_len;
+                    ns++;
+                }
+            }
+        }
+
+        c->seg_count = (uint8_t)ns;
+        size_t total = 0;
+        for (int i = 0; i < ns; i++) total += c->segs[i].len;
+        c->wire_total = total;
     }
 
     /* ETag / 304 Not Modified: if the client sent If-None-Match and it
      * matches the selected variant's ETag, override with the pre-built
-     * 304 wire buffer. Only for successful GET/HEAD on static resources. */
+     * 304 wire buffer (single segment, no body). */
     if (pr == HTTP_OK && req.if_none_match &&
         (req.method == M_GET || req.method == M_HEAD)) {
         const char* etag;
@@ -432,11 +413,11 @@ static __attribute__((hot)) int dispatch_one(conn_t* c, const jumptable_t* jt, u
         }
         if (etag && w304 && etag_matches(req.if_none_match,
                                           req.if_none_match_len, etag)) {
-            c->wire_buf = w304;
+            c->segs[0].ptr = w304;
+            c->segs[0].len = w304_len;
+            c->seg_count = 1;
             c->wire_total = w304_len;
-            c->head_ptr = w304;
-            c->head_len = w304_len;
-            head_only = true;  /* no body for 304 */
+            head_only = true;
         }
     }
 
@@ -482,11 +463,9 @@ static __attribute__((hot)) bool post_send(conn_t* c, int ep, pool_t* pool,
 
         /* Reset write-side state for next request. */
         c->res         = NULL;
-        c->head_ptr    = NULL;
-        c->head_len    = 0;
+        c->seg_count   = 0;
         c->bytes_sent  = 0;
         c->wire_total  = 0;
-        c->wire_buf    = NULL;
         c->send_body   = false;
         c->active_variant = NULL;
         c->state       = ST_READING;

@@ -638,13 +638,12 @@ static void attach_brotli_variant(arena_t* arena, resource_t* r,
 static const char kBody400[] = "<!doctype html><title>400</title><h1>400 Bad Request</h1>";
 static const char kBody404[] = "<!doctype html><title>404</title><h1>404 Not Found</h1>";
 static const char kBody405[] = "<!doctype html><title>405</title><h1>405 Method Not Allowed</h1>";
+static const char kBody409[] = "<!doctype html><title>409</title><h1>409 Conflict</h1><p>Unknown or missing Host</p>";
 static const char kBody413[] = "<!doctype html><title>413</title><h1>413 Payload Too Large</h1>";
 static const char kBody414[] = "<!doctype html><title>414</title><h1>414 URI Too Long</h1>";
 static const char kBody505[] = "<!doctype html><title>505</title><h1>505 HTTP Version Not Supported</h1>";
 
-/* Forward declarations for wire buffer builders. */
-static void build_wire_resource(arena_t* arena, resource_t* r);
-static void build_wire_variant(arena_t* arena, resource_compress_t* rc);
+/* Forward declarations for 304 buffer builders. */
 static void build_304_resource(arena_t* arena, resource_t* r, const char* cache_vary_header);
 static void build_304_variant(arena_t* arena, resource_compress_t* rc, const char* cache_vary_header);
 
@@ -654,6 +653,7 @@ static void build_canned_errors(jumptable_t* jt) {
     const char* b400 = (const char*)arena_dup(a, kBody400, sizeof(kBody400) - 1);
     const char* b404 = (const char*)arena_dup(a, kBody404, sizeof(kBody404) - 1);
     const char* b405 = (const char*)arena_dup(a, kBody405, sizeof(kBody405) - 1);
+    const char* b409 = (const char*)arena_dup(a, kBody409, sizeof(kBody409) - 1);
     const char* b413 = (const char*)arena_dup(a, kBody413, sizeof(kBody413) - 1);
     const char* b414 = (const char*)arena_dup(a, kBody414, sizeof(kBody414) - 1);
     const char* b505 = (const char*)arena_dup(a, kBody505, sizeof(kBody505) - 1);
@@ -664,19 +664,14 @@ static void build_canned_errors(jumptable_t* jt) {
     jt->err_405 = build_resource(a, "HTTP/1.1 405 Method Not Allowed",
         "text/html; charset=utf-8", b405, sizeof(kBody405) - 1,
         "Allow: GET, HEAD\r\nCache-Control: no-cache\r\n");
+    jt->err_409 = build_resource(a, "HTTP/1.1 409 Conflict",
+        "text/html; charset=utf-8", b409, sizeof(kBody409) - 1, kNoCache);
     jt->err_413 = build_resource(a, "HTTP/1.1 413 Payload Too Large",
         "text/html; charset=utf-8", b413, sizeof(kBody413) - 1, kNoCache);
     jt->err_414 = build_resource(a, "HTTP/1.1 414 URI Too Long",
         "text/html; charset=utf-8", b414, sizeof(kBody414) - 1, kNoCache);
     jt->err_505 = build_resource(a, "HTTP/1.1 505 HTTP Version Not Supported",
         "text/html; charset=utf-8", b505, sizeof(kBody505) - 1, kNoCache);
-    /* Flatten wire buffers for all canned errors. */
-    build_wire_resource(a, (resource_t*)jt->err_400);
-    build_wire_resource(a, (resource_t*)jt->err_404);
-    build_wire_resource(a, (resource_t*)jt->err_405);
-    build_wire_resource(a, (resource_t*)jt->err_413);
-    build_wire_resource(a, (resource_t*)jt->err_414);
-    build_wire_resource(a, (resource_t*)jt->err_505);
 }
 
 static const char* slurp(arena_t* arena, const char* path, off_t expected, size_t* out_len) {
@@ -731,63 +726,8 @@ static void compute_etag(char* out, size_t outsz,
 }
 
 /* ============================================================== */
-/* Flat wire buffer construction.                                 */
-/* Pre-concatenate head + body into a single contiguous buffer so */
-/* the hot path can send() from one pointer instead of building   */
-/* iovecs per request.                                            */
+/* 304 Not Modified wire buffers.                                 */
 /* ============================================================== */
-
-static void build_wire_resource(arena_t* arena, resource_t* r) {
-    size_t body_total = r->body_len;
-    if (r->chrome) body_total += r->chrome->hdr_len + r->chrome->ftr_len;
-
-    /* wire_keepalive: head_keepalive || [chrome.hdr ||] body [|| chrome.ftr] */
-    size_t wk_len = r->head_keepalive_len + body_total;
-    char* wk = (char*)arena_alloc(arena, wk_len, 64);
-    size_t off = 0;
-    memcpy(wk + off, r->head_keepalive, r->head_keepalive_len); off += r->head_keepalive_len;
-    if (r->chrome && r->chrome->hdr_len) { memcpy(wk + off, r->chrome->hdr, r->chrome->hdr_len); off += r->chrome->hdr_len; }
-    if (r->body_len) { memcpy(wk + off, r->body, r->body_len); off += r->body_len; }
-    if (r->chrome && r->chrome->ftr_len) { memcpy(wk + off, r->chrome->ftr, r->chrome->ftr_len); }
-    r->wire_keepalive = wk;
-    r->wire_keepalive_len = wk_len;
-
-    /* wire_close: head_close || [chrome.hdr ||] body [|| chrome.ftr] */
-    size_t wc_len = r->head_close_len + body_total;
-    char* wc = (char*)arena_alloc(arena, wc_len, 64);
-    off = 0;
-    memcpy(wc + off, r->head_close, r->head_close_len); off += r->head_close_len;
-    if (r->chrome && r->chrome->hdr_len) { memcpy(wc + off, r->chrome->hdr, r->chrome->hdr_len); off += r->chrome->hdr_len; }
-    if (r->body_len) { memcpy(wc + off, r->body, r->body_len); off += r->body_len; }
-    if (r->chrome && r->chrome->ftr_len) { memcpy(wc + off, r->chrome->ftr, r->chrome->ftr_len); }
-    r->wire_close = wc;
-    r->wire_close_len = wc_len;
-
-    /* ETag: hash the body portion of the wire buffer (excludes headers). */
-    const char* payload = wk + r->head_keepalive_len;
-    compute_etag(r->etag, sizeof(r->etag), payload, body_total);
-}
-
-static void build_wire_variant(arena_t* arena, resource_compress_t* rc) {
-    /* wire_keepalive: head || compressed_body */
-    size_t wk_len = rc->head_keepalive_len + rc->body_len;
-    char* wk = (char*)arena_alloc(arena, wk_len, 64);
-    memcpy(wk, rc->head_keepalive, rc->head_keepalive_len);
-    memcpy(wk + rc->head_keepalive_len, rc->body, rc->body_len);
-    rc->wire_keepalive = wk;
-    rc->wire_keepalive_len = wk_len;
-
-    /* wire_close */
-    size_t wc_len = rc->head_close_len + rc->body_len;
-    char* wc = (char*)arena_alloc(arena, wc_len, 64);
-    memcpy(wc, rc->head_close, rc->head_close_len);
-    memcpy(wc + rc->head_close_len, rc->body, rc->body_len);
-    rc->wire_close = wc;
-    rc->wire_close_len = wc_len;
-
-    /* ETag: hash the compressed body bytes. */
-    compute_etag(rc->etag, sizeof(rc->etag), rc->body, rc->body_len);
-}
 
 /* Build pre-rendered 304 Not Modified wire buffers for a resource.
  * Called after ETags are computed. cache_vary_header is the combined
@@ -873,7 +813,6 @@ bool jumptable_build(jumptable_t* jt, const char* wwwroot) {
                      + total_bytes * 6 / 5         /* brotli copies */
                      + total_entries * 768
                      + total_entries * 512         /* resource_compress_t*2 + variant heads */
-                     + total_entries * 1024        /* flat wire buffers (head+body duplication) */
                      + slot_count * sizeof(flat_slot_t)
                      + total_hosts * 512
                      + 2 * 768                   /* /health + /stats heads */
@@ -900,6 +839,13 @@ bool jumptable_build(jumptable_t* jt, const char* wwwroot) {
         if (h->name_len == DEFAULT_HOST_LEN &&
             memcmp(h->name, DEFAULT_HOST, DEFAULT_HOST_LEN) == 0) {
             jt->has_default = true;
+        }
+
+        /* Register in known_hosts for virtual-host validation. */
+        if (jt->known_host_count < 128) {
+            jt->known_hosts[jt->known_host_count].name = host_key;
+            jt->known_hosts[jt->known_host_count].len = h->name_len;
+            jt->known_host_count++;
         }
 
         /* Materialize per-host chrome. Header and footer bytes are copied
@@ -1005,14 +951,6 @@ bool jumptable_build(jumptable_t* jt, const char* wwwroot) {
                                           "HTTP/1.1 200 OK", mime, cache_hdr);
                 }
 
-                /* Flatten wire buffers: head + body into single
-                 * contiguous arena allocation for each variant. */
-                build_wire_resource(&jt->arena, r);
-                if (r->compressed)
-                    build_wire_variant(&jt->arena, (resource_compress_t*)r->compressed);
-                if (r->brotli)
-                    build_wire_variant(&jt->arena, (resource_compress_t*)r->brotli);
-
                 /* Build 304 Not Modified wire buffers for conditional requests. */
                 {
                     const char* cv_hdr = compressible
@@ -1081,6 +1019,115 @@ bool jumptable_build(jumptable_t* jt, const char* wwwroot) {
         }
     }
 
+    /* ---- Site aliases ---- */
+    /* Parse wwwroot/_aliases: each line is "alias = target".
+     * For each alias, duplicate all flat-table entries from the target
+     * host under the alias hostname (sharing the same resource_t*). */
+    {
+        char aliases_path[4096];
+        int apn = snprintf(aliases_path, sizeof(aliases_path), "%s/_aliases", wwwroot);
+        if (apn > 0 && (size_t)apn < sizeof(aliases_path)) {
+            FILE* af = fopen(aliases_path, "r");
+            if (af) {
+                char line[1024];
+                while (fgets(line, sizeof(line), af)) {
+                    /* Strip newline. */
+                    size_t ll = strlen(line);
+                    while (ll > 0 && (line[ll-1] == '\n' || line[ll-1] == '\r')) line[--ll] = '\0';
+                    if (ll == 0 || line[0] == '#') continue;
+
+                    /* Parse "alias = target" */
+                    char* eq = strchr(line, '=');
+                    if (!eq) {
+                        metal_log("warn: _aliases: bad line (no '='): %s", line);
+                        continue;
+                    }
+                    *eq = '\0';
+                    /* Trim whitespace from alias (left side) */
+                    char* alias = line;
+                    while (*alias == ' ' || *alias == '\t') alias++;
+                    char* ae = eq - 1;
+                    while (ae > alias && (*ae == ' ' || *ae == '\t')) *ae-- = '\0';
+                    /* Trim whitespace from target (right side) */
+                    char* target = eq + 1;
+                    while (*target == ' ' || *target == '\t') target++;
+                    char* te = target + strlen(target) - 1;
+                    while (te > target && (*te == ' ' || *te == '\t')) *te-- = '\0';
+
+                    size_t alias_len = strlen(alias);
+                    size_t target_len = strlen(target);
+                    if (alias_len == 0 || target_len == 0 || alias_len > 253) {
+                        metal_log("warn: _aliases: invalid alias/target: '%s' = '%s'", alias, target);
+                        continue;
+                    }
+
+                    /* Lowercase both. */
+                    metal_lower_inplace(alias, alias_len);
+                    metal_lower_inplace(target, target_len);
+
+                    /* Reject alias == target. */
+                    if (alias_len == target_len && memcmp(alias, target, alias_len) == 0) {
+                        metal_log("warn: _aliases: alias == target: '%s'", alias);
+                        continue;
+                    }
+
+                    /* Verify target is a real host (not another alias). */
+                    bool found_target = false;
+                    for (build_host_t* h = hosts; h; h = h->next) {
+                        if (h->name_len == target_len && memcmp(h->name, target, target_len) == 0) {
+                            found_target = true;
+                            break;
+                        }
+                    }
+                    if (!found_target) {
+                        metal_log("warn: _aliases: target host '%s' not found", target);
+                        continue;
+                    }
+
+                    /* Reject alias that collides with a real host directory. */
+                    bool collides = false;
+                    for (build_host_t* h = hosts; h; h = h->next) {
+                        if (h->name_len == alias_len && memcmp(h->name, alias, alias_len) == 0) {
+                            collides = true;
+                            break;
+                        }
+                    }
+                    if (collides) {
+                        metal_log("warn: _aliases: alias '%s' collides with real host", alias);
+                        continue;
+                    }
+
+                    /* Duplicate flat-table entries from target under alias. */
+                    const char* alias_key = arena_strdup_n(&jt->arena, alias, alias_len, false);
+                    size_t duped = 0;
+                    for (size_t i = 0; i < jt->cap; i++) {
+                        flat_slot_t* s = &jt->slots[i];
+                        if (!s->value) continue;
+                        uint32_t s_host_len = s->lens >> 16;
+                        uint32_t s_path_len = s->lens & 0xFFFF;
+                        if (s_host_len == target_len &&
+                            memcmp(s->host, target, target_len) == 0) {
+                            const char* path_key = arena_strdup_n(&jt->arena, s->path, s_path_len, false);
+                            flat_insert(jt, alias_key, alias_len, path_key, s_path_len, s->value);
+                            duped++;
+                        }
+                    }
+
+                    /* Register alias in known_hosts. */
+                    if (jt->known_host_count < 128) {
+                        jt->known_hosts[jt->known_host_count].name = alias_key;
+                        jt->known_hosts[jt->known_host_count].len = alias_len;
+                        jt->known_host_count++;
+                    }
+
+                    metal_log("  alias '%s' -> '%s': %zu resource(s) duplicated",
+                              alias, target, duped);
+                }
+                fclose(af);
+            }
+        }
+    }
+
     build_free(hosts);
 
     if (!arena_freeze(&jt->arena)) {
@@ -1100,12 +1147,15 @@ const resource_t* jumptable_lookup(const jumptable_t* jt,
                                    const char* host, size_t host_len,
                                    const char* path, size_t path_len) {
     if (path_len == 0 || path[0] != '/') return NULL;
-    const resource_t* r = flat_lookup(jt, host, host_len, path, path_len);
-    if (r) return r;
-    if (jt->has_default &&
-        !(host_len == DEFAULT_HOST_LEN &&
-          memcmp(host, DEFAULT_HOST, DEFAULT_HOST_LEN) == 0)) {
-        r = flat_lookup(jt, DEFAULT_HOST, DEFAULT_HOST_LEN, path, path_len);
+    return flat_lookup(jt, host, host_len, path, path_len);
+}
+
+bool jumptable_host_exists(const jumptable_t* jt,
+                           const char* host, size_t host_len) {
+    for (size_t i = 0; i < jt->known_host_count; i++) {
+        if (jt->known_hosts[i].len == host_len &&
+            memcmp(jt->known_hosts[i].name, host, host_len) == 0)
+            return true;
     }
-    return r;
+    return false;
 }

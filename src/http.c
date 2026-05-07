@@ -197,7 +197,7 @@ http_result_t http_parse(char* buf, size_t buf_len, http_request_t* out) {
         p = eol + 2;
     }
 
-    if (host_seen == 0) return HTTP_ERR_400;
+    if (host_seen == 0) return HTTP_ERR_409;
 
     /* If the request declared a body, force-close after responding —
      * we can't safely parse the next request because we won't drain. */
@@ -224,6 +224,7 @@ const resource_t* http_select(const jumptable_t* jt,
     /* Parse-level errors: cannot trust framing for next request. */
     switch (pr) {
         case HTTP_ERR_400: *out_close_after = true; return jt->err_400;
+        case HTTP_ERR_409: *out_close_after = true; return jt->err_409;
         case HTTP_ERR_413: *out_close_after = true; return jt->err_413;
         case HTTP_ERR_414: *out_close_after = true; return jt->err_414;
         case HTTP_ERR_505: *out_close_after = true; return jt->err_505;
@@ -250,6 +251,12 @@ const resource_t* http_select(const jumptable_t* jt,
     }
 
     *out_head_only = (req->method == M_HEAD);
+
+    /* Virtual-host check: reject requests for unknown hosts with 409. */
+    if (!jumptable_host_exists(jt, req->host, req->host_len)) {
+        *out_close_after = true;
+        return jt->err_409;
+    }
 
     const resource_t* r = jumptable_lookup(jt, req->host, req->host_len,
                                            req->path, req->path_len);

@@ -36,8 +36,7 @@ conn_t* pool_alloc(pool_t* p) {
 void pool_free(pool_t* p, conn_t* c) {
     c->fd = -1;
     c->res = NULL;
-    c->head_ptr = NULL;
-    c->head_len = 0;
+    c->seg_count = 0;
     c->bytes_sent = 0;
     c->read_off = 0;
     c->state = ST_READING;

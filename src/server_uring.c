@@ -323,38 +323,23 @@ static bool submit_sendmsg(ring_t* r, conn_t* c, size_t conn_idx,
                            size_t total_payload) {
     uring_state_t* us = &g_uring_state[conn_idx];
 
-    if (__builtin_expect(c->wire_buf != NULL, 1)) {
-        /* Fast path: flat wire buffer, single iovec. */
-        us->iov[0].iov_base = (void*)(uintptr_t)(c->wire_buf + c->bytes_sent);
-        us->iov[0].iov_len  = c->wire_total - c->bytes_sent;
-        if (us->iov[0].iov_len == 0) return false;
-        memset(&us->mh, 0, sizeof(us->mh));
-        us->mh.msg_iov    = us->iov;
-        us->mh.msg_iovlen = 1;
-    } else {
-        /* Slow path for mutable resources (/stats): 2-segment iovec. */
-        const resource_t* res = c->res;
-        int n = 0;
-        size_t head_end = c->head_len;
-        if (c->bytes_sent < head_end) {
-            us->iov[n].iov_base = (void*)(uintptr_t)(c->head_ptr + c->bytes_sent);
-            us->iov[n].iov_len  = head_end - c->bytes_sent;
-            n++;
+    /* Build iovec from conn_t segments, skipping past bytes_sent. */
+    int n = 0;
+    size_t skip = c->bytes_sent;
+    for (int i = 0; i < c->seg_count; i++) {
+        if (skip >= c->segs[i].len) {
+            skip -= c->segs[i].len;
+            continue;
         }
-        if (c->send_body && res->body_len) {
-            size_t body_end = head_end + res->body_len;
-            if (c->bytes_sent < body_end) {
-                size_t off = (c->bytes_sent > head_end) ? (c->bytes_sent - head_end) : 0;
-                us->iov[n].iov_base = (void*)(uintptr_t)(res->body + off);
-                us->iov[n].iov_len  = res->body_len - off;
-                n++;
-            }
-        }
-        if (n == 0) return false;
-        memset(&us->mh, 0, sizeof(us->mh));
-        us->mh.msg_iov    = us->iov;
-        us->mh.msg_iovlen = (size_t)n;
+        us->iov[n].iov_base = (void*)(c->segs[i].ptr + skip);
+        us->iov[n].iov_len = c->segs[i].len - skip;
+        skip = 0;
+        n++;
     }
+    if (n == 0) return false;
+    memset(&us->mh, 0, sizeof(us->mh));
+    us->mh.msg_iov    = us->iov;
+    us->mh.msg_iovlen = (size_t)n;
 
     struct io_uring_sqe* sqe = ring_get_sqe(r);
     if (!sqe) return false;
@@ -378,11 +363,9 @@ static bool submit_sendmsg(ring_t* r, conn_t* c, size_t conn_idx,
 
 static void conn_reset_for_next(conn_t* c) {
     c->res         = NULL;
-    c->head_ptr    = NULL;
-    c->head_len    = 0;
+    c->seg_count   = 0;
     c->bytes_sent  = 0;
     c->wire_total  = 0;
-    c->wire_buf    = NULL;
     c->send_body   = false;
     c->active_variant = NULL;
     c->state       = ST_READING;
@@ -394,11 +377,10 @@ static void conn_init_new(conn_t* c, int fd) {
     c->state = ST_READING;
     c->read_off = 0;
     c->res = NULL;
-    c->head_ptr = NULL; c->head_len = 0;
+    c->seg_count = 0;
     c->send_body = false;
     c->active_variant = NULL;
     c->wire_total = 0;
-    c->wire_buf = NULL;
     c->bytes_sent = 0;
     c->close_after = false;
     c->req_count = 0;
@@ -440,24 +422,48 @@ static bool dispatch_one(conn_t* c, const jumptable_t* jt, uint32_t max_req) {
 
     c->active_variant = variant;
 
-    /* Select flat wire buffer — same logic as epoll backend. */
-    if (variant) {
-        c->wire_buf = close_after ? variant->wire_close : variant->wire_keepalive;
-        c->wire_total = close_after ? variant->wire_close_len : variant->wire_keepalive_len;
-        c->head_ptr = close_after ? variant->head_close : variant->head_keepalive;
-        c->head_len = close_after ? variant->head_close_len : variant->head_keepalive_len;
-        if (head_only) c->wire_total = c->head_len;
-    } else if (r->wire_keepalive) {
-        c->wire_buf = close_after ? r->wire_close : r->wire_keepalive;
-        c->wire_total = close_after ? r->wire_close_len : r->wire_keepalive_len;
-        c->head_ptr = close_after ? r->head_close : r->head_keepalive;
-        c->head_len = close_after ? r->head_close_len : r->head_keepalive_len;
-        if (head_only) c->wire_total = c->head_len;
-    } else {
-        c->wire_buf = NULL;
-        c->head_ptr = close_after ? r->head_close : r->head_keepalive;
-        c->head_len = close_after ? r->head_close_len : r->head_keepalive_len;
-        c->wire_total = c->head_len + (head_only ? 0 : r->body_len);
+    /* Build iovec segments — same logic as epoll backend. */
+    {
+        const char* head = close_after
+            ? (variant ? variant->head_close       : r->head_close)
+            : (variant ? variant->head_keepalive   : r->head_keepalive);
+        size_t head_len = close_after
+            ? (variant ? variant->head_close_len   : r->head_close_len)
+            : (variant ? variant->head_keepalive_len : r->head_keepalive_len);
+
+        int ns = 0;
+        c->segs[ns].ptr = head;
+        c->segs[ns].len = head_len;
+        ns++;
+
+        if (!head_only) {
+            if (variant) {
+                c->segs[ns].ptr = variant->body;
+                c->segs[ns].len = variant->body_len;
+                ns++;
+            } else {
+                if (r->chrome && r->chrome->hdr_len) {
+                    c->segs[ns].ptr = r->chrome->hdr;
+                    c->segs[ns].len = r->chrome->hdr_len;
+                    ns++;
+                }
+                if (r->body_len) {
+                    c->segs[ns].ptr = r->body;
+                    c->segs[ns].len = r->body_len;
+                    ns++;
+                }
+                if (r->chrome && r->chrome->ftr_len) {
+                    c->segs[ns].ptr = r->chrome->ftr;
+                    c->segs[ns].len = r->chrome->ftr_len;
+                    ns++;
+                }
+            }
+        }
+
+        c->seg_count = (uint8_t)ns;
+        size_t total = 0;
+        for (int i = 0; i < ns; i++) total += c->segs[i].len;
+        c->wire_total = total;
     }
 
     /* ETag / 304 Not Modified — same logic as epoll backend. */
@@ -479,10 +485,10 @@ static bool dispatch_one(conn_t* c, const jumptable_t* jt, uint32_t max_req) {
         }
         if (etag && w304 && etag_matches(req.if_none_match,
                                           req.if_none_match_len, etag)) {
-            c->wire_buf = w304;
+            c->segs[0].ptr = w304;
+            c->segs[0].len = w304_len;
+            c->seg_count = 1;
             c->wire_total = w304_len;
-            c->head_ptr = w304;
-            c->head_len = w304_len;
             head_only = true;
         }
     }
