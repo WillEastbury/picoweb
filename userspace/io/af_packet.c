@@ -73,6 +73,7 @@ int af_packet_recv(af_packet_t* a,
     (void)csum_not_ready;
     return -1;
 #else
+    if (!a || !buf || !ip_out || !ip_len_out || !csum_not_ready) return -1;
     *csum_not_ready = 0;
 
     struct iovec iov = { .iov_base = buf, .iov_len = buf_cap };

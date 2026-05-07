@@ -329,7 +329,7 @@ static int parse_extensions(const uint8_t* ext_data, size_t ext_len,
 int tls13_parse_client_hello(const uint8_t* msg, size_t msg_len,
                              tls13_client_hello_t* out) {
     if (!msg || !out) return -1;
-    memset(out, 0, sizeof(*out));
+    secure_zero(out, sizeof(*out));
     out->raw = msg;
     out->raw_len = msg_len;
 

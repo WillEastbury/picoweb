@@ -68,6 +68,11 @@ struct tls_worker_ctx {
     uint16_t cert_sig_scheme;
 };
 
+static void secure_memzero(void* p, size_t n) {
+    volatile unsigned char* v = (volatile unsigned char*)p;
+    while (n--) *v++ = 0;
+}
+
 static int rng_fill(void* user, uint8_t* dst, size_t n) {
     (void)user;
     while (n) {
@@ -132,6 +137,7 @@ static int load_cert_material(tls_worker_ctx_t* w) {
     uint8_t* cert_pem = slurp_file(w->cfg->tls_cert_path, &cert_pem_len);
     uint8_t* key_pem = slurp_file(w->cfg->tls_key_path, &key_pem_len);
     if (!cert_pem || !key_pem) {
+        if (key_pem && key_pem_len) secure_memzero(key_pem, key_pem_len);
         free(cert_pem);
         free(key_pem);
         return -1;
@@ -179,10 +185,13 @@ static int load_cert_material(tls_worker_ctx_t* w) {
     w->key_der = key_der;
     w->key_der_len = (size_t)key_len;
 
+    if (key_pem_len) secure_memzero(key_pem, key_pem_len);
     free(cert_pem);
     free(key_pem);
     return 0;
 fail:
+    if (key_pem && key_pem_len) secure_memzero(key_pem, key_pem_len);
+    if (key_der && key_pem_len) secure_memzero(key_der, key_pem_len);
     free(cert_pem);
     free(key_pem);
     free(chain);

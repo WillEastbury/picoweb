@@ -71,10 +71,8 @@ int ip_tcp_parse_ex(const uint8_t* frame, size_t len, tcp_seg_t* out,
     uint16_t total = rd16(frame + 2);
     if (total > len) return -1;
 
-    /* IPv4 header checksum (RFC 791).  skip_csum is set when the
-     * kernel flags TP_STATUS_CSUMNOTREADY — i.e. TX-offload on a
-     * virtual interface left the field incomplete. */
-    if (!skip_csum && inet_csum(frame, ihl) != 0) return -1;
+    /* Always validate the IPv4 header checksum (RFC 791). */
+    if (inet_csum(frame, ihl) != 0) return -1;
 
     out->src_ip = rd32(frame + 12);
     out->dst_ip = rd32(frame + 16);
@@ -89,7 +87,7 @@ int ip_tcp_parse_ex(const uint8_t* frame, size_t len, tcp_seg_t* out,
     size_t doff = ((tcp[12] >> 4) & 0x0f) * 4u;
     if (doff < TCP_HEADER_LEN || doff > tcp_len) return -1;
 
-    /* TCP checksum — skip when kernel flagged CSUMNOTREADY. */
+    /* TCP checksum only: skip when kernel flagged CSUMNOTREADY. */
     if (!skip_csum && tcp_checksum(out->src_ip, out->dst_ip, tcp, tcp_len) !=
         rd16(tcp + 16)) return -1;
 
