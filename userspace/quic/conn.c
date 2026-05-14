@@ -11,6 +11,7 @@ void quic_conn_init_server(quic_conn_t* c)
     quic_crypto_rx_init(&c->rx_initial,
                         c->rx_initial_data, sizeof c->rx_initial_data,
                         c->rx_initial_bm,   sizeof c->rx_initial_bm);
+    quic_crypto_tx_init(&c->tx_initial);
 }
 
 void quic_conn_force_derive_initial_keys(quic_conn_t* c,
@@ -227,4 +228,102 @@ int quic_conn_initial_extract_client_hello(const quic_conn_t* c,
     if (quic_tp_decode(tp_body, tp_body_len, peer_tp_out) != 1) return -1;
 
     return 1;
+}
+
+/* ---- phase 5e3: outbound Initial emission ---------------------------- */
+
+void quic_conn_set_our_scid(quic_conn_t* c,
+                            const uint8_t* scid, size_t scid_len)
+{
+    if (!c) return;
+    if (scid_len > QUIC_MAX_CID_LEN) scid_len = QUIC_MAX_CID_LEN;
+    if (scid_len > 0 && scid != NULL) memcpy(c->our_scid, scid, scid_len);
+    c->our_scid_len = scid_len;
+}
+
+void quic_conn_initial_tx_set_pending(quic_conn_t* c,
+                                      const uint8_t* bytes, size_t len)
+{
+    if (!c) return;
+    quic_crypto_tx_set_pending(&c->tx_initial, bytes, len);
+}
+
+/* Lazily derive the server-direction Initial keys (used for outbound
+ * encryption). For a server conn that's is_server=1; for a client
+ * conn it'd be is_server=0. The seed is peer_dcid — the very same DCID
+ * the peer used to address its first Initial to us. */
+static void ensure_initial_tx_keys(quic_conn_t* c)
+{
+    if (c->initial_tx_keys_ready) return;
+    if (!c->peer_addrs_known) return;
+    int is_server_for_encrypt = (c->role == QUIC_ROLE_SERVER) ? 1 : 0;
+    quic_initial_derive(c->peer_dcid, c->peer_dcid_len,
+                        is_server_for_encrypt, &c->initial_tx_keys);
+    c->initial_tx_keys_ready = 1;
+}
+
+size_t quic_conn_emit_initial(quic_conn_t* c, uint8_t* out, size_t out_cap)
+{
+    if (!c || !out) return 0;
+    if (!c->peer_addrs_known) return 0;
+
+    /* Budget the CRYPTO chunk so the resulting packet fits in out_cap.
+     * AEAD overhead = 16 bytes. Long header: 1 + 4 + 1 + dcid + 1 +
+     * scid + 0 (token len, server) + 2 (length varint, conservative) +
+     * pn_len. We use pn_len=2. CRYPTO frame overhead: 1 (type) + up to
+     * 8 (offset varint) + up to 8 (length varint).
+     *
+     * To stay simple+correct we conservatively cap headers+overhead
+     * and let the chunk fill the rest.
+     */
+    const size_t aead_tag = 16;
+    const size_t hdr_overhead = 1 + 4 + 1 + c->peer_scid_len
+                                + 1 + c->our_scid_len
+                                + 1 /* token_len varint = 0 */
+                                + 2 /* length varint */
+                                + 2 /* pn_len */;
+    const size_t crypto_frame_overhead = 1 /* type */ + 8 /* offset */ + 8 /* length */;
+    const size_t fixed = hdr_overhead + crypto_frame_overhead + aead_tag;
+    if (out_cap <= fixed) return 0;
+    size_t chunk_budget = out_cap - fixed;
+
+    uint64_t       chunk_off = 0;
+    const uint8_t* chunk_ptr = NULL;
+    size_t         chunk_len = 0;
+    if (quic_crypto_tx_next(&c->tx_initial, chunk_budget,
+                            &chunk_off, &chunk_ptr, &chunk_len) != 1) {
+        return 0;  /* nothing pending */
+    }
+
+    /* Encode CRYPTO frame into a scratch payload buffer. */
+    uint8_t frames[2048];
+    if (chunk_len + 32 > sizeof frames) chunk_len = sizeof frames - 32;
+    size_t fn = quic_frame_crypto_encode(frames, sizeof frames,
+                                         chunk_off, chunk_ptr, chunk_len);
+    if (fn == 0) return 0;
+
+    ensure_initial_tx_keys(c);
+    if (!c->initial_tx_keys_ready) return 0;
+
+    quic_initial_pkt_t pkt = {0};
+    pkt.version = 0x00000001u;
+    if (c->peer_scid_len > 0)
+        memcpy(pkt.dcid, c->peer_scid, c->peer_scid_len);
+    pkt.dcid_len = c->peer_scid_len;
+    if (c->our_scid_len > 0)
+        memcpy(pkt.scid, c->our_scid, c->our_scid_len);
+    pkt.scid_len = c->our_scid_len;
+    pkt.token_len = 0;
+    pkt.pn = c->initial_tx_next_pn;
+    pkt.pn_len = 2;
+    pkt.payload = frames;
+    pkt.payload_len = fn;
+
+    size_t n = quic_initial_build(out, out_cap, &pkt,
+                                  &c->initial_tx_keys, /*pad_to_min=*/0);
+    if (n == 0) return 0;
+
+    quic_crypto_tx_consume(&c->tx_initial, chunk_len);
+    c->initial_tx_next_pn++;
+    return n;
 }

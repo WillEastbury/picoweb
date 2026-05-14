@@ -2248,8 +2248,149 @@ static void test_conn_extract_ch_not_handshake_type(void) {
               quic_conn_initial_extract_client_hello(&conn, &parsed, &peer_tp), -1);
 }
 
-/* ============================================================== */
+/* ---------------- phase 5e3: outbound Initial emission --------------- */
 
+/* Drive the §A.2 client Initial through a server conn so peer_dcid/
+ * peer_scid are populated (this is the standard fixture for emit
+ * tests). */
+static void server_conn_after_a2(quic_conn_t* conn)
+{
+    quic_conn_init_server(conn);
+    uint8_t wire[1500];
+    size_t wn = unhex(CLIENT_INITIAL_PROTECTED_HEX, wire, sizeof wire);
+    if (quic_conn_recv_initial(conn, wire, wn) != 0) {
+        printf("  FATAL: §A.2 setup failed\n"); exit(2);
+    }
+}
+
+static void test_conn_emit_initial_basic(void) {
+    printf("== conn: emit Initial — basic round-trip ==\n");
+    quic_conn_t conn;
+    server_conn_after_a2(&conn);
+
+    /* Server picks an SCID. */
+    static const uint8_t our_scid[] = {0xf0,0x67,0xa5,0x50,0x2a,0x42,0x62,0xb5};
+    quic_conn_set_our_scid(&conn, our_scid, sizeof our_scid);
+
+    /* Pretend the TLS layer produced a fake handshake blob. */
+    uint8_t fake_sh[200];
+    for (size_t i = 0; i < sizeof fake_sh; i++) fake_sh[i] = (uint8_t)(0xa0 + (i & 0x3f));
+    quic_conn_initial_tx_set_pending(&conn, fake_sh, sizeof fake_sh);
+
+    uint8_t out[2048];
+    size_t n = quic_conn_emit_initial(&conn, out, sizeof out);
+    check_int("emit produced bytes", n > 0, 1);
+    check_int("tx keys derived",     conn.initial_tx_keys_ready, 1);
+    check_int("pn incremented",      (long)conn.initial_tx_next_pn, 1);
+
+    /* Decrypt the emitted packet using the client-side keys for the
+     * *server* direction (i.e. is_server=1 derived from peer_dcid). */
+    quic_initial_keys_t client_view;
+    quic_initial_derive(conn.peer_dcid, conn.peer_dcid_len,
+                        /*is_server=*/1, &client_view);
+
+    quic_initial_pkt_t parsed;
+    uint8_t scratch[2048];
+    int rc = quic_initial_parse(out, n, &client_view,
+                                &parsed, scratch, sizeof scratch);
+    check_int("emitted Initial parses", rc, 0);
+    check_int("parsed pn", (long)parsed.pn, 0);
+    check_int("parsed dcid_len matches peer_scid_len",
+              (long)parsed.dcid_len, (long)conn.peer_scid_len);
+    check_int("parsed scid_len matches our_scid_len",
+              (long)parsed.scid_len, (long)sizeof our_scid);
+    check_int("parsed scid bytes match our_scid",
+              memcmp(parsed.scid, our_scid, sizeof our_scid) == 0, 1);
+
+    /* Walk frames; expect a CRYPTO frame at offset 0 carrying part of
+     * (or all of) fake_sh. */
+    quic_frame_t f;
+    size_t consumed = quic_frame_decode(parsed.payload, parsed.payload_len, &f);
+    check_int("first frame decodes", consumed > 0 && consumed != QUIC_FRAME_DECODE_ERROR, 1);
+    check_int("first frame is CRYPTO", f.type == QUIC_FT_CRYPTO, 1);
+    check_int("CRYPTO offset == 0", (long)f.u.crypto.offset, 0);
+    check_int("CRYPTO bytes match fake_sh prefix",
+              memcmp(f.u.crypto.data, fake_sh, (size_t)f.u.crypto.length) == 0, 1);
+
+    /* tx cursor advanced by the chunk length. */
+    check_int("tx_initial.next_offset advanced",
+              (long)conn.tx_initial.next_offset, (long)f.u.crypto.length);
+}
+
+static void test_conn_emit_initial_chunks(void) {
+    printf("== conn: emit Initial — multi-packet chunking ==\n");
+    quic_conn_t conn;
+    server_conn_after_a2(&conn);
+    static const uint8_t scid[] = {0xaa,0xbb,0xcc,0xdd};
+    quic_conn_set_our_scid(&conn, scid, sizeof scid);
+
+    /* A larger pending blob than fits in any single packet of the
+     * cap below, to force >1 emission. */
+    uint8_t big[1024];
+    for (size_t i = 0; i < sizeof big; i++) big[i] = (uint8_t)(i ^ 0x5a);
+    quic_conn_initial_tx_set_pending(&conn, big, sizeof big);
+
+    uint8_t out[300];   /* tiny cap → forces fragmentation */
+    size_t total_emitted_payload = 0;
+    int packets = 0;
+    while (1) {
+        size_t n = quic_conn_emit_initial(&conn, out, sizeof out);
+        if (n == 0) break;
+        packets++;
+
+        quic_initial_keys_t cv;
+        quic_initial_derive(conn.peer_dcid, conn.peer_dcid_len, 1, &cv);
+        quic_initial_pkt_t pp;
+        uint8_t s[1024];
+        if (quic_initial_parse(out, n, &cv, &pp, s, sizeof s) != 0) {
+            printf("  FAIL: chunked Initial #%d parse\n", packets); g_fail++; return;
+        }
+        quic_frame_t f;
+        size_t c = quic_frame_decode(pp.payload, pp.payload_len, &f);
+        if (c == 0 || c == QUIC_FRAME_DECODE_ERROR || f.type != QUIC_FT_CRYPTO) {
+            printf("  FAIL: chunked frame #%d\n", packets); g_fail++; return;
+        }
+        if ((uint64_t)f.u.crypto.offset != total_emitted_payload) {
+            printf("  FAIL: chunked offset mismatch (%llu vs %zu)\n",
+                   (unsigned long long)f.u.crypto.offset, total_emitted_payload);
+            g_fail++; return;
+        }
+        if (memcmp(f.u.crypto.data, big + total_emitted_payload,
+                   (size_t)f.u.crypto.length) != 0) {
+            printf("  FAIL: chunked bytes mismatch\n"); g_fail++; return;
+        }
+        total_emitted_payload += (size_t)f.u.crypto.length;
+        if (packets > 50) { printf("  FAIL: runaway loop\n"); g_fail++; return; }
+    }
+
+    check_int("multiple packets emitted", packets > 1, 1);
+    check_int("all bytes emitted", (long)total_emitted_payload, (long)sizeof big);
+    check_int("pn counter == packets", (long)conn.initial_tx_next_pn, (long)packets);
+}
+
+static void test_conn_emit_initial_no_pending(void) {
+    printf("== conn: emit Initial returns 0 with no pending ==\n");
+    quic_conn_t conn;
+    server_conn_after_a2(&conn);
+    static const uint8_t scid[] = {0x01,0x02};
+    quic_conn_set_our_scid(&conn, scid, sizeof scid);
+    uint8_t out[2048];
+    check_int("no pending → 0", (long)quic_conn_emit_initial(&conn, out, sizeof out), 0);
+    check_int("pn unchanged",   (long)conn.initial_tx_next_pn, 0);
+}
+
+static void test_conn_emit_initial_no_peer_addrs(void) {
+    printf("== conn: emit Initial requires peer addrs ==\n");
+    quic_conn_t conn;
+    quic_conn_init_server(&conn);   /* fresh — no recv yet */
+    uint8_t fake[16] = {0};
+    quic_conn_initial_tx_set_pending(&conn, fake, sizeof fake);
+    uint8_t out[2048];
+    check_int("no peer addrs → 0",
+              (long)quic_conn_emit_initial(&conn, out, sizeof out), 0);
+}
+
+/* ============================================================== */
 
 int main(void) {
     test_udp_build_parse_roundtrip();
@@ -2351,6 +2492,11 @@ int main(void) {
     test_conn_extract_ch_missing_tp();
     test_conn_extract_ch_malformed_tp();
     test_conn_extract_ch_not_handshake_type();
+
+    test_conn_emit_initial_basic();
+    test_conn_emit_initial_chunks();
+    test_conn_emit_initial_no_pending();
+    test_conn_emit_initial_no_peer_addrs();
 
     printf("\n=== RESULTS: PASS=%d FAIL=%d ===\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
