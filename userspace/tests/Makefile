@@ -42,13 +42,17 @@ CRYPTO_SRC := \
 
 .PHONY: all clean test
 
-all: test_crypto
+all: test_crypto test_preload
 
 test_crypto: test_crypto.c $(CRYPTO_SRC)
 	$(CC) $(CFLAGS) -o $@ $^
 
-test: test_crypto
+test_preload: test_preload.c ../../src/preload.c
+	$(CC) $(CFLAGS) -I../../src -o $@ $^
+
+test: test_crypto test_preload
 	./test_crypto
+	./test_preload
 
 clean:
-	rm -f test_crypto
+	rm -f test_crypto test_preload

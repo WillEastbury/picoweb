@@ -71,6 +71,10 @@ typedef struct {
     /* ETag + 304 Not Modified support. etag[0]=='\0' means no ETag. */
     char        etag[32];        /* W/"<len>-<fnv64>" */
     const char* wire_304;        size_t wire_304_len;
+    /* HTTP 103 Early Hints `Link:` lines (one or more "Link: ...\r\n"
+     * lines, no trailing blank). NULL/0 if no preloadable subresources
+     * were detected. Lifetime = jumptable arena. */
+    const char* link_hdr;        size_t link_hdr_len;
 } __attribute__((aligned(128))) resource_t;
 
 /* One flat-table slot. value == NULL marks the slot empty.
