@@ -28,6 +28,7 @@
 #include "../userspace/tls/engine.h"
 #include "../userspace/tls/pem.h"
 #include "tls_bridge.h"
+#include "metrics.h"
 #include "util.h"
 
 /* Shared connection-tail bytes (same semantics as epoll backend). */
@@ -368,6 +369,9 @@ static pw_disp_status_t tls_on_data(void* per_conn_state,
     *iov_n = 0;
     c->tx_stage_len = 0;
 
+    /* P0 per-stage timing. cntvct/rdtsc reads are <10 cycles. */
+    const uint64_t t_enter = metal_tsc();
+
     size_t cap = 0;
     uint8_t* rx = pw_tls_rx_buf(&c->eng, &cap);
     if (len > cap) return PW_DISP_RESET;
@@ -375,7 +379,12 @@ static pw_disp_status_t tls_on_data(void* per_conn_state,
     if (pw_tls_rx_ack(&c->eng, len) != 0) return PW_DISP_RESET;
 
     pw_tls_engine_set_clock(&c->eng, (uint64_t)metal_now_ms());
+    const uint64_t t_after_rx = metal_tsc();
+    metrics_stage_add(METRICS_STAGE_TLS_RX, t_after_rx - t_enter);
+
     if (pw_tls_step(&c->eng) < 0) return PW_DISP_RESET;
+    const uint64_t t_after_step = metal_tsc();
+    metrics_stage_add(METRICS_STAGE_TLS_STEP, t_after_step - t_after_rx);
 
     size_t app_len = 0;
     const uint8_t* app = pw_tls_app_in_buf(&c->eng, &app_len);
@@ -386,14 +395,18 @@ static pw_disp_status_t tls_on_data(void* per_conn_state,
             http_request_t dummy = {0};
             pw_iov_t resp[PW_IOV_MAX_FRAGS];
             unsigned rn = 0;
+            const uint64_t t_b0 = metal_tsc();
             if (build_http_response_iov(c, HTTP_ERR_413, &dummy, resp, &rn, &close_after) != 0) {
                 pw_tls_app_in_ack(&c->eng, app_len);
                 return PW_DISP_RESET;
             }
+            const uint64_t t_b1 = metal_tsc();
+            metrics_stage_add(METRICS_STAGE_TLS_BUILD, t_b1 - t_b0);
             if (pw_tls_app_seal_iov(&c->eng, resp, rn) != 0) {
                 pw_tls_app_in_ack(&c->eng, app_len);
                 return PW_DISP_RESET;
             }
+            metrics_stage_add(METRICS_STAGE_TLS_SEAL, metal_tsc() - t_b1);
             c->plain_len = 0;
         } else {
             memcpy(c->plain + c->plain_len, app, app_len);
@@ -403,7 +416,10 @@ static pw_disp_status_t tls_on_data(void* per_conn_state,
              * buffered plaintext. This prevents a pipeline stall when
              * one TLS record carries multiple HTTP requests. */
             while (c->plain_len > 0) {
+                const uint64_t t_p0 = metal_tsc();
                 int prc = tls_bridge_parse_request(b, (const uint8_t*)c->plain, c->plain_len);
+                const uint64_t t_p1 = metal_tsc();
+                metrics_stage_add(METRICS_STAGE_TLS_PARSE, t_p1 - t_p0);
                 if (prc == 0) break;   /* incomplete request, wait for more */
 
                 http_request_t req = b->req;
@@ -414,6 +430,8 @@ static pw_disp_status_t tls_on_data(void* per_conn_state,
                     pw_tls_app_in_ack(&c->eng, app_len);
                     return PW_DISP_RESET;
                 }
+                const uint64_t t_p2 = metal_tsc();
+                metrics_stage_add(METRICS_STAGE_TLS_BUILD, t_p2 - t_p1);
 
                 if (pw_tls_app_seal_iov(&c->eng, resp, rn) != 0) {
                     /* TX buffer pressure while additional pipelined
@@ -425,6 +443,7 @@ static pw_disp_status_t tls_on_data(void* per_conn_state,
                     c->plain_len = 0;
                     break;
                 }
+                metrics_stage_add(METRICS_STAGE_TLS_SEAL, metal_tsc() - t_p2);
 
                 if (pr == HTTP_OK && req.consumed > 0 && c->plain_len > req.consumed) {
                     size_t left = c->plain_len - req.consumed;
@@ -440,6 +459,7 @@ static pw_disp_status_t tls_on_data(void* per_conn_state,
         pw_tls_app_in_ack(&c->eng, app_len);
     }
 
+    const uint64_t t_before_tx = metal_tsc();
     size_t tx_len = 0;
     const uint8_t* tx = pw_tls_tx_buf(&c->eng, &tx_len);
     if (tx_len > 0) {
@@ -450,8 +470,10 @@ static pw_disp_status_t tls_on_data(void* per_conn_state,
         iov_out[0].base = c->tx_stage;
         iov_out[0].len = c->tx_stage_len;
         *iov_n = 1;
+        metrics_stage_add(METRICS_STAGE_TLS_TX, metal_tsc() - t_before_tx);
         return close_after ? PW_DISP_OUTPUT_AND_CLOSE : PW_DISP_OUTPUT;
     }
+    metrics_stage_add(METRICS_STAGE_TLS_TX, metal_tsc() - t_before_tx);
     return PW_DISP_NO_OUTPUT;
 }
 
