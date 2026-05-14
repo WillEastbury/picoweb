@@ -136,9 +136,89 @@ size_t quic_frame_decode(const uint8_t* in, size_t in_len, quic_frame_t* out)
         return off;
     }
 
-    /* Unknown / unsupported in phase 4a. Caller must decide whether to
-     * close the connection with FRAME_ENCODING_ERROR. We can't safely
-     * skip because we don't know the frame's wire length. */
+    if (t == 0x04) {
+        out->type = QUIC_FT_RESET_STREAM;
+        quic_frame_reset_stream_t* r = &out->u.reset_stream;
+        if (!read_varint(in, in_len, &off, &r->stream_id))      return QUIC_FRAME_DECODE_ERROR;
+        if (!read_varint(in, in_len, &off, &r->app_error_code)) return QUIC_FRAME_DECODE_ERROR;
+        if (!read_varint(in, in_len, &off, &r->final_size))     return QUIC_FRAME_DECODE_ERROR;
+        return off;
+    }
+    if (t == 0x05) {
+        out->type = QUIC_FT_STOP_SENDING;
+        quic_frame_stop_sending_t* s = &out->u.stop_sending;
+        if (!read_varint(in, in_len, &off, &s->stream_id))      return QUIC_FRAME_DECODE_ERROR;
+        if (!read_varint(in, in_len, &off, &s->app_error_code)) return QUIC_FRAME_DECODE_ERROR;
+        return off;
+    }
+    if (t == 0x10) {
+        out->type = QUIC_FT_MAX_DATA;
+        if (!read_varint(in, in_len, &off, &out->u.max_data.max)) return QUIC_FRAME_DECODE_ERROR;
+        return off;
+    }
+    if (t == 0x11) {
+        out->type = QUIC_FT_MAX_STREAM_DATA;
+        quic_frame_max_stream_data_t* m = &out->u.max_stream_data;
+        if (!read_varint(in, in_len, &off, &m->stream_id)) return QUIC_FRAME_DECODE_ERROR;
+        if (!read_varint(in, in_len, &off, &m->max))       return QUIC_FRAME_DECODE_ERROR;
+        return off;
+    }
+    if (t == 0x12 || t == 0x13) {
+        out->type = (t == 0x12) ? QUIC_FT_MAX_STREAMS_BIDI : QUIC_FT_MAX_STREAMS_UNI;
+        if (!read_varint(in, in_len, &off, &out->u.max_streams.max)) return QUIC_FRAME_DECODE_ERROR;
+        return off;
+    }
+    if (t == 0x14) {
+        out->type = QUIC_FT_DATA_BLOCKED;
+        if (!read_varint(in, in_len, &off, &out->u.data_blocked.limit)) return QUIC_FRAME_DECODE_ERROR;
+        return off;
+    }
+    if (t == 0x15) {
+        out->type = QUIC_FT_STREAM_DATA_BLOCK;
+        quic_frame_stream_data_blocked_t* b = &out->u.stream_data_blocked;
+        if (!read_varint(in, in_len, &off, &b->stream_id)) return QUIC_FRAME_DECODE_ERROR;
+        if (!read_varint(in, in_len, &off, &b->limit))     return QUIC_FRAME_DECODE_ERROR;
+        return off;
+    }
+    if (t == 0x16 || t == 0x17) {
+        out->type = (t == 0x16) ? QUIC_FT_STREAMS_BLOCK_BIDI : QUIC_FT_STREAMS_BLOCK_UNI;
+        if (!read_varint(in, in_len, &off, &out->u.streams_blocked.limit)) return QUIC_FRAME_DECODE_ERROR;
+        return off;
+    }
+    if (t == 0x18) {
+        out->type = QUIC_FT_NEW_CONNECTION_ID;
+        quic_frame_new_conn_id_t* n = &out->u.new_conn_id;
+        if (!read_varint(in, in_len, &off, &n->seq_no))         return QUIC_FRAME_DECODE_ERROR;
+        if (!read_varint(in, in_len, &off, &n->retire_prior_to)) return QUIC_FRAME_DECODE_ERROR;
+        /* §19.15: retire_prior_to MUST be <= sequence number. */
+        if (n->retire_prior_to > n->seq_no) return QUIC_FRAME_DECODE_ERROR;
+        if (off >= in_len) return QUIC_FRAME_DECODE_ERROR;
+        uint8_t cl = in[off++];
+        /* §19.15: 1..20 inclusive. */
+        if (cl < 1 || cl > 20) return QUIC_FRAME_DECODE_ERROR;
+        if ((size_t)cl + 16 > in_len - off) return QUIC_FRAME_DECODE_ERROR;
+        n->cid_len = cl;
+        memcpy(n->cid, in + off, cl);
+        off += cl;
+        memcpy(n->stateless_reset_token, in + off, 16);
+        off += 16;
+        return off;
+    }
+    if (t == 0x19) {
+        out->type = QUIC_FT_RETIRE_CONN_ID;
+        if (!read_varint(in, in_len, &off, &out->u.retire_conn_id.seq_no)) return QUIC_FRAME_DECODE_ERROR;
+        return off;
+    }
+    if (t == 0x1a || t == 0x1b) {
+        out->type = (t == 0x1a) ? QUIC_FT_PATH_CHALLENGE : QUIC_FT_PATH_RESPONSE;
+        if (in_len - off < 8) return QUIC_FRAME_DECODE_ERROR;
+        memcpy(out->u.path.data, in + off, 8);
+        off += 8;
+        return off;
+    }
+
+    /* Unknown / unsupported. Caller decides whether to close with
+     * FRAME_ENCODING_ERROR; we can't safely skip. */
     out->type = QUIC_FT_UNKNOWN;
     return off;
 }
@@ -247,4 +327,136 @@ size_t quic_frame_close_encode(uint8_t* out, size_t cap,
     if (reason_len > 0) memcpy(out + off, reason, reason_len);
     off += reason_len;
     return off;
+}
+
+size_t quic_frame_reset_stream_encode(uint8_t* out, size_t cap,
+                                      uint64_t stream_id,
+                                      uint64_t app_error_code,
+                                      uint64_t final_size)
+{
+    size_t off = 0;
+    if (!put_u8(out, cap, &off, 0x04)) return 0;
+    if (!put_varint(out, cap, &off, stream_id))      return 0;
+    if (!put_varint(out, cap, &off, app_error_code)) return 0;
+    if (!put_varint(out, cap, &off, final_size))     return 0;
+    return off;
+}
+
+size_t quic_frame_stop_sending_encode(uint8_t* out, size_t cap,
+                                      uint64_t stream_id,
+                                      uint64_t app_error_code)
+{
+    size_t off = 0;
+    if (!put_u8(out, cap, &off, 0x05)) return 0;
+    if (!put_varint(out, cap, &off, stream_id))      return 0;
+    if (!put_varint(out, cap, &off, app_error_code)) return 0;
+    return off;
+}
+
+size_t quic_frame_max_data_encode(uint8_t* out, size_t cap, uint64_t max)
+{
+    size_t off = 0;
+    if (!put_u8(out, cap, &off, 0x10)) return 0;
+    if (!put_varint(out, cap, &off, max)) return 0;
+    return off;
+}
+
+size_t quic_frame_max_stream_data_encode(uint8_t* out, size_t cap,
+                                         uint64_t stream_id, uint64_t max)
+{
+    size_t off = 0;
+    if (!put_u8(out, cap, &off, 0x11)) return 0;
+    if (!put_varint(out, cap, &off, stream_id)) return 0;
+    if (!put_varint(out, cap, &off, max))       return 0;
+    return off;
+}
+
+size_t quic_frame_max_streams_encode(uint8_t* out, size_t cap,
+                                     int uni, uint64_t max)
+{
+    size_t off = 0;
+    if (!put_u8(out, cap, &off, uni ? 0x13 : 0x12)) return 0;
+    if (!put_varint(out, cap, &off, max)) return 0;
+    return off;
+}
+
+size_t quic_frame_data_blocked_encode(uint8_t* out, size_t cap,
+                                      uint64_t limit)
+{
+    size_t off = 0;
+    if (!put_u8(out, cap, &off, 0x14)) return 0;
+    if (!put_varint(out, cap, &off, limit)) return 0;
+    return off;
+}
+
+size_t quic_frame_stream_data_blocked_encode(uint8_t* out, size_t cap,
+                                             uint64_t stream_id,
+                                             uint64_t limit)
+{
+    size_t off = 0;
+    if (!put_u8(out, cap, &off, 0x15)) return 0;
+    if (!put_varint(out, cap, &off, stream_id)) return 0;
+    if (!put_varint(out, cap, &off, limit))     return 0;
+    return off;
+}
+
+size_t quic_frame_streams_blocked_encode(uint8_t* out, size_t cap,
+                                         int uni, uint64_t limit)
+{
+    size_t off = 0;
+    if (!put_u8(out, cap, &off, uni ? 0x17 : 0x16)) return 0;
+    if (!put_varint(out, cap, &off, limit)) return 0;
+    return off;
+}
+
+size_t quic_frame_new_conn_id_encode(uint8_t* out, size_t cap,
+                                     uint64_t seq_no,
+                                     uint64_t retire_prior_to,
+                                     const uint8_t* cid, size_t cid_len,
+                                     const uint8_t* stateless_reset_token)
+{
+    if (cid_len < 1 || cid_len > 20) return 0;
+    if (retire_prior_to > seq_no) return 0;
+    size_t off = 0;
+    if (!put_u8(out, cap, &off, 0x18)) return 0;
+    if (!put_varint(out, cap, &off, seq_no))          return 0;
+    if (!put_varint(out, cap, &off, retire_prior_to)) return 0;
+    if (!put_u8(out, cap, &off, (uint8_t)cid_len))    return 0;
+    if (cid_len + 16 > cap - off) return 0;
+    memcpy(out + off, cid, cid_len);
+    off += cid_len;
+    if (stateless_reset_token) memcpy(out + off, stateless_reset_token, 16);
+    else                       memset(out + off, 0, 16);
+    off += 16;
+    return off;
+}
+
+size_t quic_frame_retire_conn_id_encode(uint8_t* out, size_t cap,
+                                        uint64_t seq_no)
+{
+    size_t off = 0;
+    if (!put_u8(out, cap, &off, 0x19)) return 0;
+    if (!put_varint(out, cap, &off, seq_no)) return 0;
+    return off;
+}
+
+static size_t encode_path(uint8_t* out, size_t cap, uint8_t t,
+                          const uint8_t data[8])
+{
+    if (cap < 9) return 0;
+    out[0] = t;
+    memcpy(out + 1, data, 8);
+    return 9;
+}
+
+size_t quic_frame_path_challenge_encode(uint8_t* out, size_t cap,
+                                        const uint8_t data[8])
+{
+    return encode_path(out, cap, 0x1a, data);
+}
+
+size_t quic_frame_path_response_encode(uint8_t* out, size_t cap,
+                                       const uint8_t data[8])
+{
+    return encode_path(out, cap, 0x1b, data);
 }
