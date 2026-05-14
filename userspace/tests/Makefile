@@ -57,7 +57,9 @@ QUIC_PRIM_SRC := \
     ../quic/initial.c            \
     ../quic/packet.c             \
     ../quic/frames.c             \
-    ../quic/loss.c
+    ../quic/loss.c               \
+    ../quic/cc.c                 \
+    ../quic/flow.c
 
 .PHONY: all clean test
 
