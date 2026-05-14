@@ -2706,7 +2706,11 @@ static void test_tcp_dispatch(void) {
 
     emit_log_t log = {0};
 
-    /* (1) SYN to UNKNOWN port -> RST, no service touched. */
+    /* (1) SYN to UNKNOWN port -> silently dropped, no service touched.
+     * Pre-perf: we used to emit a RST per RFC 793; in cluster
+     * environments where the worker sees unrelated traffic on a
+     * shared veth that's a syscall-per-packet tail-latency source
+     * and (worse) RSTs legitimate third parties. Drop instead. */
     {
         tcp_seg_t syn = {0};
         syn.src_ip=0x0a000001u; syn.dst_ip=0x0a000002u;
@@ -2714,8 +2718,8 @@ static void test_tcp_dispatch(void) {
         syn.seq=100; syn.flags=TCPF_SYN; syn.window=65535;
         log.n = 0;
         tcp_input(&stack, &syn, NULL, NULL, log_emit, &log);
-        if (log.n == 1 && (log.segs[0].flags & TCPF_RST))
-             { printf("  PASS: unknown port -> RST\n"); g_pass++; }
+        if (log.n == 0)
+             { printf("  PASS: unknown port -> silent drop\n"); g_pass++; }
         else { printf("  FAIL: unknown port n=%d flags=0x%02x\n",
                       log.n, log.n?log.segs[0].flags:0); g_fail++; }
         if (svc443.opened == 0 && svc80.opened == 0)

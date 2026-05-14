@@ -498,6 +498,20 @@ void* tls_worker_main(void* arg) {
         if (af_packet_open(&w.afp, cfg->tls_ifname, local_mac, peer_mac) != 0) {
             metal_die("tls_worker_main: af_packet_open(ifname=%s)", cfg->tls_ifname);
         }
+        /* Install an in-kernel cBPF filter so the worker only wakes
+         * for IPv4 TCP frames addressed to our listener. Without
+         * this, on shared veth / bridged interfaces the worker
+         * burns ms/burst on unrelated traffic (k8s probes, kube-
+         * proxy chatter, DNS, stray ACKs from torn-down sessions),
+         * which shows up as alternating ~60 ms tail spikes between
+         * keep-alive requests. Best-effort: log and continue if
+         * the kernel rejects the filter. */
+        if (af_packet_install_filter(&w.afp, local_ip,
+                                     (uint16_t)cfg->port) != 0) {
+            metal_log("tls_worker_main: af_packet filter install "
+                      "failed; continuing without (variance may "
+                      "be high under cluster traffic)");
+        }
     }
 
     pw_dispatch_init(&w.dispatch);
