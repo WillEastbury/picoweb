@@ -3,6 +3,7 @@
 #include "compress.h"
 #include "metrics.h"
 #include "mime.h"
+#include "preload.h"
 #include "simd.h"
 #include "util.h"
 
@@ -921,6 +922,61 @@ bool jumptable_build(jumptable_t* jt, const char* wwwroot) {
                     r->head = build_head(&jt->arena, "HTTP/1.1 200 OK",
                                               mime, is_html ? (got + (host_chrome ? host_chrome->hdr_len + host_chrome->ftr_len : 0)) : got,
                                               etag_extra, &r->head_len);
+                }
+
+                /* Auto-derive HTTP 103 Early Hints `Link:` headers from
+                 * subresources referenced in the HTML body (chrome+body+
+                 * footer). Cached on the resource and emitted as a
+                 * separate interim TLS record before the 200 response;
+                 * also embedded in the 200 head for clients that don't
+                 * speak 1xx. Per-resource so per-page assets are picked
+                 * up; chrome-derived hints dominate via dedupe. */
+                if (is_html) {
+                    /* Reassemble full HTML for scanning. The chrome
+                     * pointers reference arena memory; the body is a
+                     * fresh slurp also in arena. We need a contiguous
+                     * buffer for the scanner. */
+                    size_t hdr_len = host_chrome ? host_chrome->hdr_len : 0;
+                    size_t ftr_len = host_chrome ? host_chrome->ftr_len : 0;
+                    size_t full_len = hdr_len + got + ftr_len;
+                    char* full = (char*)malloc(full_len);
+                    if (full) {
+                        size_t p = 0;
+                        if (hdr_len) { memcpy(full + p, host_chrome->hdr, hdr_len); p += hdr_len; }
+                        memcpy(full + p, body, got); p += got;
+                        if (ftr_len) { memcpy(full + p, host_chrome->ftr, ftr_len); }
+
+                        char tmp[PW_PRELOAD_HEADER_CAP];
+                        size_t link_len = pw_preload_extract(
+                            full, full_len,
+                            host_key, h->name_len,
+                            tmp, sizeof(tmp));
+                        free(full);
+                        if (link_len > 0) {
+                            char* link_buf = (char*)arena_dup(&jt->arena, tmp, link_len);
+                            r->link_hdr = link_buf;
+                            r->link_hdr_len = link_len;
+
+                            /* Embed Link headers in the 200 head too,
+                             * so clients that don't process 1xx still
+                             * get the hint via the final response. */
+                            size_t extra_room = strlen(extra_hdr) + link_len + 384;
+                            char* combined = (char*)malloc(extra_room);
+                            if (combined) {
+                                int n = snprintf(combined, extra_room,
+                                                 "ETag: %s\r\n%s%.*s",
+                                                 r->etag, extra_hdr,
+                                                 (int)link_len, link_buf);
+                                if (n > 0 && (size_t)n < extra_room) {
+                                    r->head = build_head(&jt->arena,
+                                        "HTTP/1.1 200 OK", mime,
+                                        got + hdr_len + ftr_len,
+                                        combined, &r->head_len);
+                                }
+                                free(combined);
+                            }
+                        }
+                    }
                 }
 
                 /* Pre-compress text bodies for clients that opt in
