@@ -1,2 +1,3 @@
 test_crypto
+test_quic_primitives
 *.o

@@ -40,15 +40,25 @@ CRYPTO_SRC := \
     ../dispatch.c                \
     ../conn.c
 
+QUIC_PRIM_SRC := \
+    ../udp/udp.c                 \
+    ../tcp/ip.c                  \
+    ../crypto/aes.c              \
+    ../crypto/aes_gcm.c
+
 .PHONY: all clean test
 
-all: test_crypto
+all: test_crypto test_quic_primitives
 
 test_crypto: test_crypto.c $(CRYPTO_SRC)
 	$(CC) $(CFLAGS) -o $@ $^
 
-test: test_crypto
+test_quic_primitives: test_quic_primitives.c $(QUIC_PRIM_SRC)
+	$(CC) $(CFLAGS) -o $@ $^
+
+test: test_crypto test_quic_primitives
 	./test_crypto
+	./test_quic_primitives
 
 clean:
-	rm -f test_crypto
+	rm -f test_crypto test_quic_primitives
