@@ -60,7 +60,8 @@ QUIC_PRIM_SRC := \
     ../quic/loss.c               \
     ../quic/cc.c                 \
     ../quic/flow.c               \
-    ../quic/special.c
+    ../quic/special.c            \
+    ../quic/transport_params.c
 
 .PHONY: all clean test
 

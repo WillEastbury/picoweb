@@ -25,6 +25,7 @@
 #include "../quic/cc.h"
 #include "../quic/flow.h"
 #include "../quic/special.h"
+#include "../quic/transport_params.h"
 
 static int g_pass = 0;
 static int g_fail = 0;
@@ -1307,6 +1308,245 @@ static void test_special_idle_expired(void) {
 }
 
 /* ============================================================== */
+/* Transport parameters (RFC 9000 §18)                            */
+/* ============================================================== */
+
+static void test_tp_defaults(void) {
+    printf("== transport params: defaults ==\n");
+    quic_transport_params_t tp;
+    quic_tp_init_defaults(&tp);
+    check_int("present mask cleared",          (long)tp.present, 0);
+    check_int("max_udp_payload_size default",  (long)tp.max_udp_payload_size, 65527);
+    check_int("ack_delay_exponent default",    (long)tp.ack_delay_exponent, 3);
+    check_int("max_ack_delay_ms default",      (long)tp.max_ack_delay_ms, 25);
+    check_int("active_cid_limit default",      (long)tp.active_connection_id_limit, 2);
+}
+
+static void test_tp_encode_empty(void) {
+    printf("== transport params: encode empty ==\n");
+    quic_transport_params_t tp;
+    quic_tp_init_defaults(&tp);
+    uint8_t buf[64];
+    size_t n = quic_tp_encode(&tp, buf, sizeof buf);
+    check_int("empty encodes to 0 bytes", (long)n, 0);
+}
+
+static void test_tp_encode_decode_roundtrip(void) {
+    printf("== transport params: encode/decode round-trip ==\n");
+    quic_transport_params_t in;
+    quic_tp_init_defaults(&in);
+
+    /* server-side typical set */
+    static const uint8_t odcid[8]  = {1,2,3,4,5,6,7,8};
+    static const uint8_t iscid[8]  = {9,10,11,12,13,14,15,16};
+    static const uint8_t srt[16]   = {0x10,0x11,0x12,0x13,0x14,0x15,0x16,0x17,
+                                      0x18,0x19,0x1a,0x1b,0x1c,0x1d,0x1e,0x1f};
+    memcpy(in.original_dcid, odcid, sizeof odcid);
+    in.original_dcid_len = sizeof odcid;
+    memcpy(in.initial_source_cid, iscid, sizeof iscid);
+    in.initial_source_cid_len = sizeof iscid;
+    memcpy(in.stateless_reset_token, srt, sizeof srt);
+
+    in.max_idle_timeout_ms                       = 30000;
+    in.max_udp_payload_size                      = 1452;
+    in.initial_max_data                          = 1048576;
+    in.initial_max_stream_data_bidi_local        = 65536;
+    in.initial_max_stream_data_bidi_remote       = 65536;
+    in.initial_max_stream_data_uni               = 65536;
+    in.initial_max_streams_bidi                  = 100;
+    in.initial_max_streams_uni                   = 3;
+    in.ack_delay_exponent                        = 3;
+    in.max_ack_delay_ms                          = 25;
+    in.active_connection_id_limit                = 4;
+
+    in.present = QUIC_TP_F_ORIGINAL_DCID
+               | QUIC_TP_F_INITIAL_SOURCE_CID
+               | QUIC_TP_F_STATELESS_RESET_TOKEN
+               | QUIC_TP_F_MAX_IDLE_TIMEOUT
+               | QUIC_TP_F_MAX_UDP_PAYLOAD_SIZE
+               | QUIC_TP_F_INITIAL_MAX_DATA
+               | QUIC_TP_F_INITIAL_MAX_STREAM_DATA_BIDI_LOCAL
+               | QUIC_TP_F_INITIAL_MAX_STREAM_DATA_BIDI_REMOTE
+               | QUIC_TP_F_INITIAL_MAX_STREAM_DATA_UNI
+               | QUIC_TP_F_INITIAL_MAX_STREAMS_BIDI
+               | QUIC_TP_F_INITIAL_MAX_STREAMS_UNI
+               | QUIC_TP_F_ACK_DELAY_EXPONENT
+               | QUIC_TP_F_MAX_ACK_DELAY
+               | QUIC_TP_F_DISABLE_ACTIVE_MIGRATION
+               | QUIC_TP_F_ACTIVE_CONNECTION_ID_LIMIT;
+
+    uint8_t buf[256];
+    size_t n = quic_tp_encode(&in, buf, sizeof buf);
+    if (!n) { printf("  FAIL: encode returned 0\n"); g_fail++; return; }
+    printf("  PASS: encode produced %zu bytes\n", n); g_pass++;
+
+    quic_transport_params_t out;
+    int rc = quic_tp_decode(buf, n, &out);
+    check_int("decode succeeds", rc, 1);
+    check_int("present mask preserved",
+              (long)out.present, (long)in.present);
+    check_int("max_idle_timeout_ms",
+              (long)out.max_idle_timeout_ms, 30000);
+    check_int("max_udp_payload_size",
+              (long)out.max_udp_payload_size, 1452);
+    check_int("initial_max_data",
+              (long)out.initial_max_data, 1048576);
+    check_int("initial_max_streams_bidi",
+              (long)out.initial_max_streams_bidi, 100);
+    check_int("active_cid_limit",
+              (long)out.active_connection_id_limit, 4);
+    check_int("original_dcid_len", out.original_dcid_len, sizeof odcid);
+    check_eq("original_dcid", out.original_dcid, odcid, sizeof odcid);
+    check_int("initial_source_cid_len",
+              out.initial_source_cid_len, sizeof iscid);
+    check_eq("initial_source_cid", out.initial_source_cid, iscid, sizeof iscid);
+    check_eq("stateless_reset_token",
+             out.stateless_reset_token, srt, sizeof srt);
+}
+
+static void test_tp_decode_unknown_id_skipped(void) {
+    printf("== transport params: unknown id is skipped ==\n");
+    /* Build: known max_idle_timeout=30000, then unknown id 0x4242 (2-byte
+     * varint = 0x42, 0x42 → wait, 0x4242 needs varint encoding).
+     * Use a 1-byte unknown id 0x3f (63) which is reserved/unused. */
+    uint8_t buf[32];
+    size_t off = 0;
+    /* id 0x01 (max_idle_timeout), len 4, value 30000 (varint 4-byte: 0x80 0x00 0x75 0x30) */
+    buf[off++] = 0x01;
+    buf[off++] = 0x04;
+    buf[off++] = 0x80; buf[off++] = 0x00; buf[off++] = 0x75; buf[off++] = 0x30;
+    /* unknown id 0x3f, len 3, value bytes */
+    buf[off++] = 0x3f;
+    buf[off++] = 0x03;
+    buf[off++] = 0xaa; buf[off++] = 0xbb; buf[off++] = 0xcc;
+    /* id 0x04 (initial_max_data), len 1, value 10 */
+    buf[off++] = 0x04;
+    buf[off++] = 0x01;
+    buf[off++] = 0x0a;
+
+    quic_transport_params_t tp;
+    int rc = quic_tp_decode(buf, off, &tp);
+    check_int("decode succeeds", rc, 1);
+    check_int("max_idle_timeout_ms parsed",
+              (long)tp.max_idle_timeout_ms, 30000);
+    check_int("initial_max_data parsed",
+              (long)tp.initial_max_data, 10);
+    check_int("only known flags set",
+              (long)(tp.present & ~(uint32_t)(QUIC_TP_F_MAX_IDLE_TIMEOUT
+                                              | QUIC_TP_F_INITIAL_MAX_DATA)),
+              0);
+}
+
+static void test_tp_decode_duplicate_rejected(void) {
+    printf("== transport params: duplicate id rejected ==\n");
+    /* Two max_idle_timeout entries → must fail. */
+    uint8_t buf[] = {
+        0x01, 0x01, 0x05,
+        0x01, 0x01, 0x06,
+    };
+    quic_transport_params_t tp;
+    int rc = quic_tp_decode(buf, sizeof buf, &tp);
+    check_int("decode rejects duplicate", rc, 0);
+}
+
+static void test_tp_decode_truncated_rejected(void) {
+    printf("== transport params: truncated TLV rejected ==\n");
+    /* id=1, len=4, but only 2 bytes follow. */
+    uint8_t buf[] = { 0x01, 0x04, 0x00, 0x01 };
+    quic_transport_params_t tp;
+    int rc = quic_tp_decode(buf, sizeof buf, &tp);
+    check_int("decode rejects truncated value", rc, 0);
+}
+
+static void test_tp_decode_illegal_values(void) {
+    printf("== transport params: illegal values rejected ==\n");
+    quic_transport_params_t tp;
+    int rc;
+
+    /* max_udp_payload_size < 1200 (use 1199 → varint 2-byte 0x44 0xaf) */
+    uint8_t b1[] = { 0x03, 0x02, 0x44, 0xaf };
+    rc = quic_tp_decode(b1, sizeof b1, &tp);
+    check_int("rejects max_udp_payload_size < 1200", rc, 0);
+
+    /* ack_delay_exponent > 20 (set 21) */
+    uint8_t b2[] = { 0x0a, 0x01, 0x15 };
+    rc = quic_tp_decode(b2, sizeof b2, &tp);
+    check_int("rejects ack_delay_exponent > 20", rc, 0);
+
+    /* max_ack_delay >= 2^14 (16384, varint 4-byte: 0x80 0x00 0x40 0x00) */
+    uint8_t b3[] = { 0x0b, 0x04, 0x80, 0x00, 0x40, 0x00 };
+    rc = quic_tp_decode(b3, sizeof b3, &tp);
+    check_int("rejects max_ack_delay >= 2^14", rc, 0);
+
+    /* active_connection_id_limit < 2 (set 1) */
+    uint8_t b4[] = { 0x0e, 0x01, 0x01 };
+    rc = quic_tp_decode(b4, sizeof b4, &tp);
+    check_int("rejects active_cid_limit < 2", rc, 0);
+
+    /* stateless_reset_token wrong length (15) */
+    uint8_t b5[18] = { 0x02, 0x0f };  /* 0x0f = 15 */
+    rc = quic_tp_decode(b5, sizeof b5, &tp);
+    check_int("rejects stateless_reset_token != 16B", rc, 0);
+
+    /* original_dcid > 20 bytes (id=0, len=21) */
+    uint8_t b6[24] = { 0x00, 0x15 };
+    rc = quic_tp_decode(b6, sizeof b6, &tp);
+    check_int("rejects original_dcid > 20B", rc, 0);
+
+    /* disable_active_migration with non-zero length */
+    uint8_t b7[] = { 0x0c, 0x01, 0x00 };
+    rc = quic_tp_decode(b7, sizeof b7, &tp);
+    check_int("rejects disable_active_migration with body", rc, 0);
+}
+
+static void test_tp_encode_validation(void) {
+    printf("== transport params: encode validation ==\n");
+    quic_transport_params_t tp;
+    uint8_t buf[64];
+
+    quic_tp_init_defaults(&tp);
+    tp.present = QUIC_TP_F_MAX_UDP_PAYLOAD_SIZE;
+    tp.max_udp_payload_size = 1199;
+    check_int("encode rejects payload < 1200",
+              (long)quic_tp_encode(&tp, buf, sizeof buf), 0);
+
+    quic_tp_init_defaults(&tp);
+    tp.present = QUIC_TP_F_ACK_DELAY_EXPONENT;
+    tp.ack_delay_exponent = 21;
+    check_int("encode rejects ack_delay_exponent > 20",
+              (long)quic_tp_encode(&tp, buf, sizeof buf), 0);
+
+    quic_tp_init_defaults(&tp);
+    tp.present = QUIC_TP_F_MAX_ACK_DELAY;
+    tp.max_ack_delay_ms = 16384;
+    check_int("encode rejects max_ack_delay >= 2^14",
+              (long)quic_tp_encode(&tp, buf, sizeof buf), 0);
+
+    quic_tp_init_defaults(&tp);
+    tp.present = QUIC_TP_F_ACTIVE_CONNECTION_ID_LIMIT;
+    tp.active_connection_id_limit = 1;
+    check_int("encode rejects active_cid_limit < 2",
+              (long)quic_tp_encode(&tp, buf, sizeof buf), 0);
+
+    quic_tp_init_defaults(&tp);
+    tp.present = QUIC_TP_F_ORIGINAL_DCID;
+    tp.original_dcid_len = 21;
+    check_int("encode rejects cid_len > 20",
+              (long)quic_tp_encode(&tp, buf, sizeof buf), 0);
+}
+
+static void test_tp_encode_buffer_overflow(void) {
+    printf("== transport params: encode overflow ==\n");
+    quic_transport_params_t tp;
+    quic_tp_init_defaults(&tp);
+    tp.present = QUIC_TP_F_INITIAL_MAX_DATA;
+    tp.initial_max_data = 0x3fffffffffffffffULL;  /* needs 8-byte varint */
+    uint8_t small[2];
+    check_int("encode returns 0 on small buffer",
+              (long)quic_tp_encode(&tp, small, sizeof small), 0);
+}
+
+/* ============================================================== */
 
 
 int main(void) {
@@ -1367,6 +1607,16 @@ int main(void) {
     test_special_stateless_reset_build_match();
     test_special_version_negotiation();
     test_special_idle_expired();
+
+    test_tp_defaults();
+    test_tp_encode_empty();
+    test_tp_encode_decode_roundtrip();
+    test_tp_decode_unknown_id_skipped();
+    test_tp_decode_duplicate_rejected();
+    test_tp_decode_truncated_rejected();
+    test_tp_decode_illegal_values();
+    test_tp_encode_validation();
+    test_tp_encode_buffer_overflow();
 
     printf("\n=== RESULTS: PASS=%d FAIL=%d ===\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
