@@ -25,6 +25,8 @@
 #include "initial.h"
 #include "packet.h"
 #include "crypto_stream.h"
+#include "transport_params.h"
+#include "../tls/handshake.h"
 
 #define QUIC_CONN_RX_CRYPTO_CAP  4096u   /* per-epoch reassembly buffer */
 
@@ -92,6 +94,35 @@ const uint8_t* quic_conn_initial_rx_peek(const quic_conn_t* c,
 
 /* Mark `n` previously-peeked bytes as handed to the TLS layer. */
 void quic_conn_initial_rx_advance(quic_conn_t* c, size_t n);
+
+/* Try to extract a complete ClientHello + the QUIC transport-parameters
+ * extension from the Initial-epoch CRYPTO rx stream (wave 5 phase 5e2).
+ *
+ * Behaviour:
+ *   - Peeks the contiguous in-order rx prefix.
+ *   - If fewer bytes than a full TLS handshake message are buffered,
+ *     returns 0 without modifying *parsed_out / *peer_tp_out (caller
+ *     should pump more packets and retry).
+ *   - On a complete CH:
+ *       * Parses it via tls13_parse_client_hello (RFC 8446 §4.1.2).
+ *       * Locates the QUIC transport_parameters extension (codepoint
+ *         0x0039) inside the CH extensions block per RFC 9001 §8.2.
+ *       * Decodes the TPs into *peer_tp_out per RFC 9000 §18.
+ *     Returns 1 on full success.
+ *   - Returns -1 on any of: CH parse failure, CH extensions block
+ *     malformed, QUIC TP extension missing (REQUIRED in CH per
+ *     RFC 9001 §8.2), TP decode failure.
+ *
+ * Note: parsed_out->raw aliases the conn's Initial rx buffer. It
+ * remains valid until the caller calls quic_conn_initial_rx_advance.
+ *
+ * This call is idempotent and read-only on the conn — it does not
+ * advance the rx cursor. The caller chooses when to advance after it
+ * has driven the CH bytes into its TLS engine.
+ */
+int quic_conn_initial_extract_client_hello(const quic_conn_t* c,
+                                           tls13_client_hello_t* parsed_out,
+                                           quic_transport_params_t* peer_tp_out);
 
 /* Test helper: also force-derive Initial keys from a known DCID
  * (used by tests where the embedder wants to pre-stage keys without

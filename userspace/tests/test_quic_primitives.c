@@ -2037,6 +2037,217 @@ static void test_conn_recv_rejects_aead_failure(void) {
               (long)conn.initial_pkts_rcvd, 0);
 }
 
+/* ---------------- phase 5e2: ClientHello + TP extraction -------------- */
+
+static void w8 (uint8_t** p, uint8_t  v) { (*p)[0] = v; *p += 1; }
+static void w16(uint8_t** p, uint16_t v) { (*p)[0] = v >> 8; (*p)[1] = (uint8_t)v; *p += 2; }
+static void w24(uint8_t** p, uint32_t v) { (*p)[0] = v >> 16; (*p)[1] = v >> 8; (*p)[2] = (uint8_t)v; *p += 3; }
+static void wb (uint8_t** p, const void* s, size_t n) { memcpy(*p, s, n); *p += n; }
+
+/* Build a synthetic CH into `out`. If `tp_blob` != NULL, splice a
+ * quic_transport_parameters extension (codepoint 0x0039) as the LAST
+ * non-PSK extension. Returns total bytes written. */
+static size_t build_synthetic_ch(uint8_t* out, size_t cap,
+                                 const uint8_t* tp_blob, size_t tp_len)
+{
+    (void)cap;
+    uint8_t* p = out;
+    /* Handshake header: type=0x01, len placeholder backfilled later. */
+    w8(&p, 0x01);
+    uint8_t* hs_len_at = p; w24(&p, 0);
+    uint8_t* hs_body = p;
+
+    w16(&p, 0x0303);                                        /* legacy_version */
+    for (int i = 0; i < 32; i++) w8(&p, (uint8_t)(0x40 + i)); /* random */
+    w8(&p, 0);                                              /* legacy_session_id len = 0 */
+    /* cipher_suites: TLS_CHACHA20_POLY1305_SHA256 */
+    w16(&p, 2);
+    w16(&p, 0x1303);
+    /* legacy_compression_methods: [0x00] */
+    w8(&p, 1); w8(&p, 0);
+
+    /* extensions block, length backfilled. */
+    uint8_t* ext_len_at = p; w16(&p, 0);
+    uint8_t* ext_start = p;
+
+    /* supported_versions: 0x0304 */
+    w16(&p, 0x002b); w16(&p, 1 + 2); w8(&p, 2); w16(&p, 0x0304);
+    /* supported_groups: x25519 */
+    w16(&p, 0x000a); w16(&p, 4); w16(&p, 2); w16(&p, 0x001d);
+    /* key_share: x25519 with a 32-byte pubkey */
+    w16(&p, 0x0033); w16(&p, 2 + 4 + 32); w16(&p, 4 + 32);
+    w16(&p, 0x001d); w16(&p, 32);
+    for (int i = 0; i < 32; i++) w8(&p, (uint8_t)(0x80 + i));
+    /* signature_algorithms: ed25519 (0x0807) */
+    w16(&p, 0x000d); w16(&p, 4); w16(&p, 2); w16(&p, 0x0807);
+    /* QUIC transport_parameters: codepoint 0x0039, body = tp_blob */
+    if (tp_blob != NULL) {
+        w16(&p, 0x0039);
+        w16(&p, (uint16_t)tp_len);
+        wb (&p, tp_blob, tp_len);
+    }
+
+    uint16_t ext_len = (uint16_t)(p - ext_start);
+    ext_len_at[0] = ext_len >> 8; ext_len_at[1] = (uint8_t)ext_len;
+    uint32_t hs_body_len = (uint32_t)(p - hs_body);
+    hs_len_at[0] = (uint8_t)(hs_body_len >> 16);
+    hs_len_at[1] = (uint8_t)(hs_body_len >> 8);
+    hs_len_at[2] = (uint8_t)hs_body_len;
+
+    return (size_t)(p - out);
+}
+
+static size_t make_sample_tp(uint8_t* out, size_t cap)
+{
+    quic_transport_params_t tp;
+    quic_tp_init_defaults(&tp);
+    tp.present |= QUIC_TP_F_MAX_IDLE_TIMEOUT;
+    tp.max_idle_timeout_ms = 30000;
+    tp.present |= QUIC_TP_F_INITIAL_MAX_DATA;
+    tp.initial_max_data = 1048576;
+    tp.present |= QUIC_TP_F_INITIAL_MAX_STREAMS_BIDI;
+    tp.initial_max_streams_bidi = 100;
+    tp.present |= QUIC_TP_F_INITIAL_SOURCE_CID;
+    static const uint8_t cid[] = {0x11,0x22,0x33,0x44,0x55,0x66,0x77,0x88};
+    memcpy(tp.initial_source_cid, cid, sizeof cid);
+    tp.initial_source_cid_len = (uint8_t)sizeof cid;
+    return quic_tp_encode(&tp, out, cap);
+}
+
+static void test_conn_extract_ch_with_tp(void) {
+    printf("== conn: extract CH + QUIC transport params ==\n");
+
+    uint8_t tp_blob[256];
+    size_t tp_len = make_sample_tp(tp_blob, sizeof tp_blob);
+    if (tp_len == 0) { printf("  FAIL: tp encode\n"); g_fail++; return; }
+
+    uint8_t ch[1024];
+    size_t ch_len = build_synthetic_ch(ch, sizeof ch, tp_blob, tp_len);
+
+    quic_conn_t conn;
+    quic_conn_init_server(&conn);
+    /* Stage the CH bytes directly into the Initial-epoch rx stream. */
+    if (quic_crypto_rx_stage(&conn.rx_initial, 0, ch, ch_len) < 0) {
+        printf("  FAIL: rx stage\n"); g_fail++; return;
+    }
+
+    tls13_client_hello_t parsed;
+    quic_transport_params_t peer_tp;
+    int rc = quic_conn_initial_extract_client_hello(&conn, &parsed, &peer_tp);
+    check_int("extract returns 1", rc, 1);
+    check_int("CH offers chacha_poly", parsed.offers_chacha_poly, 1);
+    check_int("CH offers tls13",       parsed.offers_tls13, 1);
+    check_int("CH offers x25519",      parsed.offers_x25519, 1);
+
+    check_int("peer_tp has max_idle_timeout",
+              (peer_tp.present & QUIC_TP_F_MAX_IDLE_TIMEOUT) != 0, 1);
+    check_int("peer_tp.max_idle_timeout_ms == 30000",
+              (long)peer_tp.max_idle_timeout_ms, 30000);
+    check_int("peer_tp.initial_max_data == 1048576",
+              (long)peer_tp.initial_max_data, 1048576);
+    check_int("peer_tp.initial_max_streams_bidi == 100",
+              (long)peer_tp.initial_max_streams_bidi, 100);
+    check_int("peer_tp has initial_source_cid",
+              (peer_tp.present & QUIC_TP_F_INITIAL_SOURCE_CID) != 0, 1);
+    check_int("peer_tp.initial_source_cid_len == 8",
+              (long)peer_tp.initial_source_cid_len, 8);
+    check_int("peer_tp.initial_source_cid bytes match",
+              memcmp(peer_tp.initial_source_cid,
+                     "\x11\x22\x33\x44\x55\x66\x77\x88", 8) == 0, 1);
+
+    /* parsed.raw must alias the rx buffer. */
+    check_int("parsed.raw aliases rx",
+              parsed.raw == conn.rx_initial_data, 1);
+    check_int("parsed.raw_len == ch_len",
+              (long)parsed.raw_len, (long)ch_len);
+}
+
+static void test_conn_extract_ch_incomplete(void) {
+    printf("== conn: extract CH returns 0 when incomplete ==\n");
+    uint8_t tp_blob[256];
+    size_t tp_len = make_sample_tp(tp_blob, sizeof tp_blob);
+    uint8_t ch[1024];
+    size_t ch_len = build_synthetic_ch(ch, sizeof ch, tp_blob, tp_len);
+
+    quic_conn_t conn;
+    quic_conn_init_server(&conn);
+    /* Stage only a prefix — header + a few body bytes. */
+    if (quic_crypto_rx_stage(&conn.rx_initial, 0, ch, 32) < 0) {
+        printf("  FAIL: rx stage prefix\n"); g_fail++; return;
+    }
+
+    tls13_client_hello_t parsed;
+    quic_transport_params_t peer_tp;
+    check_int("incomplete CH returns 0",
+              quic_conn_initial_extract_client_hello(&conn, &parsed, &peer_tp), 0);
+
+    /* Now stage the rest. */
+    if (quic_crypto_rx_stage(&conn.rx_initial, 32, ch + 32, ch_len - 32) < 0) {
+        printf("  FAIL: rx stage tail\n"); g_fail++; return;
+    }
+    check_int("complete CH then returns 1",
+              quic_conn_initial_extract_client_hello(&conn, &parsed, &peer_tp), 1);
+}
+
+static void test_conn_extract_ch_missing_tp(void) {
+    printf("== conn: extract CH without QUIC TP rejected ==\n");
+    uint8_t ch[1024];
+    /* No TP extension. */
+    size_t ch_len = build_synthetic_ch(ch, sizeof ch, NULL, 0);
+
+    quic_conn_t conn;
+    quic_conn_init_server(&conn);
+    if (quic_crypto_rx_stage(&conn.rx_initial, 0, ch, ch_len) < 0) {
+        printf("  FAIL: rx stage\n"); g_fail++; return;
+    }
+
+    tls13_client_hello_t parsed;
+    quic_transport_params_t peer_tp;
+    check_int("missing QUIC TP returns -1",
+              quic_conn_initial_extract_client_hello(&conn, &parsed, &peer_tp), -1);
+}
+
+static void test_conn_extract_ch_malformed_tp(void) {
+    printf("== conn: extract CH with malformed TP rejected ==\n");
+    /* TP blob that decodes to truncated TLV: id=0x01 (varint, 1 byte),
+     * len=0x08 (claims 8-byte body), but only 2 bytes follow. */
+    uint8_t bad_tp[] = { 0x01, 0x08, 0xaa, 0xbb };
+
+    uint8_t ch[1024];
+    size_t ch_len = build_synthetic_ch(ch, sizeof ch, bad_tp, sizeof bad_tp);
+
+    quic_conn_t conn;
+    quic_conn_init_server(&conn);
+    if (quic_crypto_rx_stage(&conn.rx_initial, 0, ch, ch_len) < 0) {
+        printf("  FAIL: rx stage\n"); g_fail++; return;
+    }
+
+    tls13_client_hello_t parsed;
+    quic_transport_params_t peer_tp;
+    check_int("malformed TP returns -1",
+              quic_conn_initial_extract_client_hello(&conn, &parsed, &peer_tp), -1);
+}
+
+static void test_conn_extract_ch_not_handshake_type(void) {
+    printf("== conn: extract CH rejects non-CH handshake type ==\n");
+    /* Build a valid CH but flip the handshake type to 0x02 (server_hello). */
+    uint8_t tp_blob[256];
+    size_t tp_len = make_sample_tp(tp_blob, sizeof tp_blob);
+    uint8_t ch[1024];
+    size_t ch_len = build_synthetic_ch(ch, sizeof ch, tp_blob, tp_len);
+    ch[0] = 0x02;
+
+    quic_conn_t conn;
+    quic_conn_init_server(&conn);
+    if (quic_crypto_rx_stage(&conn.rx_initial, 0, ch, ch_len) < 0) {
+        printf("  FAIL: rx stage\n"); g_fail++; return;
+    }
+    tls13_client_hello_t parsed;
+    quic_transport_params_t peer_tp;
+    check_int("non-CH type returns -1",
+              quic_conn_initial_extract_client_hello(&conn, &parsed, &peer_tp), -1);
+}
+
 /* ============================================================== */
 
 
@@ -2134,6 +2345,12 @@ int main(void) {
     test_conn_recv_dcid_pin();
     test_conn_recv_rejects_short_garbage();
     test_conn_recv_rejects_aead_failure();
+
+    test_conn_extract_ch_with_tp();
+    test_conn_extract_ch_incomplete();
+    test_conn_extract_ch_missing_tp();
+    test_conn_extract_ch_malformed_tp();
+    test_conn_extract_ch_not_handshake_type();
 
     printf("\n=== RESULTS: PASS=%d FAIL=%d ===\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;

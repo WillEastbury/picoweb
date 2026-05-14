@@ -48,11 +48,15 @@ QUIC_PRIM_SRC := \
     ../crypto/sha256.c           \
     ../crypto/sha256_shani.c     \
     ../crypto/sha256_armv8.c     \
+    ../crypto/sha512.c           \
+    ../crypto/ed25519.c          \
+    ../crypto/rsa.c              \
     ../crypto/hmac.c             \
     ../crypto/hkdf.c             \
     ../crypto/aes.c              \
     ../crypto/aes_gcm.c          \
     ../tls/keysched.c            \
+    ../tls/handshake.c           \
     ../quic/varint.c             \
     ../quic/initial.c            \
     ../quic/packet.c             \
