@@ -178,6 +178,8 @@ static int load_cert_material(tls_worker_ctx_t* w) {
         w->cert_sig_scheme = TLS13_SIG_SCHEME_ED25519;
     } else if (w->key_type == CERT_KEY_RSA) {
         w->cert_sig_scheme = TLS13_SIG_SCHEME_RSA_PSS_RSAE_SHA256;
+    } else if (w->key_type == CERT_KEY_ECDSA_P256) {
+        w->cert_sig_scheme = TLS13_SIG_SCHEME_ECDSA_SECP256R1_SHA256;
     }
 
     w->cert_chain_der = chain;
@@ -469,11 +471,11 @@ void* tls_worker_main(void* arg) {
     if (load_cert_material(&w) != 0) {
         metal_die("tls_worker_main: failed loading TLS cert/key");
     }
-    if (w.key_type != CERT_KEY_ED25519 && w.key_type != CERT_KEY_RSA) {
+    if (w.key_type != CERT_KEY_ED25519 &&
+        w.key_type != CERT_KEY_RSA &&
+        w.key_type != CERT_KEY_ECDSA_P256) {
         const char* kt = "unknown";
-        if (w.key_type == CERT_KEY_RSA) kt = "rsa";
-        else if (w.key_type == CERT_KEY_ECDSA_P256) kt = "ecdsa-p256";
-        metal_die("tls_worker_main: key type '%s' loaded but handshake signing for this type is not implemented yet (supported: Ed25519, RSA-PSS)", kt);
+        metal_die("tls_worker_main: key type '%s' loaded but handshake signing for this type is not implemented yet (supported: Ed25519, RSA-PSS, ECDSA-P256-SHA256)", kt);
     }
 
     uint8_t local_mac[6];
