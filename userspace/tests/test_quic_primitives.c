@@ -2689,6 +2689,147 @@ static void test_conn_recv_handshake_rejects_no_keys(void) {
 
 /* ============================================================== */
 
+/* ---------------- phase 5e6: server handshake driver ----------------- */
+
+#include "../quic/handshake_driver.h"
+#include "../crypto/x25519.h"
+
+static void drive_test_setup_conn_with_ch(quic_conn_t* conn,
+                                          const uint8_t* tp_blob,
+                                          size_t tp_len,
+                                          uint8_t* ch_buf, size_t ch_buf_cap,
+                                          size_t* ch_len_out)
+{
+    quic_conn_init_server(conn);
+    size_t ch_len = build_synthetic_ch(ch_buf, ch_buf_cap, tp_blob, tp_len);
+    if (quic_crypto_rx_stage(&conn->rx_initial, 0, ch_buf, ch_len) < 0) {
+        printf("  FATAL: rx stage\n"); exit(2);
+    }
+    /* Pretend the embedder ran recv_initial: fake peer dcid/scid +
+     * peer_addrs_known so the tx pipelines can derive Initial keys. */
+    static const uint8_t peer_dcid[] = {0xa1,0xa2,0xa3,0xa4,0xa5,0xa6,0xa7,0xa8};
+    static const uint8_t peer_scid[] = {0xc1,0xc2,0xc3,0xc4,0xc5,0xc6,0xc7,0xc8};
+    quic_conn_force_derive_initial_keys(conn, peer_dcid, sizeof peer_dcid);
+    memcpy(conn->peer_dcid, peer_dcid, sizeof peer_dcid);
+    conn->peer_dcid_len = sizeof peer_dcid;
+    memcpy(conn->peer_scid, peer_scid, sizeof peer_scid);
+    conn->peer_scid_len = sizeof peer_scid;
+    conn->peer_addrs_known = 1;
+    static const uint8_t our_scid[] = {0xb0,0xb1,0xb2,0xb3,0xb4,0xb5,0xb6,0xb7};
+    quic_conn_set_our_scid(conn, our_scid, sizeof our_scid);
+    *ch_len_out = ch_len;
+}
+
+static void test_drive_server_handshake_happy(void) {
+    printf("== drive: full server handshake (CH → SH+EE+Cert+CV+Fin) ==\n");
+
+    uint8_t tp_blob[256];
+    size_t  tp_len = make_sample_tp(tp_blob, sizeof tp_blob);
+
+    quic_conn_t conn;
+    uint8_t ch[1024]; size_t ch_len;
+    drive_test_setup_conn_with_ch(&conn, tp_blob, tp_len, ch, sizeof ch, &ch_len);
+
+    static const uint8_t srv_priv[32] = {
+        1,2,3,4,5,6,7,8, 9,10,11,12,13,14,15,16,
+        17,18,19,20,21,22,23,24, 25,26,27,28,29,30,31,32,
+    };
+    static const uint8_t srv_random[32] = {
+        0xde,0xad,0xbe,0xef, 0xfa,0xce,0xfe,0xed,
+        0x01,0x02,0x03,0x04, 0x05,0x06,0x07,0x08,
+        0xa0,0xa1,0xa2,0xa3, 0xa4,0xa5,0xa6,0xa7,
+        0xb0,0xb1,0xb2,0xb3, 0xb4,0xb5,0xb6,0xb7,
+    };
+    static const uint8_t fake_cert[8] = { 0x30,0x06,0x02,0x01,0x00,0x05,0x00,0x00 };
+    static const size_t  cert_lens[1] = { sizeof fake_cert };
+    static const uint8_t ed_seed[32] = {
+        0x9d,0x61,0xb1,0x9d,0xef,0xfd,0x5a,0x60,
+        0xba,0x84,0x4a,0xf4,0x92,0xec,0x2c,0xc4,
+        0x44,0x49,0xc5,0x69,0x7b,0x32,0x69,0x19,
+        0x70,0x3b,0xac,0x03,0x1c,0xae,0x7f,0x60,
+    };
+
+    quic_server_handshake_inputs_t in = {0};
+    in.server_priv_x25519 = srv_priv;
+    in.server_random      = srv_random;
+    in.cert.chain_der     = fake_cert;
+    in.cert.cert_lens     = cert_lens;
+    in.cert.n_certs       = 1;
+    in.cert.ed25519_seed  = ed_seed;
+
+    int rc = quic_server_drive_handshake(&conn, &in);
+    check_int("driver returned 0", rc, 0);
+    check_int("handshake state populated", conn.have_handshake_state, 1);
+    check_int("handshake keys ready",      conn.handshake_keys_ready, 1);
+    check_int("Initial blob non-empty",    conn.drv_initial_blob_len > 0, 1);
+    check_int("Handshake blob non-empty",  conn.drv_handshake_blob_len > 0, 1);
+
+    /* SH starts with handshake type 0x02. */
+    check_int("Initial blob starts with SH (0x02)",
+              conn.drv_initial_blob[0], 0x02);
+    /* HS blob starts with EE (0x08). */
+    check_int("HS blob starts with EE (0x08)",
+              conn.drv_handshake_blob[0], 0x08);
+
+    /* Now exercise the emit pipelines end-to-end. */
+    uint8_t out[1500];
+    size_t  emitted = quic_conn_emit_initial(&conn, out, sizeof out);
+    check_int("emit Initial produced bytes", emitted > 0, 1);
+    check_int("Initial pn advanced", (long)conn.initial_tx_next_pn, 1);
+
+    emitted = quic_conn_emit_handshake(&conn, out, sizeof out);
+    check_int("emit Handshake produced bytes", emitted > 0, 1);
+    check_int("Handshake pn advanced", (long)conn.handshake_tx_next_pn, 1);
+}
+
+static void test_drive_rejects_no_x25519(void) {
+    printf("== drive: rejects CH without X25519 key share ==\n");
+    /* Build a CH with no extensions (no x25519). */
+    quic_conn_t conn;
+    quic_conn_init_server(&conn);
+    /* Minimal CH: hs hdr + legacy_version + random + sid=0 + cs + cm + ext_total=0.
+     * legacy_version(2) + random(32) + 1 + 2+2 + 1+1 + 2 = 41 bytes body. */
+    uint8_t ch[64];
+    uint8_t* p = ch;
+    *p++ = 0x01; *p++=0; *p++=0; *p++=41;
+    *p++ = 0x03; *p++ = 0x03;
+    for (int i = 0; i < 32; i++) *p++ = 0;
+    *p++ = 0;
+    *p++ = 0; *p++ = 2; *p++ = 0x13; *p++ = 0x03;
+    *p++ = 1; *p++ = 0;
+    *p++ = 0; *p++ = 0;
+    if (quic_crypto_rx_stage(&conn.rx_initial, 0, ch, (size_t)(p-ch)) < 0) {
+        printf("  FATAL\n"); exit(2);
+    }
+
+    static const uint8_t srv_priv[32]   = {1};
+    static const uint8_t srv_random[32] = {2};
+    static const uint8_t fake_cert[4]   = {0x30,0,0,0};
+    static const size_t  cert_lens[1]   = {4};
+    static const uint8_t ed_seed[32]    = {3};
+    quic_server_handshake_inputs_t in = {0};
+    in.server_priv_x25519 = srv_priv;
+    in.server_random = srv_random;
+    in.cert.chain_der = fake_cert;
+    in.cert.cert_lens = cert_lens;
+    in.cert.n_certs = 1;
+    in.cert.ed25519_seed = ed_seed;
+
+    check_int("driver rejects",
+              quic_server_drive_handshake(&conn, &in), -1);
+}
+
+static void test_drive_rejects_bad_args(void) {
+    printf("== drive: rejects null inputs ==\n");
+    quic_conn_t conn; quic_conn_init_server(&conn);
+    check_int("null in", quic_server_drive_handshake(&conn, NULL), -1);
+    quic_server_handshake_inputs_t in = {0};
+    check_int("missing server_priv",
+              quic_server_drive_handshake(&conn, &in), -1);
+}
+
+/* ============================================================== */
+
 int main(void) {
     test_udp_build_parse_roundtrip();
     test_udp_zero_payload();
@@ -2806,6 +2947,10 @@ int main(void) {
     test_conn_recv_handshake_round_trip();
     test_conn_recv_handshake_rejects_initial_type();
     test_conn_recv_handshake_rejects_no_keys();
+
+    test_drive_server_handshake_happy();
+    test_drive_rejects_no_x25519();
+    test_drive_rejects_bad_args();
 
     printf("\n=== RESULTS: PASS=%d FAIL=%d ===\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
