@@ -2390,6 +2390,136 @@ static void test_conn_emit_initial_no_peer_addrs(void) {
               (long)quic_conn_emit_initial(&conn, out, sizeof out), 0);
 }
 
+/* ---------------- phase 5e4: Handshake packet build/parse ----------- */
+
+static void test_handshake_pkt_round_trip(void) {
+    printf("== Handshake packet build/parse round-trip ==\n");
+
+    /* Use a deterministic 32-byte handshake_traffic_secret to derive
+     * AES-128-GCM keys via the RFC 9001 §5.1 label set ("quic key" /
+     * "quic iv" / "quic hp"). Reusing quic_keys_from_secret which we
+     * built in phase 5c. */
+    uint8_t secret[32];
+    for (int i = 0; i < 32; i++) secret[i] = (uint8_t)(0x10 + i);
+    quic_keys_t k;
+    if (quic_keys_from_secret(secret, sizeof secret, 16, 16, &k) != 1) {
+        printf("  FAIL: derive keys\n"); g_fail++; return;
+    }
+    /* Project into the Initial-keys-shaped struct used by the packet API. */
+    quic_handshake_keys_t keys;
+    memcpy(keys.key, k.key, 16);
+    memcpy(keys.iv,  k.iv,  12);
+    memcpy(keys.hp,  k.hp,  16);
+
+    /* Some plaintext frames — a CRYPTO frame at offset 0 with arbitrary bytes. */
+    uint8_t hs_bytes[80];
+    for (size_t i = 0; i < sizeof hs_bytes; i++) hs_bytes[i] = (uint8_t)(0x70 + (i & 0x1f));
+    uint8_t frames[256];
+    size_t fn = quic_frame_crypto_encode(frames, sizeof frames, 0,
+                                         hs_bytes, sizeof hs_bytes);
+    if (fn == 0) { printf("  FAIL: crypto encode\n"); g_fail++; return; }
+
+    quic_handshake_pkt_t pkt = {0};
+    pkt.version = 0x00000001u;
+    static const uint8_t dcid[] = {0x11,0x22,0x33,0x44,0x55,0x66,0x77,0x88};
+    static const uint8_t scid[] = {0xaa,0xbb,0xcc,0xdd};
+    memcpy(pkt.dcid, dcid, sizeof dcid); pkt.dcid_len = sizeof dcid;
+    memcpy(pkt.scid, scid, sizeof scid); pkt.scid_len = sizeof scid;
+    pkt.pn = 42;
+    pkt.pn_len = 2;
+    pkt.payload = frames;
+    pkt.payload_len = fn;
+
+    uint8_t wire[2048];
+    size_t n = quic_handshake_build(wire, sizeof wire, &pkt, &keys);
+    check_int("build produced bytes", n > 0, 1);
+    /* Long header + Handshake type bits = byte0 high nibble == 0xe? */
+    check_int("byte0 long-header form bit", (wire[0] & 0x80) != 0, 1);
+    /* After HP the type bits might still be visible (HP only masks
+     * low 4 bits): top 4 bits should be 1110 = 0xE for Handshake. */
+    check_int("byte0 type bits == Handshake (0xe0)",
+              (wire[0] & 0xf0) == 0xe0, 1);
+
+    quic_handshake_pkt_t got;
+    uint8_t scratch[2048];
+    int rc = quic_handshake_parse(wire, n, &keys, &got, scratch, sizeof scratch);
+    check_int("parse returns 0", rc, 0);
+    check_int("dcid matches", memcmp(got.dcid, dcid, sizeof dcid) == 0
+                              && got.dcid_len == sizeof dcid, 1);
+    check_int("scid matches", memcmp(got.scid, scid, sizeof scid) == 0
+                              && got.scid_len == sizeof scid, 1);
+    check_int("pn matches", (long)got.pn, 42);
+    check_int("pn_len matches", (long)got.pn_len, 2);
+    check_int("payload_len matches", (long)got.payload_len, (long)fn);
+    check_int("payload bytes match",
+              memcmp(got.payload, frames, fn) == 0, 1);
+
+    /* Walk the decoded payload and verify CRYPTO frame contents. */
+    quic_frame_t f;
+    size_t consumed = quic_frame_decode(got.payload, got.payload_len, &f);
+    check_int("inner CRYPTO frame decodes",
+              consumed > 0 && consumed != QUIC_FRAME_DECODE_ERROR
+              && f.type == QUIC_FT_CRYPTO, 1);
+    check_int("inner CRYPTO bytes match",
+              memcmp(f.u.crypto.data, hs_bytes, sizeof hs_bytes) == 0, 1);
+}
+
+static void test_handshake_pkt_rejects_initial_type(void) {
+    printf("== Handshake parser rejects Initial-typed packet ==\n");
+    /* Build a real Initial packet, then feed it to handshake_parse. */
+    uint8_t dcid[8] = {0x83,0x94,0xc8,0xf0,0x3e,0x51,0x57,0x08};
+    quic_initial_keys_t ikeys;
+    quic_initial_derive(dcid, sizeof dcid, /*is_server=*/0, &ikeys);
+
+    uint8_t frames[16];
+    size_t fn = quic_frame_padding_encode(frames, sizeof frames, 16);
+    quic_initial_pkt_t ip = {0};
+    ip.version = 0x00000001u;
+    memcpy(ip.dcid, dcid, sizeof dcid); ip.dcid_len = sizeof dcid;
+    ip.pn = 0; ip.pn_len = 2;
+    ip.payload = frames; ip.payload_len = fn;
+    uint8_t wire[2048];
+    size_t n = quic_initial_build(wire, sizeof wire, &ip, &ikeys, 0);
+    if (n == 0) { printf("  FAIL: build initial\n"); g_fail++; return; }
+
+    quic_handshake_pkt_t got;
+    uint8_t scratch[2048];
+    /* Use bogus handshake keys — type check should fail before AEAD. */
+    quic_handshake_keys_t hks; memset(&hks, 0, sizeof hks);
+    check_int("Initial-typed packet rejected by handshake_parse",
+              quic_handshake_parse(wire, n, &hks, &got, scratch, sizeof scratch),
+              -1);
+}
+
+static void test_handshake_pkt_rejects_bad_version(void) {
+    printf("== Handshake parser rejects wrong version ==\n");
+    uint8_t secret[32]; for (int i = 0; i < 32; i++) secret[i] = (uint8_t)i;
+    quic_keys_t k;
+    quic_keys_from_secret(secret, 32, 16, 16, &k);
+    quic_handshake_keys_t keys;
+    memcpy(keys.key, k.key, 16);
+    memcpy(keys.iv,  k.iv,  12);
+    memcpy(keys.hp,  k.hp,  16);
+
+    uint8_t pad[8]; memset(pad, 0, sizeof pad);
+    quic_handshake_pkt_t pkt = {0};
+    pkt.version = 0x00000001u;
+    pkt.pn = 0; pkt.pn_len = 1;
+    pkt.payload = pad; pkt.payload_len = sizeof pad;
+    uint8_t wire[256];
+    size_t n = quic_handshake_build(wire, sizeof wire, &pkt, &keys);
+    if (n == 0) { printf("  FAIL: build hs\n"); g_fail++; return; }
+
+    /* Corrupt the version field to 0xdeadbeef. */
+    wire[1] = 0xde; wire[2] = 0xad; wire[3] = 0xbe; wire[4] = 0xef;
+
+    quic_handshake_pkt_t got;
+    uint8_t scratch[256];
+    check_int("wrong version rejected",
+              quic_handshake_parse(wire, n, &keys, &got, scratch, sizeof scratch),
+              -1);
+}
+
 /* ============================================================== */
 
 int main(void) {
@@ -2497,6 +2627,10 @@ int main(void) {
     test_conn_emit_initial_chunks();
     test_conn_emit_initial_no_pending();
     test_conn_emit_initial_no_peer_addrs();
+
+    test_handshake_pkt_round_trip();
+    test_handshake_pkt_rejects_initial_type();
+    test_handshake_pkt_rejects_bad_version();
 
     printf("\n=== RESULTS: PASS=%d FAIL=%d ===\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
