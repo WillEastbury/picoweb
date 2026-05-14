@@ -508,3 +508,66 @@ size_t quic_conn_emit_handshake(quic_conn_t* c, uint8_t* out, size_t out_cap)
     c->handshake_tx_next_pn++;
     return n;
 }
+
+/* ---- phase 5e7: client Finished verify + 1-RTT key install -------- */
+
+#include "../tls/handshake.h"
+#include "../tls/keysched.h"
+
+int quic_server_finish_handshake(quic_conn_t* c)
+{
+    if (!c) return -1;
+    if (!c->have_handshake_state) return -1;
+    if (c->app_keys_ready) return 0;
+
+    /* Peek the buffered client Finished. RFC 8446 §4.4.4: 0x14 then
+     * u24 length; verify_data is 32 bytes for SHA-256 suites. */
+    size_t avail = 0;
+    const uint8_t* fin = quic_crypto_rx_peek(&c->rx_handshake, &avail);
+    if (!fin || avail < 4) return -1;
+    if (fin[0] != 0x14) return -1;
+    uint32_t body_len = ((uint32_t)fin[1] << 16) |
+                        ((uint32_t)fin[2] <<  8) |
+                         (uint32_t)fin[3];
+    if (body_len != 32) return -1;
+    if (avail < 4 + 32) return -1;
+
+    /* Verify the client Finished against the SH-flight transcript
+     * (== transcript_hash_thru_server_fin). */
+    if (tls13_verify_finished(c->client_handshake_traffic_secret,
+                              c->transcript_hash_thru_server_fin,
+                              fin + 4) != 0) {
+        return -1;
+    }
+
+    /* Derive application secrets. Note: per RFC 8446 §7.1, c_ap and
+     * s_ap are derived from the SAME transcript snapshot used for the
+     * server Finished — the client Finished is verified against that
+     * same snapshot but does NOT itself feed into c_ap/s_ap. */
+    uint8_t ms[32], c_ap[32], s_ap[32];
+    if (tls13_compute_application_secrets(c->handshake_secret,
+                                          c->transcript_hash_thru_server_fin,
+                                          ms, c_ap, s_ap) != 0) return -1;
+
+    /* Derive AES-128-GCM 1-RTT packet keys. Reuse the local helper
+     * pattern from hs_keys_install_one. */
+    quic_keys_t big_tx, big_rx;
+    if (!quic_keys_from_secret(s_ap, 32, 16, 16, &big_tx)) return -1;
+    if (!quic_keys_from_secret(c_ap, 32, 16, 16, &big_rx)) return -1;
+
+    memcpy(c->app_tx_keys.key, big_tx.key, 16);
+    memcpy(c->app_tx_keys.iv,  big_tx.iv,  12);
+    memcpy(c->app_tx_keys.hp,  big_tx.hp,  16);
+    memcpy(c->app_rx_keys.key, big_rx.key, 16);
+    memcpy(c->app_rx_keys.iv,  big_rx.iv,  12);
+    memcpy(c->app_rx_keys.hp,  big_rx.hp,  16);
+
+    memcpy(c->client_application_traffic_secret_0, c_ap, 32);
+    memcpy(c->server_application_traffic_secret_0, s_ap, 32);
+    memcpy(c->master_secret, ms, 32);
+    c->app_keys_ready = 1;
+
+    /* Consume the Finished bytes from the Handshake-epoch reassembler. */
+    quic_crypto_rx_advance(&c->rx_handshake, 4 + 32);
+    return 0;
+}

@@ -2828,6 +2828,147 @@ static void test_drive_rejects_bad_args(void) {
               quic_server_drive_handshake(&conn, &in), -1);
 }
 
+/* ---------------- phase 5e7: client Finished + 1-RTT ----------------- */
+
+#include "../tls/keysched.h"
+
+static void test_finish_handshake_round_trip(void) {
+    printf("== finish: client Finished verify → 1-RTT keys ==\n");
+
+    /* Drive the full happy-path setup first. */
+    uint8_t tp_blob[256];
+    size_t  tp_len = make_sample_tp(tp_blob, sizeof tp_blob);
+
+    quic_conn_t conn;
+    uint8_t ch[1024]; size_t ch_len;
+    drive_test_setup_conn_with_ch(&conn, tp_blob, tp_len, ch, sizeof ch, &ch_len);
+
+    static const uint8_t srv_priv[32] = {
+        1,2,3,4,5,6,7,8, 9,10,11,12,13,14,15,16,
+        17,18,19,20,21,22,23,24, 25,26,27,28,29,30,31,32,
+    };
+    static const uint8_t srv_random[32] = {
+        0xde,0xad,0xbe,0xef, 0xfa,0xce,0xfe,0xed,
+        0x01,0x02,0x03,0x04, 0x05,0x06,0x07,0x08,
+        0xa0,0xa1,0xa2,0xa3, 0xa4,0xa5,0xa6,0xa7,
+        0xb0,0xb1,0xb2,0xb3, 0xb4,0xb5,0xb6,0xb7,
+    };
+    static const uint8_t fake_cert[8] = { 0x30,0x06,0x02,0x01,0x00,0x05,0x00,0x00 };
+    static const size_t  cert_lens[1] = { sizeof fake_cert };
+    static const uint8_t ed_seed[32] = {
+        0x9d,0x61,0xb1,0x9d,0xef,0xfd,0x5a,0x60,
+        0xba,0x84,0x4a,0xf4,0x92,0xec,0x2c,0xc4,
+        0x44,0x49,0xc5,0x69,0x7b,0x32,0x69,0x19,
+        0x70,0x3b,0xac,0x03,0x1c,0xae,0x7f,0x60,
+    };
+    quic_server_handshake_inputs_t in = {0};
+    in.server_priv_x25519 = srv_priv;
+    in.server_random      = srv_random;
+    in.cert.chain_der     = fake_cert;
+    in.cert.cert_lens     = cert_lens;
+    in.cert.n_certs       = 1;
+    in.cert.ed25519_seed  = ed_seed;
+    if (quic_server_drive_handshake(&conn, &in) != 0) {
+        printf("  FATAL: drive failed\n"); g_fail++; return;
+    }
+
+    /* Synthesize the matching client Finished. verify_data is computed
+     * against client_handshake_traffic_secret + transcript-thru-server-Fin
+     * — which the server has already snapshotted on conn. */
+    uint8_t verify_data[32];
+    if (tls13_compute_finished(conn.client_handshake_traffic_secret,
+                               conn.transcript_hash_thru_server_fin,
+                               verify_data) != 0) {
+        printf("  FATAL: compute_finished\n"); g_fail++; return;
+    }
+    uint8_t client_fin[64];
+    int fn = tls13_build_finished(client_fin, sizeof client_fin, verify_data);
+    if (fn <= 0) { printf("  FATAL: build_finished\n"); g_fail++; return; }
+
+    /* Stage it directly into the conn's Handshake-epoch reassembler. */
+    if (quic_crypto_rx_stage(&conn.rx_handshake, 0,
+                             client_fin, (size_t)fn) < 0) {
+        printf("  FATAL: rx_handshake stage\n"); g_fail++; return;
+    }
+
+    int rc = quic_server_finish_handshake(&conn);
+    check_int("finish OK",          rc, 0);
+    check_int("app keys ready",     conn.app_keys_ready, 1);
+    /* app_tx and app_rx must differ. */
+    check_int("app tx/rx differ",
+              memcmp(conn.app_tx_keys.key,
+                     conn.app_rx_keys.key, 16) != 0, 1);
+    /* idempotent: second call returns 0 (already-ready short-circuit). */
+    check_int("idempotent",         quic_server_finish_handshake(&conn), 0);
+}
+
+static void test_finish_rejects_bad_verify(void) {
+    printf("== finish: rejects bad verify_data ==\n");
+    /* Drive setup. */
+    uint8_t tp_blob[256];
+    size_t  tp_len = make_sample_tp(tp_blob, sizeof tp_blob);
+    quic_conn_t conn;
+    uint8_t ch[1024]; size_t ch_len;
+    drive_test_setup_conn_with_ch(&conn, tp_blob, tp_len, ch, sizeof ch, &ch_len);
+    static const uint8_t srv_priv[32]   = {7};
+    static const uint8_t srv_random[32] = {0x33};
+    static const uint8_t fake_cert[8]   = {0x30,0x06,0x02,0x01,0x00,0x05,0,0};
+    static const size_t  cert_lens[1]   = {sizeof fake_cert};
+    static const uint8_t ed_seed[32]    = {0x42};
+    quic_server_handshake_inputs_t in = {0};
+    in.server_priv_x25519 = srv_priv;
+    in.server_random = srv_random;
+    in.cert.chain_der = fake_cert;
+    in.cert.cert_lens = cert_lens;
+    in.cert.n_certs = 1;
+    in.cert.ed25519_seed = ed_seed;
+    if (quic_server_drive_handshake(&conn, &in) != 0) {
+        printf("  FATAL\n"); g_fail++; return;
+    }
+
+    /* Forge a Finished with all-zero verify_data. */
+    uint8_t bad_fin[36];
+    bad_fin[0] = 0x14; bad_fin[1] = 0; bad_fin[2] = 0; bad_fin[3] = 32;
+    memset(bad_fin + 4, 0, 32);
+    if (quic_crypto_rx_stage(&conn.rx_handshake, 0,
+                             bad_fin, sizeof bad_fin) < 0) {
+        printf("  FATAL\n"); g_fail++; return;
+    }
+    check_int("verify rejected", quic_server_finish_handshake(&conn), -1);
+    check_int("app keys NOT ready", conn.app_keys_ready, 0);
+}
+
+static void test_finish_rejects_no_state(void) {
+    printf("== finish: rejects without driver run ==\n");
+    quic_conn_t conn; quic_conn_init_server(&conn);
+    check_int("no state → -1", quic_server_finish_handshake(&conn), -1);
+}
+
+static void test_finish_rejects_short_buffer(void) {
+    printf("== finish: rejects truncated Finished ==\n");
+    uint8_t tp_blob[256];
+    size_t  tp_len = make_sample_tp(tp_blob, sizeof tp_blob);
+    quic_conn_t conn;
+    uint8_t ch[1024]; size_t ch_len;
+    drive_test_setup_conn_with_ch(&conn, tp_blob, tp_len, ch, sizeof ch, &ch_len);
+    static const uint8_t p[32] = {1};
+    static const uint8_t r[32] = {2};
+    static const uint8_t cd[8] = {0x30,0x06,0x02,0x01,0x00,0x05,0,0};
+    static const size_t  cl[1] = {8};
+    static const uint8_t s[32] = {3};
+    quic_server_handshake_inputs_t in = {
+        .server_priv_x25519 = p, .server_random = r,
+        .cert = { .chain_der = cd, .cert_lens = cl, .n_certs = 1, .ed25519_seed = s }
+    };
+    if (quic_server_drive_handshake(&conn, &in) != 0) {
+        printf("  FATAL\n"); g_fail++; return;
+    }
+    /* Stage only the 4-byte header — body absent. */
+    static const uint8_t hdr[4] = { 0x14, 0, 0, 32 };
+    quic_crypto_rx_stage(&conn.rx_handshake, 0, hdr, sizeof hdr);
+    check_int("short body → -1", quic_server_finish_handshake(&conn), -1);
+}
+
 /* ============================================================== */
 
 int main(void) {
@@ -2951,6 +3092,11 @@ int main(void) {
     test_drive_server_handshake_happy();
     test_drive_rejects_no_x25519();
     test_drive_rejects_bad_args();
+
+    test_finish_handshake_round_trip();
+    test_finish_rejects_bad_verify();
+    test_finish_rejects_no_state();
+    test_finish_rejects_short_buffer();
 
     printf("\n=== RESULTS: PASS=%d FAIL=%d ===\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
