@@ -55,7 +55,8 @@ QUIC_PRIM_SRC := \
     ../tls/keysched.c            \
     ../quic/varint.c             \
     ../quic/initial.c            \
-    ../quic/packet.c
+    ../quic/packet.c             \
+    ../quic/frames.c
 
 .PHONY: all clean test
 
