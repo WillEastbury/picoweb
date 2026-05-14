@@ -44,6 +44,13 @@ typedef struct {
     const char* tls_peer_mac;
     bool        tls_use_xdp;
     uint32_t    tls_xdp_queue;
+    /* RX dispatch policy for the TLS worker. Default (false) is
+     * poll(2)-based: the worker sleeps on the AF_XDP / AF_PACKET fd
+     * and wakes on packet arrival or a 10ms tick deadline. Set true
+     * for the legacy busy-poll loop (lowest absolute latency, but
+     * pegs a full core and triggers Kubernetes CFS-throttling tail
+     * latency on cgroups with a cpu limit). */
+    bool        tls_busy_poll;
 } server_cfg_t;
 
 /* Backend worker entrypoints. Each takes a server_cfg_t* and runs
