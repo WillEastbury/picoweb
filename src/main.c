@@ -32,6 +32,8 @@ static void usage(const char* argv0) {
         "  --tls-peer-mac=MAC  optional fixed L2 peer MAC hint for --tls\n"
         "  --tls-xdp           use AF_XDP socket I/O for --tls backend (copy mode)\n"
         "  --tls-xdp-queue=N   AF_XDP queue id (default 0)\n"
+        "  --http-early-hints  enable HTTP/1.1 103 Early Hints with auto-derived\n"
+        "                      Link: rel=preload headers (off by default)\n"
         "  --sqpoll     enable IORING_SETUP_SQPOLL: kernel polls our SQ,\n"
         "               eliminating io_uring_enter() syscalls on the submit\n"
         "               path. Costs one kernel thread per worker. Requires\n"
@@ -69,6 +71,7 @@ int main(int argc, char** argv) {
     const char* tls_peer_mac = NULL;
     bool tls_use_xdp = false;
     uint32_t tls_xdp_queue = 0;
+    bool http_early_hints = false;
 
     /* Two-pass parse: lift flags out of argv first, then handle the
      * remaining positional args exactly as before. This keeps the
@@ -153,6 +156,10 @@ int main(int argc, char** argv) {
         }
         if (strcmp(argv[i], "--tls-xdp") == 0) {
             tls_use_xdp = true;
+            continue;
+        }
+        if (strcmp(argv[i], "--http-early-hints") == 0) {
+            http_early_hints = true;
             continue;
         }
         if (strncmp(argv[i], "--tls-xdp-queue=", 16) == 0) {
@@ -300,6 +307,7 @@ int main(int argc, char** argv) {
         cfgs[i].tls_peer_mac          = tls_peer_mac;
         cfgs[i].tls_use_xdp           = tls_use_xdp;
         cfgs[i].tls_xdp_queue         = tls_xdp_queue;
+        cfgs[i].http_early_hints      = http_early_hints;
         /* SQPOLL kernel-thread CPU policy: avoid pinning the kernel
          * polling thread to the same core as its userspace worker
          * (worker i is pinned to (i % nproc)) — they'd thrash one
@@ -329,20 +337,29 @@ int main(int argc, char** argv) {
             metal_die("pthread_create #%ld", i);
         }
         if (attr_p) pthread_attr_destroy(&attr);
-        /* Pin worker N to core (N % nproc). With SO_REUSEPORT each
-         * worker has its own listen socket and per-worker state, so
-         * keeping each on a fixed core preserves L1/L2 cache locality
-         * and matches the kernel's RPS hashing for steady throughput.
+        /* Pin worker N to a CPU. We deliberately AVOID CPU 0 when
+         * possible because the veth NET_RX softirq for inbound traffic
+         * tends to run on CPU 0 (it hashes the first interrupt-handling
+         * core), and a busy-polling user thread on the same core fights
+         * those softirqs for cycles — under burst load this manifests as
+         * XDP-layer RX drops because softirq slice doesn't run long
+         * enough to push frames into the XSK ring before the user thread
+         * resumes.
+         * Mapping: worker N -> CPU ((N + 1) % nproc). With workers=1 and
+         * nproc>=2, that puts the worker on CPU 1 and leaves CPU 0 free
+         * for kernel softirqs. With nproc==1 we have no choice and stay
+         * on CPU 0. With workers>1 we still cycle across all cores.
          * Best-effort: failure is logged and ignored. */
 #ifdef __linux__
         long nproc = sysconf(_SC_NPROCESSORS_ONLN);
         if (nproc >= 1) {
+            long target = (nproc >= 2) ? ((i + 1) % nproc) : 0;
             cpu_set_t cpus;
             CPU_ZERO(&cpus);
-            CPU_SET((int)(i % nproc), &cpus);
+            CPU_SET((int)target, &cpus);
             if (pthread_setaffinity_np(threads[i], sizeof(cpus), &cpus) != 0) {
                 metal_log("pthread_setaffinity_np worker %ld -> cpu %ld: %s",
-                          i, i % nproc, strerror(errno));
+                          i, target, strerror(errno));
             }
         }
 #endif
