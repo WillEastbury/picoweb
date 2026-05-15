@@ -2969,6 +2969,187 @@ static void test_finish_rejects_short_buffer(void) {
     check_int("short body → -1", quic_server_finish_handshake(&conn), -1);
 }
 
+/* ---------------- phase 6a: 1-RTT short-header tests ---------------- */
+
+static void make_app_keys_pair(quic_short_keys_t* tx, quic_short_keys_t* rx)
+{
+    static const uint8_t s[32] = {
+        0x10,0x20,0x30,0x40, 0x50,0x60,0x70,0x80,
+        0x90,0xa0,0xb0,0xc0, 0xd0,0xe0,0xf0,0x00,
+        0x11,0x22,0x33,0x44, 0x55,0x66,0x77,0x88,
+        0x99,0xaa,0xbb,0xcc, 0xdd,0xee,0xff,0x01,
+    };
+    static const uint8_t c[32] = {
+        0xaa,0xbb,0xcc,0xdd, 0xee,0xff,0x00,0x11,
+        0x22,0x33,0x44,0x55, 0x66,0x77,0x88,0x99,
+        0xa0,0xb0,0xc0,0xd0, 0xe0,0xf0,0x01,0x02,
+        0x03,0x04,0x05,0x06, 0x07,0x08,0x09,0x0a,
+    };
+    quic_keys_t big;
+    if (!quic_keys_from_secret(s, 32, 16, 16, &big)) {
+        printf("  FATAL keys s\n"); exit(2);
+    }
+    memcpy(tx->key, big.key, 16); memcpy(tx->iv, big.iv, 12); memcpy(tx->hp, big.hp, 16);
+    if (!quic_keys_from_secret(c, 32, 16, 16, &big)) {
+        printf("  FATAL keys c\n"); exit(2);
+    }
+    memcpy(rx->key, big.key, 16); memcpy(rx->iv, big.iv, 12); memcpy(rx->hp, big.hp, 16);
+}
+
+static void test_short_pkt_round_trip(void) {
+    printf("== short: build → parse round-trip ==\n");
+    quic_short_keys_t tx, rx;
+    make_app_keys_pair(&tx, &rx);
+    /* Symmetric: server's tx = client's rx. We reuse `tx` for both sides. */
+    static const uint8_t dcid[] = {0xa1,0xa2,0xa3,0xa4,0xa5,0xa6,0xa7,0xa8};
+    quic_short_pkt_t pkt = {0};
+    memcpy(pkt.dcid, dcid, sizeof dcid);
+    pkt.dcid_len = sizeof dcid;
+    pkt.pn = 42;
+    pkt.pn_len = 2;
+    static const uint8_t pl[] = {0xde,0xad,0xbe,0xef,0xfa,0xce};
+    pkt.payload = pl; pkt.payload_len = sizeof pl;
+
+    uint8_t wire[256];
+    size_t n = quic_short_build(wire, sizeof wire, &pkt, &tx);
+    check_int("build produced bytes", n > 0, 1);
+    /* form bit=0, fixed=1 in plaintext byte0. After HP applied, those
+     * top two bits remain (only low 5 bits are protected). */
+    check_int("byte0 form=0", (wire[0] & 0x80) == 0 ? 0 : 1, 0);
+    check_int("byte0 fixed=1", (wire[0] & 0x40) ? 0 : 1, 0);
+
+    quic_short_pkt_t got;
+    uint8_t scratch[256];
+    int rc = quic_short_parse(wire, n, sizeof dcid, &tx,
+                              &got, scratch, sizeof scratch);
+    check_int("parse OK", rc, 0);
+    check_int("pn round-tripped", (long)got.pn, 42);
+    check_int("pn_len round-tripped", (int)got.pn_len, 2);
+    check_int("payload len match", (long)got.payload_len, (long)sizeof pl);
+    check_int("payload bytes match", memcmp(got.payload, pl, sizeof pl), 0);
+    check_int("dcid match", memcmp(got.dcid, dcid, sizeof dcid), 0);
+    (void)rx;
+}
+
+static void test_short_pkt_rejects_long_form(void) {
+    printf("== short: rejects long-header byte0 ==\n");
+    quic_short_keys_t tx, rx; make_app_keys_pair(&tx, &rx);
+    uint8_t fake[64]; memset(fake, 0, sizeof fake);
+    fake[0] = 0xc0; /* long-bit=1 */
+    quic_short_pkt_t got; uint8_t scratch[64];
+    check_int("long-form rejected",
+              quic_short_parse(fake, sizeof fake, 8, &tx, &got, scratch, sizeof scratch),
+              -1);
+}
+
+static void test_short_pkt_rejects_clear_fixed(void) {
+    printf("== short: rejects cleared fixed bit ==\n");
+    quic_short_keys_t tx, rx; make_app_keys_pair(&tx, &rx);
+    uint8_t fake[64]; memset(fake, 0, sizeof fake);
+    fake[0] = 0x00; /* form=0, fixed=0 */
+    quic_short_pkt_t got; uint8_t scratch[64];
+    check_int("clear-fixed rejected",
+              quic_short_parse(fake, sizeof fake, 8, &tx, &got, scratch, sizeof scratch),
+              -1);
+}
+
+static void test_short_pkt_aead_failure(void) {
+    printf("== short: AEAD failure rejected ==\n");
+    quic_short_keys_t tx, rx; make_app_keys_pair(&tx, &rx);
+    static const uint8_t dcid[] = {1,2,3,4,5,6,7,8};
+    quic_short_pkt_t pkt = {0};
+    memcpy(pkt.dcid, dcid, sizeof dcid);
+    pkt.dcid_len = sizeof dcid; pkt.pn = 1; pkt.pn_len = 1;
+    static const uint8_t pl[16] = {0xff,0x55,0x00,0x11,0x22,0x33,0x44,0x55,
+                                   0x66,0x77,0x88,0x99,0xaa,0xbb,0xcc,0xdd};
+    pkt.payload = pl; pkt.payload_len = sizeof pl;
+    uint8_t wire[128];
+    size_t n = quic_short_build(wire, sizeof wire, &pkt, &tx);
+    if (n == 0) { printf("  FATAL\n"); g_fail++; return; }
+    /* Flip a tag byte. */
+    wire[n - 1] ^= 0x01;
+    quic_short_pkt_t got; uint8_t scratch[128];
+    check_int("AEAD reject", quic_short_parse(wire, n, sizeof dcid, &tx,
+                                              &got, scratch, sizeof scratch), -1);
+}
+
+static void test_conn_emit_recv_app_round_trip(void) {
+    printf("== conn: emit + recv 1-RTT round-trip ==\n");
+
+    /* Drive a full handshake on the server, then symmetric reverse on a
+     * second conn so we can use server.app_tx_keys as client.app_rx_keys. */
+    uint8_t tp_blob[256];
+    size_t  tp_len = make_sample_tp(tp_blob, sizeof tp_blob);
+    quic_conn_t server, client;
+    uint8_t ch[1024]; size_t ch_len;
+    drive_test_setup_conn_with_ch(&server, tp_blob, tp_len, ch, sizeof ch, &ch_len);
+
+    static const uint8_t srv_priv[32] = {1,2,3,4};
+    static const uint8_t srv_random[32] = {5,6,7,8};
+    static const uint8_t fake_cert[8] = {0x30,0x06,0x02,0x01,0x00,0x05,0,0};
+    static const size_t  cert_lens[1] = {8};
+    static const uint8_t ed_seed[32] = {9,10,11,12};
+    quic_server_handshake_inputs_t in = {
+        .server_priv_x25519 = srv_priv, .server_random = srv_random,
+        .cert = { .chain_der = fake_cert, .cert_lens = cert_lens, .n_certs = 1, .ed25519_seed = ed_seed }
+    };
+    if (quic_server_drive_handshake(&server, &in) != 0) {
+        printf("  FATAL drive\n"); g_fail++; return;
+    }
+    /* Stage client Finished. */
+    uint8_t vd[32];
+    if (tls13_compute_finished(server.client_handshake_traffic_secret,
+                               server.transcript_hash_thru_server_fin, vd) != 0) {
+        printf("  FATAL fin\n"); g_fail++; return;
+    }
+    uint8_t cf[64]; int fn = tls13_build_finished(cf, sizeof cf, vd);
+    if (fn <= 0) { printf("  FATAL build_fin\n"); g_fail++; return; }
+    quic_crypto_rx_stage(&server.rx_handshake, 0, cf, (size_t)fn);
+    if (quic_server_finish_handshake(&server) != 0) {
+        printf("  FATAL finish\n"); g_fail++; return;
+    }
+
+    /* Build a peer (client) view. Mirror everything: peer_scid<->our_scid,
+     * app_tx<->app_rx. Easiest: reuse another conn struct and copy
+     * keys+CIDs from server with directions swapped. */
+    quic_conn_init_server(&client);
+    memcpy(client.our_scid, server.peer_scid, server.peer_scid_len);
+    client.our_scid_len = server.peer_scid_len;
+    memcpy(client.peer_scid, server.our_scid, server.our_scid_len);
+    client.peer_scid_len = server.our_scid_len;
+    client.peer_addrs_known = 1;
+    client.app_tx_keys = server.app_rx_keys;
+    client.app_rx_keys = server.app_tx_keys;
+    client.app_keys_ready = 1;
+
+    /* Server emits an app packet with a STREAM frame payload. */
+    static const uint8_t pl[] = { 0x01, 0x01, 0x01 };  /* three PING frames */
+    uint8_t out[1500];
+    size_t n = quic_conn_emit_app(&server, pl, sizeof pl, out, sizeof out);
+    check_int("emit produced bytes", n > 0, 1);
+    check_int("server app pn advanced", (long)server.app_tx_next_pn, 1);
+
+    int rc = quic_conn_recv_app(&client, out, n);
+    check_int("client recv OK", rc, 0);
+    check_int("client app pkts++", (long)client.app_pkts_rcvd, 1);
+}
+
+static void test_conn_emit_app_no_keys(void) {
+    printf("== conn: emit_app rejects without keys ==\n");
+    quic_conn_t c; quic_conn_init_server(&c);
+    uint8_t out[256];
+    static const uint8_t pl[8] = {0};
+    check_int("no keys → 0",
+              (long)quic_conn_emit_app(&c, pl, sizeof pl, out, sizeof out), 0);
+}
+
+static void test_conn_recv_app_no_keys(void) {
+    printf("== conn: recv_app rejects without keys ==\n");
+    quic_conn_t c; quic_conn_init_server(&c);
+    uint8_t fake[64]; memset(fake, 0, sizeof fake); fake[0] = 0x40;
+    check_int("no keys → -1", quic_conn_recv_app(&c, fake, sizeof fake), -1);
+}
+
 /* ============================================================== */
 
 int main(void) {
@@ -3097,6 +3278,14 @@ int main(void) {
     test_finish_rejects_bad_verify();
     test_finish_rejects_no_state();
     test_finish_rejects_short_buffer();
+
+    test_short_pkt_round_trip();
+    test_short_pkt_rejects_long_form();
+    test_short_pkt_rejects_clear_fixed();
+    test_short_pkt_aead_failure();
+    test_conn_emit_recv_app_round_trip();
+    test_conn_emit_app_no_keys();
+    test_conn_recv_app_no_keys();
 
     printf("\n=== RESULTS: PASS=%d FAIL=%d ===\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;

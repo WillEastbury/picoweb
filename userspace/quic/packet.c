@@ -400,3 +400,129 @@ int quic_handshake_parse(const uint8_t* in, size_t in_len,
     pkt->payload_len = ct_len;
     return 0;
 }
+
+/* ---------------- 1-RTT short-header packet (RFC 9000 §17.3.1) ----- */
+
+size_t quic_short_build(uint8_t* out, size_t out_cap,
+                        const quic_short_pkt_t* pkt,
+                        const quic_short_keys_t* keys)
+{
+    if (!out || !pkt || !keys) return 0;
+    if (pkt->dcid_len > QUIC_MAX_CID_LEN) return 0;
+    if (pkt->pn_len < 1 || pkt->pn_len > 4) return 0;
+
+    size_t off = 0;
+    /* form=0, fixed=1, spin S, reserved=00, key_phase K, pn_len bits. */
+    uint8_t byte0 = 0x40u
+                  | ((pkt->spin      & 1u) << 5)
+                  | ((pkt->key_phase & 1u) << 2)
+                  | (uint8_t)(pkt->pn_len - 1);
+    if (off + 1 > out_cap) return 0;
+    out[off++] = byte0;
+
+    if (off + pkt->dcid_len > out_cap) return 0;
+    memcpy(out + off, pkt->dcid, pkt->dcid_len);
+    off += pkt->dcid_len;
+
+    size_t pn_off = off;
+    if (off + pkt->pn_len > out_cap) return 0;
+    for (unsigned i = 0; i < pkt->pn_len; i++) {
+        out[off + i] = (uint8_t)(pkt->pn >> (8 * (pkt->pn_len - 1 - i)));
+    }
+    off += pkt->pn_len;
+
+    if (off + pkt->payload_len + QUIC_TAG_LEN > out_cap) return 0;
+    if (pkt->payload_len)
+        memcpy(out + off, pkt->payload, pkt->payload_len);
+    size_t pt_off = off;
+    off += pkt->payload_len;
+
+    uint8_t nonce[QUIC_INITIAL_IV_LEN];
+    make_nonce(keys->iv, pkt->pn, nonce);
+    aes128_gcm_seal(keys->key, nonce,
+                    out, pt_off,
+                    out + pt_off, pkt->payload_len,
+                    out + pt_off,
+                    out + pt_off + pkt->payload_len);
+    off += QUIC_TAG_LEN;
+
+    if (pn_off + 4 + QUIC_HP_SAMPLE_LEN > off) return 0;
+    hp_apply(keys->hp, out + pn_off + 4,
+             &out[0], out + pn_off, pkt->pn_len);
+
+    return off;
+}
+
+int quic_short_parse(const uint8_t* in, size_t in_len,
+                     size_t expected_dcid_len,
+                     const quic_short_keys_t* keys,
+                     quic_short_pkt_t* pkt,
+                     uint8_t* scratch, size_t scratch_cap)
+{
+    if (!in || !keys || !pkt || !scratch) return -1;
+    if (expected_dcid_len > QUIC_MAX_CID_LEN) return -1;
+
+    /* Minimum: byte0 + dcid + 1B PN + 4B sample + 16B tag. */
+    if (in_len < 1 + expected_dcid_len + 1 + 4 + QUIC_TAG_LEN) return -1;
+
+    uint8_t byte0 = in[0];
+    /* form=0 (long-bit clear), fixed=1. */
+    if ((byte0 & 0x80) != 0) return -1;
+    if ((byte0 & 0x40) == 0) return -1;
+
+    size_t off = 1;
+    const uint8_t* dcid = in + off;
+    off += expected_dcid_len;
+
+    size_t pn_off = off;
+    if (pn_off + 4 + QUIC_HP_SAMPLE_LEN > in_len) return -1;
+
+    aes128_ctx_t aes;
+    aes128_init(&aes, keys->hp);
+    uint8_t mask[16];
+    aes128_encrypt_block(&aes, in + pn_off + 4, mask);
+
+    /* Short-header HP: low 5 bits of byte0 protected (pn_len+rsv+kp). */
+    uint8_t real_byte0 = byte0 ^ (mask[0] & 0x1f);
+    unsigned pn_len = (real_byte0 & 0x03) + 1;
+    if (pn_off + pn_len + QUIC_TAG_LEN > in_len) return -1;
+
+    uint8_t pn_bytes[4] = {0};
+    for (unsigned i = 0; i < pn_len; i++) {
+        pn_bytes[i] = in[pn_off + i] ^ mask[1 + i];
+    }
+    uint64_t pn = 0;
+    for (unsigned i = 0; i < pn_len; i++) pn = (pn << 8) | pn_bytes[i];
+
+    size_t hdr_len = pn_off + pn_len;
+    if (hdr_len > scratch_cap) return -1;
+    memcpy(scratch, in, hdr_len);
+    scratch[0] = real_byte0;
+    for (unsigned i = 0; i < pn_len; i++) scratch[pn_off + i] = pn_bytes[i];
+
+    /* Payload runs from after PN to end-of-datagram (no length field). */
+    if (in_len < hdr_len + QUIC_TAG_LEN) return -1;
+    size_t enc_len = in_len - hdr_len;
+    size_t ct_len  = enc_len - QUIC_TAG_LEN;
+    if (hdr_len + ct_len > scratch_cap) return -1;
+
+    uint8_t nonce[QUIC_INITIAL_IV_LEN];
+    make_nonce(keys->iv, pn, nonce);
+    int rc = aes128_gcm_open(keys->key, nonce,
+                             scratch, hdr_len,
+                             in + hdr_len, ct_len,
+                             in + hdr_len + ct_len,
+                             scratch + hdr_len);
+    if (rc != 0) return -1;
+
+    if (expected_dcid_len > sizeof pkt->dcid) return -1;
+    memcpy(pkt->dcid, dcid, expected_dcid_len);
+    pkt->dcid_len    = expected_dcid_len;
+    pkt->pn          = pn;
+    pkt->pn_len      = pn_len;
+    pkt->spin        = (real_byte0 >> 5) & 1u;
+    pkt->key_phase   = (real_byte0 >> 2) & 1u;
+    pkt->payload     = scratch + hdr_len;
+    pkt->payload_len = ct_len;
+    return 0;
+}

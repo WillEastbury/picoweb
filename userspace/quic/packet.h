@@ -97,4 +97,57 @@ int quic_handshake_parse(const uint8_t* in, size_t in_len,
                          quic_handshake_pkt_t* pkt,
                          uint8_t* scratch, size_t scratch_cap);
 
+/* ---- 1-RTT short-header packets (RFC 9000 §17.3.1, RFC 9001 §5) ----
+ *
+ * Wire format:
+ *   byte0 = 0|1|S|R|R|K|P|P
+ *           form=0, fixed=1, spin S, reserved RR (zero after HP),
+ *           key_phase K, pn_len bits PP
+ *   DCID                       -- length is implicit (peer's known CID len)
+ *   PN     (1..4 bytes)
+ *   payload (encrypted, AEAD-protected; tag included)
+ *
+ * Header protection sample is taken at pn_off + 4 just like the long
+ * header case. The protected bits in byte0 are bits 0..4 (pn_len +
+ * reserved + key_phase). Build always emits S=0, R=0, K=0 — multipath /
+ * key-update support belongs to later phases.
+ */
+typedef struct {
+    /* Outbound DCID — the peer's chosen CID (== our peer_scid). The
+     * receiver uses its own configured DCID length to slice this out
+     * of the wire on parse. */
+    uint8_t  dcid[QUIC_MAX_CID_LEN];
+    size_t   dcid_len;
+    uint64_t pn;
+    unsigned pn_len;                  /* 1..4 */
+    const uint8_t* payload;
+    size_t   payload_len;
+    /* Spin / key-phase bits (typically 0). */
+    unsigned spin     : 1;
+    unsigned key_phase: 1;
+} quic_short_pkt_t;
+
+typedef quic_initial_keys_t quic_short_keys_t;
+
+/* Build a protected 1-RTT short-header packet. dcid_len must match
+ * the peer's expected CID length. Returns total bytes written, or 0
+ * on error. */
+size_t quic_short_build(uint8_t* out, size_t out_cap,
+                        const quic_short_pkt_t* pkt,
+                        const quic_short_keys_t* keys);
+
+/* Parse a protected 1-RTT short-header packet. The receiver MUST
+ * supply `expected_dcid_len` — for the spike this is whatever CID
+ * length the conn told the peer to address it by (typically our_scid_len).
+ * Returns 0 on success, -1 on any failure. On success pkt->dcid /
+ * dcid_len / pn / pn_len / payload / payload_len are populated.
+ *
+ * The buffer carries no length field — payload runs to the end of the
+ * datagram bytes the caller passes in (`in_len`). */
+int quic_short_parse(const uint8_t* in, size_t in_len,
+                     size_t expected_dcid_len,
+                     const quic_short_keys_t* keys,
+                     quic_short_pkt_t* pkt,
+                     uint8_t* scratch, size_t scratch_cap);
+
 #endif
