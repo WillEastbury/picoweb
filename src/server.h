@@ -44,6 +44,15 @@ typedef struct {
     const char* tls_peer_mac;
     bool        tls_use_xdp;
     uint32_t    tls_xdp_queue;
+
+    /* HTTP 103 Early Hints. When true, GET responses for HTML resources
+     * with a precomputed Link header (built from <link>/<script>/<img>/
+     * <source> references found at startup) are preceded on the wire by
+     * an interim "HTTP/1.1 103 Early Hints" response sealed in its own
+     * TLS record. Same hints are also embedded in the final 200 head.
+     * Skipped for HEAD, conditional GETs that would 304, and for
+     * resources without a Link header. Off by default. */
+    bool        http_early_hints;
 } server_cfg_t;
 
 /* Backend worker entrypoints. Each takes a server_cfg_t* and runs

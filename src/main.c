@@ -32,6 +32,8 @@ static void usage(const char* argv0) {
         "  --tls-peer-mac=MAC  optional fixed L2 peer MAC hint for --tls\n"
         "  --tls-xdp           use AF_XDP socket I/O for --tls backend (copy mode)\n"
         "  --tls-xdp-queue=N   AF_XDP queue id (default 0)\n"
+        "  --http-early-hints  enable HTTP/1.1 103 Early Hints with auto-derived\n"
+        "                      Link: rel=preload headers (off by default)\n"
         "  --sqpoll     enable IORING_SETUP_SQPOLL: kernel polls our SQ,\n"
         "               eliminating io_uring_enter() syscalls on the submit\n"
         "               path. Costs one kernel thread per worker. Requires\n"
@@ -69,6 +71,7 @@ int main(int argc, char** argv) {
     const char* tls_peer_mac = NULL;
     bool tls_use_xdp = false;
     uint32_t tls_xdp_queue = 0;
+    bool http_early_hints = false;
 
     /* Two-pass parse: lift flags out of argv first, then handle the
      * remaining positional args exactly as before. This keeps the
@@ -153,6 +156,10 @@ int main(int argc, char** argv) {
         }
         if (strcmp(argv[i], "--tls-xdp") == 0) {
             tls_use_xdp = true;
+            continue;
+        }
+        if (strcmp(argv[i], "--http-early-hints") == 0) {
+            http_early_hints = true;
             continue;
         }
         if (strncmp(argv[i], "--tls-xdp-queue=", 16) == 0) {
@@ -300,6 +307,7 @@ int main(int argc, char** argv) {
         cfgs[i].tls_peer_mac          = tls_peer_mac;
         cfgs[i].tls_use_xdp           = tls_use_xdp;
         cfgs[i].tls_xdp_queue         = tls_xdp_queue;
+        cfgs[i].http_early_hints      = http_early_hints;
         /* SQPOLL kernel-thread CPU policy: avoid pinning the kernel
          * polling thread to the same core as its userspace worker
          * (worker i is pinned to (i % nproc)) — they'd thrash one

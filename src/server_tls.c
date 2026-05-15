@@ -322,10 +322,48 @@ static int build_http_response_iov(tls_conn_state_t* c,
         }
     }
 
-    *out_n = n;
-    *out_close_after = close_after;
     return 0;
 }
+
+/* Emit a sealed HTTP/1.1 103 Early Hints record for `req` if the
+ * resource has a precomputed Link header and the request would not
+ * be answered with a 304 or HEAD-only response. The 103 is sealed
+ * into its own TLS application-data record so the client parser
+ * sees a distinct status line ahead of the final 200. Failures are
+ * treated as "skip" — the client will still get the same Link
+ * headers in the final 200 head. */
+static void maybe_seal_103(tls_conn_state_t* c,
+                           http_result_t pr, http_request_t* req) {
+    tls_worker_ctx_t* w = c->w;
+    if (!w || !w->cfg || !w->cfg->http_early_hints) return;
+    if (pr != HTTP_OK) return;
+    if (req->method != M_GET) return;
+
+    bool ca = false, ho = false;
+    const resource_t* r = http_select(w->cfg->jt, pr, req, &ca, &ho);
+    if (!r || ho || !r->link_hdr || r->link_hdr_len == 0) return;
+
+    /* Skip 103 when conditional GET would be answered with 304. */
+    if (req->if_none_match) {
+        const char* etag = NULL;
+        if (req->accept_br && r->brotli)            etag = r->brotli->etag;
+        else if (req->accept_pc && r->compressed)   etag = r->compressed->etag;
+        else if (r->etag[0] != '\0')                etag = r->etag;
+        if (etag && etag_matches(req->if_none_match,
+                                 req->if_none_match_len, etag)) return;
+    }
+
+    static const char status[] = "HTTP/1.1 103 Early Hints\r\n";
+    static const char term[]   = "\r\n";
+    pw_iov_t iov[3] = {
+        { .base = (const uint8_t*)status, .len = sizeof(status) - 1 },
+        { .base = (const uint8_t*)r->link_hdr, .len = r->link_hdr_len },
+        { .base = (const uint8_t*)term, .len = sizeof(term) - 1 },
+    };
+    /* Best effort: failure (e.g. tx-buf pressure) is non-fatal. */
+    (void)pw_tls_app_seal_iov(&c->eng, iov, 3);
+}
+
 
 static void* tls_on_open(void* svc_state, const pw_conn_info_t* info) {
     (void)info;
@@ -416,6 +454,11 @@ static pw_disp_status_t tls_on_data(void* per_conn_state,
                     pw_tls_app_in_ack(&c->eng, app_len);
                     return PW_DISP_RESET;
                 }
+
+                /* Best-effort interim 103 Early Hints record. Sealed
+                 * separately so the client parser sees a distinct
+                 * status line ahead of the 200. */
+                maybe_seal_103(c, pr, &req);
 
                 if (pw_tls_app_seal_iov(&c->eng, resp, rn) != 0) {
                     /* TX buffer pressure while additional pipelined
