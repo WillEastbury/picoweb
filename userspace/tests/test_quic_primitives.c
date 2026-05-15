@@ -27,6 +27,7 @@
 #include "../quic/special.h"
 #include "../quic/transport_params.h"
 #include "../quic/crypto_stream.h"
+#include "../quic/stream.h"
 #include "../quic/keys.h"
 #include "../quic/tls_ext.h"
 #include "../quic/conn.h"
@@ -3151,6 +3152,243 @@ static void test_conn_recv_app_no_keys(void) {
 }
 
 /* ============================================================== */
+/*                       phase 6b STREAM tests                      */
+/* ============================================================== */
+
+static void test_stream_in_order(void) {
+    printf("== stream: in-order ingest ==\n");
+    quic_stream_rx_t s; quic_stream_rx_init(&s, 4);
+    static const uint8_t a[] = "hello ";
+    static const uint8_t b[] = "world!";
+    check_int("ingest a", quic_stream_rx_ingest(&s, 0, a, 6, 0), 1);
+    check_int("ingest b+FIN", quic_stream_rx_ingest(&s, 6, b, 6, 1), 1);
+    size_t n; const uint8_t* p = quic_stream_rx_peek(&s, &n);
+    check_int("peek len", (long)n, 12);
+    check_int("byte0 'h'", p[0], 'h');
+    check_int("byte11 '!'", p[11], '!');
+    check_int("complete", quic_stream_rx_is_complete(&s), 1);
+}
+
+static void test_stream_out_of_order(void) {
+    printf("== stream: out-of-order with gap fill ==\n");
+    quic_stream_rx_t s; quic_stream_rx_init(&s, 7);
+    static const uint8_t mid[] = "mid";
+    static const uint8_t hd[]  = "hd";
+    static const uint8_t tl[]  = "tail";
+    check_int("ingest mid@2", quic_stream_rx_ingest(&s, 2, mid, 3, 0), 1);
+    /* nothing in-order yet */
+    size_t n; (void)quic_stream_rx_peek(&s, &n);
+    check_int("no contig yet", (long)n, 0);
+    check_int("ingest hd@0",  quic_stream_rx_ingest(&s, 0, hd, 2, 0), 1);
+    (void)quic_stream_rx_peek(&s, &n);
+    check_int("now 5 contig", (long)n, 5);
+    check_int("ingest tl@5+FIN", quic_stream_rx_ingest(&s, 5, tl, 4, 1), 1);
+    check_int("complete", quic_stream_rx_is_complete(&s), 1);
+}
+
+static void test_stream_duplicate(void) {
+    printf("== stream: duplicate returns 0 ==\n");
+    quic_stream_rx_t s; quic_stream_rx_init(&s, 9);
+    static const uint8_t d[] = "abcd";
+    check_int("first",  quic_stream_rx_ingest(&s, 0, d, 4, 0), 1);
+    check_int("dup",    quic_stream_rx_ingest(&s, 0, d, 4, 0), 0);
+}
+
+static void test_stream_fin_size_change(void) {
+    printf("== stream: FIN size change → -1 ==\n");
+    quic_stream_rx_t s; quic_stream_rx_init(&s, 11);
+    static const uint8_t d[] = "abcdef";
+    check_int("data+FIN@6", quic_stream_rx_ingest(&s, 0, d, 6, 1), 1);
+    /* re-FIN at different size */
+    check_int("re-FIN@4 → -1",
+              quic_stream_rx_ingest(&s, 0, d, 4, 1), -1);
+}
+
+static void test_stream_data_past_fin(void) {
+    printf("== stream: data past final_size → -1 ==\n");
+    quic_stream_rx_t s; quic_stream_rx_init(&s, 13);
+    static const uint8_t d[] = "abcd";
+    check_int("data+FIN@4", quic_stream_rx_ingest(&s, 0, d, 4, 1), 1);
+    check_int("extend@4 → -1",
+              quic_stream_rx_ingest(&s, 4, d, 4, 0), -1);
+}
+
+static void test_stream_fin_smaller_than_staged(void) {
+    printf("== stream: FIN smaller than already staged → -1 ==\n");
+    quic_stream_rx_t s; quic_stream_rx_init(&s, 15);
+    static const uint8_t d[] = "abcdef";
+    check_int("stage hi@10", quic_stream_rx_ingest(&s, 10, d, 6, 0), 1);
+    /* highest = 16; declare FIN with smaller size */
+    static const uint8_t e[] = "x";
+    check_int("FIN@1 → -1", quic_stream_rx_ingest(&s, 0, e, 1, 1), -1);
+}
+
+static void test_stream_overflow_capacity(void) {
+    printf("== stream: capacity overflow → -1 ==\n");
+    quic_stream_rx_t s; quic_stream_rx_init(&s, 17);
+    static uint8_t big[16]; memset(big, 'q', sizeof big);
+    /* offset just past cap → should fail */
+    check_int("overflow → -1",
+              quic_stream_rx_ingest(&s, QUIC_STREAM_RX_CAP + 1, big, 8, 0),
+              -1);
+}
+
+static void test_stream_empty_fin(void) {
+    printf("== stream: empty STREAM frame with FIN ==\n");
+    quic_stream_rx_t s; quic_stream_rx_init(&s, 19);
+    static const uint8_t d[] = "abc";
+    check_int("data@0", quic_stream_rx_ingest(&s, 0, d, 3, 0), 1);
+    check_int("empty FIN@3", quic_stream_rx_ingest(&s, 3, NULL, 0, 1), 1);
+    check_int("complete", quic_stream_rx_is_complete(&s), 1);
+}
+
+/* ---- conn-level dispatch: 1-RTT recv routes STREAM into per-stream slot ---- */
+
+static void test_conn_recv_app_dispatches_stream(void) {
+    printf("== conn: 1-RTT STREAM dispatched into per-stream rx ==\n");
+    /* Simpler than full handshake: synthesise matching app keys + CIDs
+     * directly on two conns. */
+    quic_conn_t server, client;
+    quic_conn_init_server(&server);
+    quic_conn_init_server(&client);
+    static const uint8_t scid_a[] = {0xa1,0xa2,0xa3,0xa4,0xa5,0xa6,0xa7,0xa8};
+    static const uint8_t scid_b[] = {0xb1,0xb2,0xb3,0xb4,0xb5,0xb6,0xb7,0xb8};
+    quic_conn_set_our_scid(&server, scid_a, sizeof scid_a);
+    quic_conn_set_our_scid(&client, scid_b, sizeof scid_b);
+    memcpy(server.peer_scid, scid_b, sizeof scid_b); server.peer_scid_len = 8;
+    memcpy(client.peer_scid, scid_a, sizeof scid_a); client.peer_scid_len = 8;
+    server.peer_addrs_known = client.peer_addrs_known = 1;
+    /* Symmetric keys (one direction is enough for this test). */
+    quic_handshake_keys_t k;
+    memset(&k, 0, sizeof k);
+    for (int i = 0; i < 16; i++) k.key[i] = (uint8_t)(0x10 + i);
+    for (int i = 0; i < 12; i++) k.iv[i]  = (uint8_t)(0x20 + i);
+    for (int i = 0; i < 16; i++) k.hp[i]  = (uint8_t)(0x30 + i);
+    client.app_tx_keys = k; server.app_rx_keys = k;
+    client.app_keys_ready = server.app_keys_ready = 1;
+
+    /* Build a STREAM frame on the client side and ship it to server. */
+    uint8_t frames[64];
+    static const uint8_t body[] = "GET /";
+    size_t fn = quic_frame_stream_encode(frames, sizeof frames,
+                                         /*stream_id*/ 0,
+                                         /*offset*/ 0,
+                                         body, sizeof body - 1,
+                                         /*fin*/ 1);
+    check_int("frame encoded", fn > 0, 1);
+
+    uint8_t out[1500];
+    size_t pn = quic_conn_emit_app(&client, frames, fn, out, sizeof out);
+    check_int("emit OK", pn > 0, 1);
+    int rc = quic_conn_recv_app(&server, out, pn);
+    check_int("server recv OK", rc, 0);
+
+    /* Server should now have stream 0 reassembled. */
+    int found = -1;
+    for (unsigned i = 0; i < QUIC_CONN_MAX_STREAMS; i++)
+        if (server.streams[i].in_use && server.streams[i].stream_id == 0) {
+            found = (int)i; break;
+        }
+    check_int("stream slot claimed", found >= 0, 1);
+    check_int("stream complete", quic_stream_rx_is_complete(&server.streams[found]), 1);
+    size_t n; const uint8_t* p = quic_stream_rx_peek(&server.streams[found], &n);
+    check_int("5 bytes", (long)n, 5);
+    check_int("starts with 'G'", p[0], 'G');
+}
+
+static void test_conn_recv_app_rejects_new_token(void) {
+    printf("== conn: 1-RTT NEW_TOKEN from peer → -1 ==\n");
+    quic_conn_t server, client;
+    quic_conn_init_server(&server);
+    quic_conn_init_server(&client);
+    static const uint8_t scid_a[] = {0xa1,0xa2,0xa3,0xa4,0xa5,0xa6,0xa7,0xa8};
+    static const uint8_t scid_b[] = {0xb1,0xb2,0xb3,0xb4,0xb5,0xb6,0xb7,0xb8};
+    quic_conn_set_our_scid(&server, scid_a, sizeof scid_a);
+    quic_conn_set_our_scid(&client, scid_b, sizeof scid_b);
+    memcpy(server.peer_scid, scid_b, 8); server.peer_scid_len = 8;
+    memcpy(client.peer_scid, scid_a, 8); client.peer_scid_len = 8;
+    server.peer_addrs_known = client.peer_addrs_known = 1;
+    quic_handshake_keys_t k; memset(&k, 0, sizeof k);
+    for (int i = 0; i < 16; i++) { k.key[i] = (uint8_t)(0x40+i); k.hp[i] = (uint8_t)(0x50+i); }
+    for (int i = 0; i < 12; i++) k.iv[i] = (uint8_t)(0x60+i);
+    client.app_tx_keys = k; server.app_rx_keys = k;
+    client.app_keys_ready = server.app_keys_ready = 1;
+
+    uint8_t frames[16];
+    frames[0] = 0x07;
+    frames[1] = 0x04;
+    frames[2] = 'a'; frames[3] = 'b'; frames[4] = 'c'; frames[5] = 'd';
+
+    uint8_t out[1500];
+    size_t pn = quic_conn_emit_app(&client, frames, 6, out, sizeof out);
+    check_int("emit OK", pn > 0, 1);
+    int rc = quic_conn_recv_app(&server, out, pn);
+    check_int("rejected", rc, -1);
+}
+
+static void test_conn_recv_app_rejects_handshake_done(void) {
+    printf("== conn: 1-RTT HANDSHAKE_DONE from peer → -1 ==\n");
+    quic_conn_t server, client;
+    quic_conn_init_server(&server);
+    quic_conn_init_server(&client);
+    static const uint8_t scid_a[] = {0xa1,0xa2,0xa3,0xa4,0xa5,0xa6,0xa7,0xa8};
+    static const uint8_t scid_b[] = {0xb1,0xb2,0xb3,0xb4,0xb5,0xb6,0xb7,0xb8};
+    quic_conn_set_our_scid(&server, scid_a, sizeof scid_a);
+    quic_conn_set_our_scid(&client, scid_b, sizeof scid_b);
+    memcpy(server.peer_scid, scid_b, 8); server.peer_scid_len = 8;
+    memcpy(client.peer_scid, scid_a, 8); client.peer_scid_len = 8;
+    server.peer_addrs_known = client.peer_addrs_known = 1;
+    quic_handshake_keys_t k; memset(&k, 0, sizeof k);
+    for (int i = 0; i < 16; i++) { k.key[i] = (uint8_t)(0x70+i); k.hp[i] = (uint8_t)(0x80+i); }
+    for (int i = 0; i < 12; i++) k.iv[i] = (uint8_t)(0x90+i);
+    client.app_tx_keys = k; server.app_rx_keys = k;
+    client.app_keys_ready = server.app_keys_ready = 1;
+
+    uint8_t frames[16] = { 0x1e };
+    /* pad with PADDING so build's HP-sample requirement is met */
+    uint8_t out[1500];
+    size_t pn = quic_conn_emit_app(&client, frames, sizeof frames, out, sizeof out);
+    check_int("emit OK", pn > 0, 1);
+    int rc = quic_conn_recv_app(&server, out, pn);
+    check_int("rejected", rc, -1);
+}
+
+static void test_conn_recv_app_stream_overflow_slots(void) {
+    printf("== conn: too many distinct streams → -1 ==\n");
+    quic_conn_t server, client;
+    quic_conn_init_server(&server);
+    quic_conn_init_server(&client);
+    static const uint8_t scid_a[] = {0xa1,0xa2,0xa3,0xa4,0xa5,0xa6,0xa7,0xa8};
+    static const uint8_t scid_b[] = {0xb1,0xb2,0xb3,0xb4,0xb5,0xb6,0xb7,0xb8};
+    quic_conn_set_our_scid(&server, scid_a, sizeof scid_a);
+    quic_conn_set_our_scid(&client, scid_b, sizeof scid_b);
+    memcpy(server.peer_scid, scid_b, 8); server.peer_scid_len = 8;
+    memcpy(client.peer_scid, scid_a, 8); client.peer_scid_len = 8;
+    server.peer_addrs_known = client.peer_addrs_known = 1;
+    quic_handshake_keys_t k; memset(&k, 0, sizeof k);
+    for (int i = 0; i < 16; i++) { k.key[i] = (uint8_t)(0xa0+i); k.hp[i] = (uint8_t)(0xb0+i); }
+    for (int i = 0; i < 12; i++) k.iv[i] = (uint8_t)(0xc0+i);
+    client.app_tx_keys = k; server.app_rx_keys = k;
+    client.app_keys_ready = server.app_keys_ready = 1;
+
+    for (unsigned i = 0; i <= QUIC_CONN_MAX_STREAMS; i++) {
+        uint8_t frames[32];
+        static const uint8_t body[] = "x";
+        size_t fn = quic_frame_stream_encode(frames, sizeof frames,
+                                             /*stream_id*/ i * 4u,
+                                             0, body, 1, 0);
+        uint8_t out[1500];
+        size_t pn = quic_conn_emit_app(&client, frames, fn, out, sizeof out);
+        int rc = quic_conn_recv_app(&server, out, pn);
+        if (i < QUIC_CONN_MAX_STREAMS) {
+            if (rc != 0) { printf("  FAIL slot %u rc=%d\n", i, rc); g_fail++; return; }
+        } else {
+            check_int("overflow rejected", rc, -1);
+        }
+    }
+}
+
+/* ============================================================== */
 
 int main(void) {
     test_udp_build_parse_roundtrip();
@@ -3286,6 +3524,20 @@ int main(void) {
     test_conn_emit_recv_app_round_trip();
     test_conn_emit_app_no_keys();
     test_conn_recv_app_no_keys();
+
+    /* phase 6b */
+    test_stream_in_order();
+    test_stream_out_of_order();
+    test_stream_duplicate();
+    test_stream_fin_size_change();
+    test_stream_data_past_fin();
+    test_stream_fin_smaller_than_staged();
+    test_stream_overflow_capacity();
+    test_stream_empty_fin();
+    test_conn_recv_app_dispatches_stream();
+    test_conn_recv_app_rejects_new_token();
+    test_conn_recv_app_rejects_handshake_done();
+    test_conn_recv_app_stream_overflow_slots();
 
     printf("\n=== RESULTS: PASS=%d FAIL=%d ===\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;

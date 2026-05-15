@@ -629,9 +629,12 @@ int quic_conn_recv_app(quic_conn_t* c, const uint8_t* datagram, size_t len)
     }
     c->app_pkts_rcvd++;
 
-    /* Frame walk — for the spike we accept PADDING/PING/ACK and
-     * STREAM-class frames (0x08..0x0f) without further processing.
-     * Real frame handling lands in subsequent phases. */
+    /* Frame walk — RFC 9000 §12.4 Table 3 enforcement for 1-RTT.
+     * Reject server-only frames received from peer (NEW_TOKEN
+     * §19.7, HANDSHAKE_DONE §19.20) and dispatch STREAM frames into
+     * per-stream reassemblers. CRYPTO is permitted in 1-RTT for
+     * post-handshake messages (NewSessionTicket / KeyUpdate hints)
+     * but we don't process them here yet. */
     size_t fo = 0;
     while (fo < pkt.payload_len) {
         quic_frame_t f;
@@ -640,8 +643,39 @@ int quic_conn_recv_app(quic_conn_t* c, const uint8_t* datagram, size_t len)
         if (consumed == 0) break;
         if (consumed == QUIC_FRAME_DECODE_ERROR) return -1;
         fo += consumed;
-        /* All frames currently accepted; no per-type rejection in this
-         * phase (RFC 9000 §12.4 enforcement comes in 6b). */
+
+        switch (f.type) {
+        case QUIC_FT_NEW_TOKEN:        /* server-only frame, §19.7 */
+        case QUIC_FT_HANDSHAKE_DONE:   /* server-only frame, §19.20 */
+            return -1;
+        case QUIC_FT_STREAM: {
+            const quic_frame_stream_t* sf = &f.u.stream;
+            int slot = -1;
+            int free_slot = -1;
+            for (unsigned i = 0; i < QUIC_CONN_MAX_STREAMS; i++) {
+                if (c->streams[i].in_use &&
+                    c->streams[i].stream_id == sf->stream_id) {
+                    slot = (int)i; break;
+                }
+                if (!c->streams[i].in_use && free_slot < 0) free_slot = (int)i;
+            }
+            if (slot < 0) {
+                if (free_slot < 0) return -1;
+                quic_stream_rx_init(&c->streams[free_slot], sf->stream_id);
+                slot = free_slot;
+            }
+            int rc = quic_stream_rx_ingest(&c->streams[slot],
+                                           sf->offset, sf->data, sf->length,
+                                           sf->fin);
+            if (rc < 0) return -1;
+            break;
+        }
+        default:
+            /* PADDING / PING / ACK / RESET_STREAM / STOP_SENDING /
+             * MAX_x / etc accepted; per-frame state machines land in
+             * later phases. */
+            break;
+        }
     }
     return 0;
 }
