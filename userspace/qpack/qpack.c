@@ -714,3 +714,43 @@ qpack_status_t qpack_decode_field_section_huff(const uint8_t* in, size_t in_len,
     if (scratch_used_out) *scratch_used_out = scratch_used;
     return QPACK_OK;
 }
+
+/* ---- Huffman-emitting encoders (placed after Huffman codec) -- */
+
+size_t qpack_encode_literal_static_name_huff(uint8_t* out, size_t cap,
+                                             uint64_t name_index,
+                                             const uint8_t* value, size_t value_len)
+{
+    if (name_index >= QPACK_STATIC_TABLE_SIZE) return 0;
+    size_t off = prefix_int_encode(out, cap, 4, /*high*/ 0x70, name_index);
+    if (off == 0) return 0;
+    size_t hl = qpack_huffman_encoded_len(value, value_len);
+    size_t v  = prefix_int_encode(out + off, cap - off, 7, /*high*/ 0x80, hl);
+    if (v == 0) return 0;
+    off += v;
+    if (cap - off < hl) return 0;
+    size_t w = qpack_huffman_encode(out + off, cap - off, value, value_len);
+    if (w != hl) return 0;
+    return off + w;
+}
+
+size_t qpack_encode_literal_huff(uint8_t* out, size_t cap,
+                                 const uint8_t* name, size_t name_len,
+                                 const uint8_t* value, size_t value_len)
+{
+    size_t hnl = qpack_huffman_encoded_len(name, name_len);
+    size_t off = prefix_int_encode(out, cap, 3, /*high*/ 0x38, hnl);
+    if (off == 0) return 0;
+    if (cap - off < hnl) return 0;
+    size_t wn = qpack_huffman_encode(out + off, cap - off, name, name_len);
+    if (wn != hnl) return 0;
+    off += wn;
+    size_t hvl = qpack_huffman_encoded_len(value, value_len);
+    size_t v   = prefix_int_encode(out + off, cap - off, 7, /*high*/ 0x80, hvl);
+    if (v == 0) return 0;
+    off += v;
+    if (cap - off < hvl) return 0;
+    size_t wv = qpack_huffman_encode(out + off, cap - off, value, value_len);
+    if (wv != hvl) return 0;
+    return off + wv;
+}

@@ -3835,6 +3835,140 @@ static void test_qpack_huff_decode_overflow(void) {
     check_int("OUTPUT_OVERFLOW", st, QPACK_ERR_OUTPUT_OVERFLOW);
 }
 
+/* ===== phase 6d3 — h3 response builder + huff encoders ========== */
+
+static void test_qpack_huff_encode_static_name_value(void) {
+    printf("== qpack: encode literal-static-name + Huffman value ==\n");
+    static const uint8_t value[] = "picoweb";
+    uint8_t buf[64]; size_t off = 0;
+    off += qpack_encode_prefix_empty(buf + off, sizeof buf - off);
+    size_t n = qpack_encode_literal_static_name_huff(buf + off, sizeof buf - off,
+                                                      92, value, 7);
+    check_int("encoder returns nonzero", n != 0, 1);
+    off += n;
+    qpack_field_t fields[2]; size_t nf = 2;
+    uint8_t scratch[32]; size_t su = 0;
+    qpack_status_t st = qpack_decode_field_section_huff(buf, off, fields, &nf,
+                                                         scratch, sizeof scratch, &su);
+    check_int("decode OK", st, QPACK_OK);
+    check_int("1 field", (long)nf, 1);
+    check_int("name=server",
+              fields[0].name_len == 6 && memcmp(fields[0].name, "server", 6) == 0, 1);
+    check_int("value=picoweb",
+              fields[0].value_len == 7 && memcmp(fields[0].value, "picoweb", 7) == 0, 1);
+}
+
+static void test_qpack_huff_encode_literal_both(void) {
+    printf("== qpack: encode literal-name + Huffman both ==\n");
+    static const uint8_t nm[] = "x-trace-id";
+    static const uint8_t vl[] = "abc-123";
+    uint8_t buf[64]; size_t off = 0;
+    off += qpack_encode_prefix_empty(buf + off, sizeof buf - off);
+    size_t n = qpack_encode_literal_huff(buf + off, sizeof buf - off,
+                                          nm, sizeof nm - 1,
+                                          vl, sizeof vl - 1);
+    check_int("encoder returns nonzero", n != 0, 1);
+    off += n;
+    qpack_field_t fields[2]; size_t nf = 2;
+    uint8_t scratch[64]; size_t su = 0;
+    qpack_status_t st = qpack_decode_field_section_huff(buf, off, fields, &nf,
+                                                         scratch, sizeof scratch, &su);
+    check_int("decode OK", st, QPACK_OK);
+    check_int("name match",
+              fields[0].name_len == sizeof nm - 1 &&
+              memcmp(fields[0].name, nm, sizeof nm - 1) == 0, 1);
+    check_int("value match",
+              fields[0].value_len == sizeof vl - 1 &&
+              memcmp(fields[0].value, vl, sizeof vl - 1) == 0, 1);
+}
+
+static void test_h3_build_response_200(void) {
+    printf("== h3: build_response 200 + text/html + body ==\n");
+    static const uint8_t body[] = "<html>hi</html>";
+    uint8_t out[256];
+    size_t  n = h3_build_response(out, sizeof out, 200,
+                                  "text/html; charset=utf-8", 24,
+                                  body, sizeof body - 1);
+    check_int("encoder returns nonzero", n != 0, 1);
+    /* Parse first frame as HEADERS, second as DATA. */
+    h3_frame_t h1;
+    size_t r = h3_frame_decode(out, n, &h1);
+    check_int("HEADERS frame parsed", r > 0 && r != (size_t)-1, 1);
+    check_int("HEADERS type", h1.type, H3_FT_HEADERS);
+    /* Decode HEADERS payload. */
+    qpack_field_t fields[8]; size_t nf = 8;
+    uint8_t scratch[128]; size_t su = 0;
+    qpack_status_t st = qpack_decode_field_section_huff(h1.payload,
+                                                         (size_t)h1.length, fields, &nf,
+                                                         scratch, sizeof scratch, &su);
+    check_int("HEADERS decode OK", st, QPACK_OK);
+    check_int("3 fields", (long)nf, 3);
+    check_int(":status 200",
+              fields[0].name_len == 7 &&
+              memcmp(fields[0].name, ":status", 7) == 0 &&
+              fields[0].value_len == 3 &&
+              memcmp(fields[0].value, "200", 3) == 0, 1);
+    check_int("content-type",
+              fields[1].name_len == 12 &&
+              memcmp(fields[1].name, "content-type", 12) == 0, 1);
+    check_int("content-length=15",
+              fields[2].name_len == 14 &&
+              memcmp(fields[2].name, "content-length", 14) == 0 &&
+              fields[2].value_len == 2 &&
+              memcmp(fields[2].value, "15", 2) == 0, 1);
+
+    /* Second frame = DATA. */
+    h3_frame_t h2;
+    size_t r2 = h3_frame_decode(out + r, n - r, &h2);
+    check_int("DATA frame parsed", r2 > 0 && r2 != (size_t)-1, 1);
+    check_int("DATA type", h2.type, H3_FT_DATA);
+    check_int("DATA length matches body", (long)h2.length, (long)(sizeof body - 1));
+    check_int("DATA payload bytes",
+              memcmp(h2.payload, body, sizeof body - 1) == 0, 1);
+}
+
+static void test_h3_build_response_304_no_body(void) {
+    printf("== h3: build_response 304 (no ctype, no body) ==\n");
+    uint8_t out[64];
+    size_t  n = h3_build_response(out, sizeof out, 304, NULL, 0, NULL, 0);
+    check_int("encoder returns nonzero", n != 0, 1);
+    h3_frame_t h;
+    size_t r = h3_frame_decode(out, n, &h);
+    check_int("HEADERS parsed", r > 0 && r != (size_t)-1, 1);
+    check_int("HEADERS type", h.type, H3_FT_HEADERS);
+    check_int("no DATA frame after", n == r, 1);
+    qpack_field_t fields[4]; size_t nf = 4;
+    uint8_t scratch[32]; size_t su = 0;
+    qpack_status_t st = qpack_decode_field_section_huff(h.payload,
+                                                         (size_t)h.length, fields, &nf,
+                                                         scratch, sizeof scratch, &su);
+    check_int("decode OK", st, QPACK_OK);
+    check_int("1 field", (long)nf, 1);
+    check_int(":status 304",
+              fields[0].value_len == 3 && memcmp(fields[0].value, "304", 3) == 0, 1);
+}
+
+static void test_h3_build_response_unknown_status(void) {
+    printf("== h3: build_response 418 (unindexed status) ==\n");
+    uint8_t out[64];
+    size_t  n = h3_build_response(out, sizeof out, 418, NULL, 0, NULL, 0);
+    check_int("encoder returns nonzero", n != 0, 1);
+    h3_frame_t h;
+    size_t r = h3_frame_decode(out, n, &h);
+    (void)r;
+    qpack_field_t fields[2]; size_t nf = 2;
+    uint8_t scratch[32]; size_t su = 0;
+    qpack_status_t st = qpack_decode_field_section_huff(h.payload,
+                                                         (size_t)h.length, fields, &nf,
+                                                         scratch, sizeof scratch, &su);
+    check_int("decode OK", st, QPACK_OK);
+    check_int(":status 418",
+              fields[0].name_len == 7 &&
+              memcmp(fields[0].name, ":status", 7) == 0 &&
+              fields[0].value_len == 3 &&
+              memcmp(fields[0].value, "418", 3) == 0, 1);
+}
+
 /* ============================================================== */
 
 int main(void) {
@@ -4026,6 +4160,13 @@ int main(void) {
     test_qpack_decode_huff_value();
     test_qpack_decode_huff_literal_name();
     test_qpack_huff_decode_overflow();
+
+    /* phase 6d3 — Huffman encoders + h3 response builder */
+    test_qpack_huff_encode_static_name_value();
+    test_qpack_huff_encode_literal_both();
+    test_h3_build_response_200();
+    test_h3_build_response_304_no_body();
+    test_h3_build_response_unknown_status();
 
     printf("\n=== RESULTS: PASS=%d FAIL=%d ===\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
