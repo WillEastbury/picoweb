@@ -415,7 +415,26 @@ static pw_disp_status_t tls_on_data(void* per_conn_state,
     if (pw_tls_rx_ack(&c->eng, len) != 0) return PW_DISP_RESET;
 
     pw_tls_engine_set_clock(&c->eng, (uint64_t)metal_now_ms());
-    if (pw_tls_step(&c->eng) < 0) return PW_DISP_RESET;
+    if (pw_tls_step(&c->eng) < 0) {
+        /* DIAG: dump rxlen/cap and first 32 bytes of rx so we can tell
+         * whether the engine got a real ClientHello (starts 16 03 01/03)
+         * or garbage from the AF_XDP / userspace-TCP layer below. Throttled
+         * (first 50 + every 100th) to avoid log floods. */
+        static _Thread_local unsigned long diag_n = 0;
+        diag_n++;
+        if (diag_n <= 50 || (diag_n % 100) == 0) {
+            char hex[3 * 32 + 1];
+            size_t dump = len < 32 ? len : 32;
+            for (size_t i = 0; i < dump; i++)
+                snprintf(hex + i * 3, 4, "%02x ", rx[i]);
+            hex[dump ? dump * 3 - 1 : 0] = '\0';
+            fprintf(stderr,
+                    "tls: RESET step failed state=%d phase=%d err=%d rxlen=%zu cap=%zu n=%lu rx[0..%zu]=%s\n",
+                    c->eng.state, c->eng.hs_phase, c->eng.last_err,
+                    len, cap, diag_n, dump, hex);
+        }
+        return PW_DISP_RESET;
+    }
 
     size_t app_len = 0;
     const uint8_t* app = pw_tls_app_in_buf(&c->eng, &app_len);

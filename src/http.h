@@ -34,6 +34,11 @@ typedef struct {
     size_t consumed;      /* total bytes consumed from buf */
     const char* if_none_match;   /* raw If-None-Match value (points into buf) */
     size_t if_none_match_len;
+    /* Content-Length value, parsed from header. 0 if header absent or
+     * value was "0". On a valid request, body bytes (if any) live in the
+     * caller buffer at offset `consumed` and have length `content_length`.
+     * The HTTP parser does NOT itself consume the body. */
+    size_t content_length;
 } http_request_t;
 
 /* Parse a request from buf[0..buf_len). On HTTP_NEED_MORE the caller
