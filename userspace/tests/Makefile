@@ -18,6 +18,8 @@ CRYPTO_SRC := \
     ../crypto/sha512.c           \
     ../crypto/ed25519.c          \
     ../crypto/rsa.c              \
+    ../crypto/p256.c             \
+    ../crypto/ecdsa.c            \
     ../crypto/pool.c             \
     ../crypto/hmac.c             \
     ../crypto/hkdf.c             \
@@ -40,15 +42,57 @@ CRYPTO_SRC := \
     ../dispatch.c                \
     ../conn.c
 
+QUIC_PRIM_SRC := \
+    ../udp/udp.c                 \
+    ../tcp/ip.c                  \
+    ../crypto/util.c             \
+    ../crypto/cpuid.c            \
+    ../crypto/sha256.c           \
+    ../crypto/sha256_shani.c     \
+    ../crypto/sha256_armv8.c     \
+    ../crypto/sha512.c           \
+    ../crypto/ed25519.c          \
+    ../crypto/rsa.c              \
+    ../crypto/p256.c             \
+    ../crypto/ecdsa.c            \
+    ../crypto/hmac.c             \
+    ../crypto/hkdf.c             \
+    ../crypto/aes.c              \
+    ../crypto/aes_gcm.c          \
+    ../tls/keysched.c            \
+    ../tls/handshake.c           \
+    ../quic/varint.c             \
+    ../quic/initial.c            \
+    ../quic/packet.c             \
+    ../quic/frames.c             \
+    ../quic/loss.c               \
+    ../quic/cc.c                 \
+    ../quic/flow.c               \
+    ../quic/special.c            \
+    ../quic/transport_params.c   \
+    ../quic/crypto_stream.c      \
+    ../quic/stream.c             \
+    ../quic/keys.c               \
+    ../quic/tls_ext.c            \
+    ../quic/conn.c               \
+    ../quic/handshake_driver.c   \
+    ../h3/h3.c                   \
+    ../qpack/qpack.c             \
+    ../crypto/x25519.c
+
 .PHONY: all clean test
 
-all: test_crypto
+all: test_crypto test_quic_primitives
 
 test_crypto: test_crypto.c $(CRYPTO_SRC)
+	$(CC) $(CFLAGS) -o $@ $^ -lpthread
+
+test_quic_primitives: test_quic_primitives.c $(QUIC_PRIM_SRC)
 	$(CC) $(CFLAGS) -o $@ $^
 
-test: test_crypto
+test: test_crypto test_quic_primitives
 	./test_crypto
+	./test_quic_primitives
 
 clean:
-	rm -f test_crypto
+	rm -f test_crypto test_quic_primitives

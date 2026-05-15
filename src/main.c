@@ -13,6 +13,7 @@
 #include "simd.h"
 #include "tls_certs.h"
 #include "util.h"
+#include "../userspace/crypto/ecdsa.h"
 
 static void usage(const char* argv0) {
     fprintf(stderr,
@@ -280,6 +281,21 @@ int main(int argc, char** argv) {
     /* Initialize per-worker metrics state. MUST happen before
      * jumptable_build (which calls metrics_build_resources for /stats). */
     metrics_init((int)workers);
+
+    /* Spawn the ECDSA-P256 precompute pool + producer thread. Each
+     * pooled tuple lets a TLS handshake skip the dominant k*G and
+     * scalar_inv ops, dropping per-sign cost from ~5-50 ms to a few
+     * mod-muls. Failure is non-fatal: sign() transparently falls back
+     * to the inline RFC 6979 path. Only meaningful for the TLS
+     * backend, but cheap enough to start unconditionally. */
+    if (backend == PICOWEB_BACKEND_TLS) {
+        if (ecdsa_p256_precomp_init(64) != 0) {
+            metal_log("warning: ecdsa precompute pool init failed; "
+                      "sign() will use inline path");
+        } else {
+            metal_log("ecdsa precompute pool: cap=64, producer thread started");
+        }
+    }
 
     /* Build the immutable jump table once on the main thread. */
     static jumptable_t jt;
