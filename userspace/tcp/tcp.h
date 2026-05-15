@@ -32,7 +32,22 @@
 #include "../iov.h"
 #include "../dispatch.h"
 
-#define TCP_TABLE_SIZE 64u
+/* Connection table size. Slot 0 is reserved for the LISTEN PCB, leaving
+ * (TCP_TABLE_SIZE - 1) usable connection slots per worker. The TLS
+ * server's per-conn state (server_tls.c:tls_worker_ctx.conns) is also
+ * sized by this macro, and each tls_conn_state_t is fat (~110 KB —
+ * dominated by PW_TLS_TX_BUF_CAP=96 KB + 8 KB plaintext stage).
+ *   64 (original) -> ~7 MB / worker, supports ~12 burst conns reliably
+ *  256 (now)      -> ~28 MB / worker, supports >100 burst conns reliably
+ * Bumped from 64 because real browsers open 6+ parallel HTTP/1.1
+ * connections per page (no ALPN h2 in this stack), each of which holds
+ * a slot from SYN through final ACK. With 64 slots and per-handshake
+ * latency of ~250 µs serialised on the single AF_XDP worker, modest
+ * concurrent visitors saturate the table and excess SYNs get
+ * silently dropped (no SYN-ACK -> client TCP retransmit -> page hang).
+ * Pod memory limit is 128 Mi; 28 MB fits with ~80 MB headroom.
+ */
+#define TCP_TABLE_SIZE 256u
 
 /* Maximum number of unacked outbound segments tracked per conn for
  * retransmit. Spike-sized; production stacks track many more. The
