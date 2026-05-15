@@ -29,6 +29,7 @@
 #include "../quic/crypto_stream.h"
 #include "../quic/stream.h"
 #include "../h3/h3.h"
+#include "../qpack/qpack.h"
 #include "../quic/keys.h"
 #include "../quic/tls_ext.h"
 #include "../quic/conn.h"
@@ -3517,6 +3518,147 @@ static void test_h3_encode_overflow(void) {
 }
 
 /* ============================================================== */
+/*                  phase 6d1 QPACK static tests                   */
+/* ============================================================== */
+
+static void test_qpack_static_lookup(void) {
+    printf("== qpack: static table spot checks ==\n");
+    const char* nm; const char* val; size_t nl, vl;
+    check_int("idx 0  (:authority)", qpack_static_get(0,  &nm, &nl, &val, &vl), 0);
+    check_int(":authority", strcmp(nm, ":authority") == 0, 1);
+    check_int("idx 17 (:method GET)", qpack_static_get(17, &nm, &nl, &val, &vl), 0);
+    check_int("name :method", strcmp(nm, ":method") == 0, 1);
+    check_int("val GET",     strcmp(val, "GET") == 0, 1);
+    check_int("idx 25 (:status 200)", qpack_static_get(25, &nm, &nl, &val, &vl), 0);
+    check_int("val 200",     strcmp(val, "200") == 0, 1);
+    check_int("idx 98 (x-frame sameorigin)", qpack_static_get(98, &nm, &nl, &val, &vl), 0);
+    check_int("idx 99 OOR", qpack_static_get(99, &nm, &nl, &val, &vl), -1);
+}
+
+static void test_qpack_decode_indexed(void) {
+    printf("== qpack: decode three indexed lines ==\n");
+    /* :method GET, :scheme https, :status 200 */
+    uint8_t buf[16]; size_t off = 0;
+    off += qpack_encode_prefix_empty(buf + off, sizeof buf - off);
+    off += qpack_encode_indexed_static(buf + off, sizeof buf - off, 17);
+    off += qpack_encode_indexed_static(buf + off, sizeof buf - off, 23);
+    off += qpack_encode_indexed_static(buf + off, sizeof buf - off, 25);
+    qpack_field_t fields[8]; size_t nf = 8;
+    qpack_status_t st = qpack_decode_field_section(buf, off, fields, &nf);
+    check_int("OK", st, QPACK_OK);
+    check_int("3 fields", (long)nf, 3);
+    check_int("name :method", memcmp(fields[0].name, ":method", 7) == 0, 1);
+    check_int("val GET",     memcmp(fields[0].value, "GET", 3) == 0, 1);
+    check_int("name :scheme", memcmp(fields[1].name, ":scheme", 7) == 0, 1);
+    check_int("val https",   memcmp(fields[1].value, "https", 5) == 0, 1);
+    check_int("val 200",     memcmp(fields[2].value, "200", 3) == 0, 1);
+}
+
+static void test_qpack_decode_literal_with_static_name(void) {
+    printf("== qpack: decode literal-with-static-name ==\n");
+    uint8_t buf[64]; size_t off = 0;
+    off += qpack_encode_prefix_empty(buf + off, sizeof buf - off);
+    /* :authority = "wavefunctionlabs.com" — name idx 0 */
+    static const uint8_t v[] = "wavefunctionlabs.com";
+    off += qpack_encode_literal_static_name(buf + off, sizeof buf - off,
+                                            0, v, sizeof v - 1);
+    qpack_field_t fields[4]; size_t nf = 4;
+    qpack_status_t st = qpack_decode_field_section(buf, off, fields, &nf);
+    check_int("OK", st, QPACK_OK);
+    check_int("1 field", (long)nf, 1);
+    check_int("name :authority", memcmp(fields[0].name, ":authority", 10) == 0, 1);
+    check_int("value matches", fields[0].value_len == sizeof v - 1, 1);
+    check_int("val first byte 'w'", fields[0].value[0], 'w');
+}
+
+static void test_qpack_decode_literal_with_literal_name(void) {
+    printf("== qpack: decode literal-with-literal-name ==\n");
+    uint8_t buf[64]; size_t off = 0;
+    off += qpack_encode_prefix_empty(buf + off, sizeof buf - off);
+    static const uint8_t nm[]  = "x-custom";
+    static const uint8_t val[] = "yes";
+    off += qpack_encode_literal(buf + off, sizeof buf - off,
+                                nm, sizeof nm - 1, val, sizeof val - 1);
+    qpack_field_t fields[4]; size_t nf = 4;
+    qpack_status_t st = qpack_decode_field_section(buf, off, fields, &nf);
+    check_int("OK", st, QPACK_OK);
+    check_int("1 field", (long)nf, 1);
+    check_int("name x-custom", memcmp(fields[0].name, "x-custom", 8) == 0, 1);
+    check_int("val yes", memcmp(fields[0].value, "yes", 3) == 0, 1);
+}
+
+static void test_qpack_decode_rejects_huffman(void) {
+    printf("== qpack: H bit on value rejected with QPACK_ERR_HUFFMAN ==\n");
+    uint8_t buf[16];
+    buf[0] = 0; buf[1] = 0;     /* prefix */
+    buf[2] = 0x70;              /* literal-w/ static-name, idx 0 */
+    buf[3] = 0x83;              /* H=1, len=3 */
+    buf[4] = 0xab; buf[5] = 0xcd; buf[6] = 0xef;
+    qpack_field_t fields[4]; size_t nf = 4;
+    qpack_status_t st = qpack_decode_field_section(buf, 7, fields, &nf);
+    check_int("ERR_HUFFMAN", st, QPACK_ERR_HUFFMAN);
+}
+
+static void test_qpack_decode_rejects_dynamic(void) {
+    printf("== qpack: dynamic-table reference rejected ==\n");
+    /* RIC=0, delta=0; then T=0 indexed line (dyn). 0x80 alone with low bits is dyn idx. */
+    uint8_t buf[8] = {0, 0, 0x80};   /* indexed line, T=0, idx=0 in dyn table */
+    qpack_field_t fields[4]; size_t nf = 4;
+    qpack_status_t st = qpack_decode_field_section(buf, 3, fields, &nf);
+    check_int("ERR_DYNAMIC_REQ", st, QPACK_ERR_DYNAMIC_REQ);
+}
+
+static void test_qpack_decode_rejects_nonzero_ric(void) {
+    printf("== qpack: non-zero Required Insert Count rejected ==\n");
+    uint8_t buf[4] = { 1, 0, 0xc0 };  /* RIC=1, delta=0, then idx 0 */
+    qpack_field_t fields[4]; size_t nf = 4;
+    qpack_status_t st = qpack_decode_field_section(buf, 3, fields, &nf);
+    check_int("ERR_DYNAMIC_REQ", st, QPACK_ERR_DYNAMIC_REQ);
+}
+
+static void test_qpack_decode_truncated(void) {
+    printf("== qpack: truncated value bytes → ERR_TRUNCATED ==\n");
+    uint8_t buf[16];
+    buf[0] = 0; buf[1] = 0;
+    buf[2] = 0x70;            /* literal w/static-name idx 0 */
+    buf[3] = 0x05;            /* value-len = 5, no H */
+    buf[4] = 'a'; buf[5] = 'b'; /* only 2 bytes follow */
+    qpack_field_t fields[4]; size_t nf = 4;
+    qpack_status_t st = qpack_decode_field_section(buf, 6, fields, &nf);
+    check_int("ERR_TRUNCATED", st, QPACK_ERR_TRUNCATED);
+}
+
+static void test_qpack_encode_oor_index(void) {
+    printf("== qpack: encode rejects out-of-range static index ==\n");
+    uint8_t out[8];
+    check_int("idx 99 → 0",
+              (long)qpack_encode_indexed_static(out, sizeof out, 99), 0);
+    check_int("idx 999 → 0",
+              (long)qpack_encode_indexed_static(out, sizeof out, 999), 0);
+}
+
+static void test_qpack_realistic_response(void) {
+    printf("== qpack: realistic 200-OK response section round-trip ==\n");
+    uint8_t buf[128]; size_t off = 0;
+    off += qpack_encode_prefix_empty(buf + off, sizeof buf - off);
+    off += qpack_encode_indexed_static(buf + off, sizeof buf - off, 25);  /* :status 200 */
+    static const uint8_t srv[] = "picoweb";
+    off += qpack_encode_literal_static_name(buf + off, sizeof buf - off,
+                                            92 /* server */, srv, sizeof srv - 1);
+    off += qpack_encode_indexed_static(buf + off, sizeof buf - off, 52);  /* content-type text/html;charset=utf-8 */
+    qpack_field_t fields[8]; size_t nf = 8;
+    qpack_status_t st = qpack_decode_field_section(buf, off, fields, &nf);
+    check_int("OK", st, QPACK_OK);
+    check_int("3 fields", (long)nf, 3);
+    check_int(":status 200", memcmp(fields[0].value, "200", 3) == 0, 1);
+    check_int("server picoweb",
+              fields[1].value_len == 7 &&
+              memcmp(fields[1].value, "picoweb", 7) == 0, 1);
+    check_int("content-type",
+              memcmp(fields[2].name, "content-type", 12) == 0, 1);
+}
+
+/* ============================================================== */
 
 int main(void) {
     test_udp_build_parse_roundtrip();
@@ -3676,6 +3818,18 @@ int main(void) {
     test_h3_settings_round_trip();
     test_h3_settings_truncated();
     test_h3_encode_overflow();
+
+    /* phase 6d1 — QPACK static decoder */
+    test_qpack_static_lookup();
+    test_qpack_decode_indexed();
+    test_qpack_decode_literal_with_static_name();
+    test_qpack_decode_literal_with_literal_name();
+    test_qpack_decode_rejects_huffman();
+    test_qpack_decode_rejects_dynamic();
+    test_qpack_decode_rejects_nonzero_ric();
+    test_qpack_decode_truncated();
+    test_qpack_encode_oor_index();
+    test_qpack_realistic_response();
 
     printf("\n=== RESULTS: PASS=%d FAIL=%d ===\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
