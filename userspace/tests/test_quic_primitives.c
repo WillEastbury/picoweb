@@ -3969,6 +3969,200 @@ static void test_h3_build_response_unknown_status(void) {
               memcmp(fields[0].value, "418", 3) == 0, 1);
 }
 
+/* ===== phase 6e1 — h3 request parser ============================ */
+
+/* Helper: build a minimal request stream payload with given pseudo
+ * headers. Returns bytes written. */
+static size_t build_req(uint8_t* out, size_t cap,
+                        const char* method, const char* path,
+                        const char* authority,
+                        const uint8_t* body, size_t body_len)
+{
+    /* Build field section. Use literal-with-static-name with overrides. */
+    uint8_t fs[256]; size_t fo = 0;
+    fo += qpack_encode_prefix_empty(fs + fo, sizeof fs - fo);
+    /* :method (idx 15 = ":method CONNECT") */
+    fo += qpack_encode_literal_static_name(fs + fo, sizeof fs - fo,
+                                            15, (const uint8_t*)method,
+                                            strlen(method));
+    /* :scheme (idx 22 = ":scheme http"); override with "https" */
+    fo += qpack_encode_literal_static_name(fs + fo, sizeof fs - fo,
+                                            22, (const uint8_t*)"https", 5);
+    if (authority) {
+        /* :authority (idx 0) */
+        fo += qpack_encode_literal_static_name(fs + fo, sizeof fs - fo,
+                                                0, (const uint8_t*)authority,
+                                                strlen(authority));
+    }
+    /* :path (idx 1 = ":path /") */
+    fo += qpack_encode_literal_static_name(fs + fo, sizeof fs - fo,
+                                            1, (const uint8_t*)path,
+                                            strlen(path));
+
+    size_t off = 0;
+    off += h3_frame_encode(out + off, cap - off, H3_FT_HEADERS, fs, fo);
+    if (body) {
+        off += h3_frame_encode(out + off, cap - off, H3_FT_DATA, body, body_len);
+    }
+    return off;
+}
+
+static void test_h3_parse_request_minimal(void) {
+    printf("== h3: parse_request GET / minimal ==\n");
+    uint8_t buf[256];
+    size_t  n = build_req(buf, sizeof buf, "GET", "/", "example.com", NULL, 0);
+    qpack_field_t fields[16];
+    uint8_t scratch[256];
+    h3_request_t req;
+    int r = h3_parse_request(buf, n, fields, 16, scratch, sizeof scratch, &req);
+    check_int("OK", r, H3_REQ_OK);
+    check_int(":method=GET",
+              req.method_len == 3 && memcmp(req.method, "GET", 3) == 0, 1);
+    check_int(":scheme=https",
+              req.scheme_len == 5 && memcmp(req.scheme, "https", 5) == 0, 1);
+    check_int(":authority=example.com",
+              req.authority_len == 11 &&
+              memcmp(req.authority, "example.com", 11) == 0, 1);
+    check_int(":path=/",
+              req.path_len == 1 && memcmp(req.path, "/", 1) == 0, 1);
+    check_int("no body", req.body == NULL && req.body_len == 0, 1);
+}
+
+static void test_h3_parse_request_with_body(void) {
+    printf("== h3: parse_request POST with body ==\n");
+    static const uint8_t body[] = "hello=world";
+    uint8_t buf[256];
+    size_t  n = build_req(buf, sizeof buf, "POST", "/submit",
+                          "example.com", body, sizeof body - 1);
+    qpack_field_t fields[16];
+    uint8_t scratch[256];
+    h3_request_t req;
+    int r = h3_parse_request(buf, n, fields, 16, scratch, sizeof scratch, &req);
+    check_int("OK", r, H3_REQ_OK);
+    check_int(":method=POST",
+              req.method_len == 4 && memcmp(req.method, "POST", 4) == 0, 1);
+    check_int("body matches",
+              req.body_len == sizeof body - 1 &&
+              memcmp(req.body, body, sizeof body - 1) == 0, 1);
+}
+
+static void test_h3_parse_request_with_two_data_frames(void) {
+    printf("== h3: parse_request POST with two contiguous DATA frames ==\n");
+    uint8_t buf[256];
+    size_t  n = build_req(buf, sizeof buf, "POST", "/x", "h", NULL, 0);
+    /* Append two DATA frames. */
+    n += h3_frame_encode(buf + n, sizeof buf - n, H3_FT_DATA,
+                         (const uint8_t*)"abc", 3);
+    n += h3_frame_encode(buf + n, sizeof buf - n, H3_FT_DATA,
+                         (const uint8_t*)"def", 3);
+    qpack_field_t fields[16];
+    uint8_t scratch[128];
+    h3_request_t req;
+    int r = h3_parse_request(buf, n, fields, 16, scratch, sizeof scratch, &req);
+    check_int("OK", r, H3_REQ_OK);
+    check_int("body 6 bytes", (long)req.body_len, 6);
+    check_int("body bytes", memcmp(req.body, "abcdef", 6) == 0, 1);
+}
+
+static void test_h3_parse_request_skips_unknown_frame(void) {
+    printf("== h3: parse_request skips unknown (grease) frame ==\n");
+    uint8_t buf[256];
+    size_t  n = build_req(buf, sizeof buf, "GET", "/", "h", NULL, 0);
+    /* Append a grease frame (type 0x1f * N + 0x21 picks an unused
+     * type — 0x21 itself is unused per IANA). */
+    n += h3_frame_encode(buf + n, sizeof buf - n, 0x21,
+                         (const uint8_t*)"junk", 4);
+    qpack_field_t fields[16];
+    uint8_t scratch[128];
+    h3_request_t req;
+    int r = h3_parse_request(buf, n, fields, 16, scratch, sizeof scratch, &req);
+    check_int("OK", r, H3_REQ_OK);
+}
+
+static void test_h3_parse_request_rejects_reserved_frame(void) {
+    printf("== h3: parse_request rejects h2-reserved frame type ==\n");
+    uint8_t buf[256];
+    size_t  n = build_req(buf, sizeof buf, "GET", "/", "h", NULL, 0);
+    /* h2 PRIORITY frame type = 0x02 — reserved on h3. */
+    n += h3_frame_encode(buf + n, sizeof buf - n, 0x02, NULL, 0);
+    qpack_field_t fields[16];
+    uint8_t scratch[128];
+    h3_request_t req;
+    int r = h3_parse_request(buf, n, fields, 16, scratch, sizeof scratch, &req);
+    check_int("RESERVED_FRAME", r, H3_REQ_ERR_RESERVED_FRAME);
+}
+
+static void test_h3_parse_request_rejects_data_before_headers(void) {
+    printf("== h3: parse_request rejects DATA before HEADERS ==\n");
+    uint8_t buf[64]; size_t n = 0;
+    n += h3_frame_encode(buf + n, sizeof buf - n, H3_FT_DATA,
+                         (const uint8_t*)"x", 1);
+    qpack_field_t fields[4];
+    uint8_t scratch[64];
+    h3_request_t req;
+    int r = h3_parse_request(buf, n, fields, 4, scratch, sizeof scratch, &req);
+    check_int("FRAGMENTED_HEADERS", r, H3_REQ_ERR_FRAGMENTED_HEADERS);
+}
+
+static void test_h3_parse_request_rejects_missing_method(void) {
+    printf("== h3: parse_request rejects missing :method ==\n");
+    /* Build a request with only :scheme + :path (no :method). */
+    uint8_t fs[64]; size_t fo = 0;
+    fo += qpack_encode_prefix_empty(fs + fo, sizeof fs - fo);
+    fo += qpack_encode_literal_static_name(fs + fo, sizeof fs - fo,
+                                            22, (const uint8_t*)"https", 5);
+    fo += qpack_encode_literal_static_name(fs + fo, sizeof fs - fo,
+                                            1, (const uint8_t*)"/", 1);
+    uint8_t buf[128]; size_t n = 0;
+    n += h3_frame_encode(buf + n, sizeof buf - n, H3_FT_HEADERS, fs, fo);
+    qpack_field_t fields[8]; uint8_t scratch[128];
+    h3_request_t req;
+    int r = h3_parse_request(buf, n, fields, 8, scratch, sizeof scratch, &req);
+    check_int("PSEUDO error", r, H3_REQ_ERR_PSEUDO);
+}
+
+static void test_h3_parse_request_rejects_pseudo_after_regular(void) {
+    printf("== h3: parse_request rejects pseudo after regular field ==\n");
+    /* Build :method GET, then literal "x-y: 1", then :path / */
+    uint8_t fs[128]; size_t fo = 0;
+    fo += qpack_encode_prefix_empty(fs + fo, sizeof fs - fo);
+    fo += qpack_encode_literal_static_name(fs + fo, sizeof fs - fo,
+                                            15, (const uint8_t*)"GET", 3);
+    fo += qpack_encode_literal_static_name(fs + fo, sizeof fs - fo,
+                                            22, (const uint8_t*)"https", 5);
+    fo += qpack_encode_literal(fs + fo, sizeof fs - fo,
+                                (const uint8_t*)"x-y", 3,
+                                (const uint8_t*)"1", 1);
+    fo += qpack_encode_literal_static_name(fs + fo, sizeof fs - fo,
+                                            1, (const uint8_t*)"/", 1);
+    uint8_t buf[256]; size_t n = 0;
+    n += h3_frame_encode(buf + n, sizeof buf - n, H3_FT_HEADERS, fs, fo);
+    qpack_field_t fields[8]; uint8_t scratch[128];
+    h3_request_t req;
+    int r = h3_parse_request(buf, n, fields, 8, scratch, sizeof scratch, &req);
+    check_int("PSEUDO error", r, H3_REQ_ERR_PSEUDO);
+}
+
+static void test_h3_parse_request_rejects_duplicate_pseudo(void) {
+    printf("== h3: parse_request rejects duplicate :method ==\n");
+    uint8_t fs[128]; size_t fo = 0;
+    fo += qpack_encode_prefix_empty(fs + fo, sizeof fs - fo);
+    fo += qpack_encode_literal_static_name(fs + fo, sizeof fs - fo,
+                                            15, (const uint8_t*)"GET", 3);
+    fo += qpack_encode_literal_static_name(fs + fo, sizeof fs - fo,
+                                            15, (const uint8_t*)"POST", 4);
+    fo += qpack_encode_literal_static_name(fs + fo, sizeof fs - fo,
+                                            22, (const uint8_t*)"https", 5);
+    fo += qpack_encode_literal_static_name(fs + fo, sizeof fs - fo,
+                                            1, (const uint8_t*)"/", 1);
+    uint8_t buf[256]; size_t n = 0;
+    n += h3_frame_encode(buf + n, sizeof buf - n, H3_FT_HEADERS, fs, fo);
+    qpack_field_t fields[8]; uint8_t scratch[128];
+    h3_request_t req;
+    int r = h3_parse_request(buf, n, fields, 8, scratch, sizeof scratch, &req);
+    check_int("PSEUDO error", r, H3_REQ_ERR_PSEUDO);
+}
+
 /* ============================================================== */
 
 int main(void) {
@@ -4167,6 +4361,17 @@ int main(void) {
     test_h3_build_response_200();
     test_h3_build_response_304_no_body();
     test_h3_build_response_unknown_status();
+
+    /* phase 6e1 — h3 request parser */
+    test_h3_parse_request_minimal();
+    test_h3_parse_request_with_body();
+    test_h3_parse_request_with_two_data_frames();
+    test_h3_parse_request_skips_unknown_frame();
+    test_h3_parse_request_rejects_reserved_frame();
+    test_h3_parse_request_rejects_data_before_headers();
+    test_h3_parse_request_rejects_missing_method();
+    test_h3_parse_request_rejects_pseudo_after_regular();
+    test_h3_parse_request_rejects_duplicate_pseudo();
 
     printf("\n=== RESULTS: PASS=%d FAIL=%d ===\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;

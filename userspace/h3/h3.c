@@ -256,3 +256,143 @@ size_t h3_build_response(uint8_t* out, size_t cap,
     }
     return off;
 }
+
+/* ---- Request parser (RFC 9114 §4.1) -------------------------- */
+
+static int field_name_eq(const qpack_field_t* f, const char* s, size_t n) {
+    return f->name_len == n && memcmp(f->name, s, n) == 0;
+}
+
+int h3_parse_request(const uint8_t* in, size_t in_len,
+                     qpack_field_t* fields, size_t fields_cap,
+                     uint8_t* scratch, size_t scratch_cap,
+                     h3_request_t* out)
+{
+    if (!in || !fields || !out) return H3_REQ_ERR_TRUNCATED;
+    memset(out, 0, sizeof *out);
+    out->fields = fields;
+
+    size_t off = 0;
+    int    seen_headers = 0;
+    size_t hdr_count    = 0;
+    const uint8_t* body_end = NULL;
+    size_t scratch_used = 0;
+
+    while (off < in_len) {
+        h3_frame_t fr;
+        size_t r = h3_frame_decode(in + off, in_len - off, &fr);
+        if (r == H3_DECODE_NEED_MORE) return H3_REQ_ERR_TRUNCATED;
+        if (r == H3_DECODE_ERROR)     return H3_REQ_ERR_BAD_FRAME;
+
+        if (fr.type == H3_FT_RESERVED) return H3_REQ_ERR_RESERVED_FRAME;
+
+        if (fr.type == H3_FT_HEADERS) {
+            if (seen_headers) {
+                /* Trailers — append to fields, must come after DATA. */
+                size_t avail = fields_cap - hdr_count;
+                size_t got = avail;
+                qpack_status_t st = qpack_decode_field_section_huff(
+                    fr.payload, (size_t)fr.length,
+                    fields + hdr_count, &got,
+                    scratch + scratch_used, scratch_cap - scratch_used,
+                    NULL);
+                if (st == QPACK_ERR_OUTPUT_OVERFLOW) return H3_REQ_ERR_OVERFLOW;
+                if (st != QPACK_OK) return H3_REQ_ERR_QPACK;
+                hdr_count += got;
+            } else {
+                size_t got = fields_cap;
+                size_t scratch_delta = 0;
+                qpack_status_t st = qpack_decode_field_section_huff(
+                    fr.payload, (size_t)fr.length,
+                    fields, &got,
+                    scratch, scratch_cap,
+                    &scratch_delta);
+                if (st == QPACK_ERR_OUTPUT_OVERFLOW) return H3_REQ_ERR_OVERFLOW;
+                if (st != QPACK_OK) return H3_REQ_ERR_QPACK;
+                scratch_used = scratch_delta;
+
+                /* Validate pseudo-header ordering and uniqueness, and
+                 * extract :method/:scheme/:authority/:path. */
+                int in_regular = 0;
+                for (size_t i = 0; i < got; ++i) {
+                    qpack_field_t* f = &fields[i];
+                    int is_pseudo = (f->name_len > 0 && f->name[0] == ':');
+                    if (is_pseudo) {
+                        if (in_regular) return H3_REQ_ERR_PSEUDO;
+                        if (field_name_eq(f, ":method", 7)) {
+                            if (out->method) return H3_REQ_ERR_PSEUDO;
+                            out->method = f->value; out->method_len = f->value_len;
+                        } else if (field_name_eq(f, ":scheme", 7)) {
+                            if (out->scheme) return H3_REQ_ERR_PSEUDO;
+                            out->scheme = f->value; out->scheme_len = f->value_len;
+                        } else if (field_name_eq(f, ":authority", 10)) {
+                            if (out->authority) return H3_REQ_ERR_PSEUDO;
+                            out->authority = f->value; out->authority_len = f->value_len;
+                        } else if (field_name_eq(f, ":path", 5)) {
+                            if (out->path) return H3_REQ_ERR_PSEUDO;
+                            out->path = f->value; out->path_len = f->value_len;
+                        } else {
+                            return H3_REQ_ERR_PSEUDO; /* unknown pseudo */
+                        }
+                    } else {
+                        in_regular = 1;
+                    }
+                }
+                hdr_count = got;
+                seen_headers = 1;
+            }
+        } else if (fr.type == H3_FT_DATA) {
+            if (!seen_headers) return H3_REQ_ERR_FRAGMENTED_HEADERS;
+            if (fr.length == 0) {
+                /* empty DATA frame: nothing to do */
+            } else if (out->body == NULL) {
+                /* First DATA: point directly into input buffer. */
+                out->body = fr.payload;
+                out->body_len = (size_t)fr.length;
+                body_end = fr.payload + fr.length;
+            } else if (fr.payload == body_end) {
+                /* Physically contiguous (rare in practice — DATA frame
+                 * headers usually break contiguity). */
+                out->body_len += (size_t)fr.length;
+                body_end = fr.payload + fr.length;
+            } else {
+                /* Non-contiguous: copy into scratch to reassemble. If
+                 * the body wasn't already in scratch, move it there
+                 * first; then append the new DATA frame's payload. */
+                size_t need = (out->body >= scratch &&
+                               out->body < scratch + scratch_cap)
+                              ? (size_t)fr.length
+                              : out->body_len + (size_t)fr.length;
+                if (scratch_used + need > scratch_cap)
+                    return H3_REQ_ERR_OVERFLOW;
+                if (!(out->body >= scratch &&
+                      out->body < scratch + scratch_cap)) {
+                    memcpy(scratch + scratch_used, out->body, out->body_len);
+                    out->body = scratch + scratch_used;
+                    scratch_used += out->body_len;
+                }
+                memcpy(scratch + scratch_used, fr.payload, (size_t)fr.length);
+                scratch_used += (size_t)fr.length;
+                out->body_len += (size_t)fr.length;
+                body_end = NULL; /* no longer meaningful */
+            }
+        } else if (fr.type == H3_FT_UNKNOWN) {
+            /* skip silently per §9 */
+        } else {
+            /* CANCEL_PUSH / SETTINGS / PUSH_PROMISE / GOAWAY /
+             * MAX_PUSH_ID — none of these are valid on a request
+             * stream (RFC 9114 §7.2.x, §6.2). */
+            return H3_REQ_ERR_BAD_FRAME;
+        }
+
+        off += r;
+    }
+
+    if (!seen_headers)        return H3_REQ_ERR_TRUNCATED;
+    if (!out->method)         return H3_REQ_ERR_PSEUDO;
+    if (!out->scheme)         return H3_REQ_ERR_PSEUDO;
+    if (!out->path)           return H3_REQ_ERR_PSEUDO;
+
+    out->fields_count = hdr_count;
+    return H3_REQ_OK;
+}

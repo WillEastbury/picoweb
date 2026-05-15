@@ -21,6 +21,8 @@
 #include <stdint.h>
 #include <stddef.h>
 
+#include "../qpack/qpack.h"
+
 /* RFC 9114 §7.2 frame types we parse / emit. Reserved frame types
  * (HTTP/2 GOAWAY/PUSH_PROMISE/PING that MUST be treated as errors
  * in h3 per §7.2.8) are reported as H3_FT_RESERVED so the caller
@@ -121,5 +123,60 @@ size_t h3_build_response(uint8_t* out, size_t cap,
                          unsigned status_code,
                          const char* ctype, size_t ctype_len,
                          const uint8_t* body, size_t body_len);
+
+/* ---- Request-side parser (RFC 9114 §4.1) ----------------------- */
+
+typedef struct {
+    /* Pseudo-headers (point into scratch or input buffer). */
+    const uint8_t* method;     size_t method_len;
+    const uint8_t* scheme;     size_t scheme_len;
+    const uint8_t* authority;  size_t authority_len;
+    const uint8_t* path;       size_t path_len;
+    /* All other fields, in declaration order (excludes pseudo-headers). */
+    qpack_field_t* fields;     size_t fields_count;
+    /* Optional body (concatenation of DATA frame payloads). NULL if
+     * none; pointer is into the input buffer (no copy). */
+    const uint8_t* body;       size_t body_len;
+} h3_request_t;
+
+#define H3_REQ_OK                       0
+#define H3_REQ_ERR_TRUNCATED           -1
+#define H3_REQ_ERR_BAD_FRAME           -2  /* malformed h3 framing */
+#define H3_REQ_ERR_RESERVED_FRAME      -3  /* h2-only frame on h3 stream */
+#define H3_REQ_ERR_QPACK               -4  /* QPACK decode failed */
+#define H3_REQ_ERR_PSEUDO              -5  /* missing/duplicate pseudo header
+                                              or pseudo after regular */
+#define H3_REQ_ERR_OVERFLOW            -6  /* fields/scratch capacity exceeded */
+#define H3_REQ_ERR_FRAGMENTED_HEADERS  -7  /* DATA before HEADERS, or HEADERS
+                                              not the first request frame */
+#define H3_REQ_ERR_NO_BODY_BUFFER      -8  /* multiple DATA frames need a
+                                              caller-supplied contiguous
+                                              body buffer (not yet provided) */
+
+/* Parse a complete request stream payload (i.e. the bytes received on
+ * a client-initiated bidi QUIC stream, after STREAM-frame reassembly
+ * and FIN). Caller supplies fields/scratch buffers; pointers in the
+ * returned request point into either `in` or `scratch`.
+ *
+ * RFC 9114 invariants enforced:
+ *   §4.1 first frame on a request stream MUST be HEADERS
+ *   §4.1 only HEADERS / DATA / reserved / unknown allowed on a request
+ *   §7.2.8 reserved (h2-leftover) types ⇒ error
+ *   §9 unknown types are skipped silently
+ *   §4.3.1 pseudo-headers MUST precede regular headers; required set
+ *          on a request includes :method, :scheme, :path (we treat
+ *          :authority as recommended-but-not-required, matching
+ *          common h3 servers)
+ *   §4.3.1 each pseudo-header MUST appear at most once
+ *
+ * Multiple DATA frames are concatenated only if they are physically
+ * contiguous in `in` (which they will be after stream reassembly);
+ * non-contiguous DATA returns H3_REQ_ERR_NO_BODY_BUFFER (deferred).
+ *
+ * Returns H3_REQ_OK or one of the H3_REQ_ERR_* codes. */
+int h3_parse_request(const uint8_t* in, size_t in_len,
+                     qpack_field_t* fields, size_t fields_cap,
+                     uint8_t* scratch, size_t scratch_cap,
+                     h3_request_t* out);
 
 #endif
