@@ -28,6 +28,7 @@
 #include "../quic/transport_params.h"
 #include "../quic/crypto_stream.h"
 #include "../quic/stream.h"
+#include "../h3/h3.h"
 #include "../quic/keys.h"
 #include "../quic/tls_ext.h"
 #include "../quic/conn.h"
@@ -3389,6 +3390,133 @@ static void test_conn_recv_app_stream_overflow_slots(void) {
 }
 
 /* ============================================================== */
+/*                    phase 6c HTTP/3 frame tests                  */
+/* ============================================================== */
+
+static void test_h3_classify(void) {
+    printf("== h3: classify_type ==\n");
+    check_int("DATA",         h3_classify_type(0x00), H3_FT_DATA);
+    check_int("HEADERS",      h3_classify_type(0x01), H3_FT_HEADERS);
+    check_int("CANCEL_PUSH",  h3_classify_type(0x03), H3_FT_CANCEL_PUSH);
+    check_int("SETTINGS",     h3_classify_type(0x04), H3_FT_SETTINGS);
+    check_int("PUSH_PROMISE", h3_classify_type(0x05), H3_FT_PUSH_PROMISE);
+    check_int("GOAWAY",       h3_classify_type(0x07), H3_FT_GOAWAY);
+    check_int("MAX_PUSH_ID",  h3_classify_type(0x0d), H3_FT_MAX_PUSH_ID);
+    check_int("h2 PRIORITY=RESERVED",     h3_classify_type(0x02), H3_FT_RESERVED);
+    check_int("h2 PING=RESERVED",         h3_classify_type(0x06), H3_FT_RESERVED);
+    check_int("h2 WINDOW_UPDATE=RESERVED",h3_classify_type(0x08), H3_FT_RESERVED);
+    check_int("h2 CONTINUATION=RESERVED", h3_classify_type(0x09), H3_FT_RESERVED);
+    check_int("grease=UNKNOWN",   h3_classify_type(0x21), H3_FT_UNKNOWN);
+}
+
+static void test_h3_encode_decode_data(void) {
+    printf("== h3: DATA encode + decode round-trip ==\n");
+    uint8_t out[64];
+    static const uint8_t pl[] = "hello h3";
+    size_t n = h3_frame_encode(out, sizeof out, H3_FT_DATA, pl, sizeof pl - 1);
+    check_int("encoded", n > 0, 1);
+    /* type=0x00 (1 byte varint), length=8 (1 byte varint), payload 8 = 10 */
+    check_int("size = 10", (long)n, 10);
+    h3_frame_t f;
+    size_t consumed = h3_frame_decode(out, n, &f);
+    check_int("consumed", (long)consumed, (long)n);
+    check_int("type DATA", f.type, H3_FT_DATA);
+    check_int("len 8", (long)f.length, 8);
+    check_int("payload[0] 'h'", f.payload[0], 'h');
+}
+
+static void test_h3_decode_partial(void) {
+    printf("== h3: decode returns NEED_MORE on partial input ==\n");
+    /* Encode HEADERS with 4-byte payload, then truncate. */
+    uint8_t out[16];
+    static const uint8_t pl[] = "abcd";
+    size_t n = h3_frame_encode(out, sizeof out, H3_FT_HEADERS, pl, 4);
+    h3_frame_t f;
+    /* Truncate at every prefix shorter than n. */
+    for (size_t k = 0; k < n; k++) {
+        size_t r = h3_frame_decode(out, k, &f);
+        check_int("need more", r == H3_DECODE_NEED_MORE, 1);
+    }
+    check_int("full decodes", h3_frame_decode(out, n, &f) == n, 1);
+}
+
+static void test_h3_decode_grease(void) {
+    printf("== h3: grease type classified as UNKNOWN ==\n");
+    /* Type 0x21 = 33; length 0; payload empty. */
+    uint8_t out[8];
+    size_t n = h3_frame_encode(out, sizeof out, 0x21, NULL, 0);
+    h3_frame_t f;
+    check_int("decoded", h3_frame_decode(out, n, &f) == n, 1);
+    check_int("type UNKNOWN", f.type, H3_FT_UNKNOWN);
+    check_int("raw 0x21", (long)f.raw_type, 0x21);
+    check_int("len 0", (long)f.length, 0);
+}
+
+static void test_h3_decode_reserved(void) {
+    printf("== h3: h2-reserved type classified as RESERVED ==\n");
+    uint8_t out[8];
+    size_t n = h3_frame_encode(out, sizeof out, 0x06 /* h2 PING */, NULL, 0);
+    h3_frame_t f;
+    check_int("decoded", h3_frame_decode(out, n, &f) == n, 1);
+    check_int("type RESERVED", f.type, H3_FT_RESERVED);
+}
+
+static void test_h3_settings_round_trip(void) {
+    printf("== h3: SETTINGS payload build + iterate ==\n");
+    uint8_t pl[64]; size_t plen = 0;
+    plen = h3_settings_append(pl, sizeof pl, plen,
+                              H3_SETTINGS_QPACK_MAX_TABLE_CAPACITY, 0);
+    check_int("append 1", plen > 0, 1);
+    plen = h3_settings_append(pl, sizeof pl, plen,
+                              H3_SETTINGS_MAX_FIELD_SECTION_SIZE, 16384);
+    check_int("append 2", plen > 0, 1);
+    plen = h3_settings_append(pl, sizeof pl, plen,
+                              H3_SETTINGS_QPACK_BLOCKED_STREAMS, 0);
+    check_int("append 3", plen > 0, 1);
+
+    /* Iterate. */
+    size_t cur = 0;
+    uint64_t id, val;
+    int r;
+    r = h3_settings_next(pl, plen, &cur, &id, &val);
+    check_int("pair1 ok", r, 1);
+    check_int("pair1 id",  (long)id, H3_SETTINGS_QPACK_MAX_TABLE_CAPACITY);
+    check_int("pair1 val", (long)val, 0);
+    r = h3_settings_next(pl, plen, &cur, &id, &val);
+    check_int("pair2 ok", r, 1);
+    check_int("pair2 id",  (long)id, H3_SETTINGS_MAX_FIELD_SECTION_SIZE);
+    check_int("pair2 val", (long)val, 16384);
+    r = h3_settings_next(pl, plen, &cur, &id, &val);
+    check_int("pair3 ok", r, 1);
+    check_int("pair3 id",  (long)id, H3_SETTINGS_QPACK_BLOCKED_STREAMS);
+    r = h3_settings_next(pl, plen, &cur, &id, &val);
+    check_int("end", r, 0);
+}
+
+static void test_h3_settings_truncated(void) {
+    printf("== h3: SETTINGS with trailing identifier-without-value → -1 ==\n");
+    uint8_t pl[8]; size_t plen = 0;
+    plen = h3_settings_append(pl, sizeof pl, plen, 0x01, 100);
+    check_int("seed", plen > 0, 1);
+    /* Append a stray identifier byte (1-byte varint 0x05) with no value. */
+    pl[plen++] = 0x05;
+    size_t cur = 0;
+    uint64_t id, val;
+    int r = h3_settings_next(pl, plen, &cur, &id, &val);
+    check_int("first ok", r, 1);
+    r = h3_settings_next(pl, plen, &cur, &id, &val);
+    check_int("trailing → -1", r, -1);
+}
+
+static void test_h3_encode_overflow(void) {
+    printf("== h3: encode rejects too-small buffer ==\n");
+    uint8_t out[3];
+    static const uint8_t pl[8] = {0};
+    check_int("overflow → 0",
+              (long)h3_frame_encode(out, sizeof out, H3_FT_DATA, pl, sizeof pl), 0);
+}
+
+/* ============================================================== */
 
 int main(void) {
     test_udp_build_parse_roundtrip();
@@ -3538,6 +3666,16 @@ int main(void) {
     test_conn_recv_app_rejects_new_token();
     test_conn_recv_app_rejects_handshake_done();
     test_conn_recv_app_stream_overflow_slots();
+
+    /* phase 6c — HTTP/3 framing */
+    test_h3_classify();
+    test_h3_encode_decode_data();
+    test_h3_decode_partial();
+    test_h3_decode_grease();
+    test_h3_decode_reserved();
+    test_h3_settings_round_trip();
+    test_h3_settings_truncated();
+    test_h3_encode_overflow();
 
     printf("\n=== RESULTS: PASS=%d FAIL=%d ===\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
