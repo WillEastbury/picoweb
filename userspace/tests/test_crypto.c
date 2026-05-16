@@ -16,6 +16,8 @@
 #include "../crypto/sha256.h"
 #include "../crypto/sha512.h"
 #include "../crypto/ed25519.h"
+#include "../crypto/p256.h"
+#include "../crypto/ecdsa.h"
 #include "../crypto/hmac.h"
 #include "../crypto/hkdf.h"
 #include "../crypto/chacha20.h"
@@ -434,6 +436,48 @@ static void test_x25519(void) {
     x25519(shared_b, bob_priv, alice_pub);
     check_eq("Alice shared secret", shared_a, want_shared, 32);
     check_eq("Bob   shared secret", shared_b, want_shared, 32);
+}
+
+/* ============================================================== */
+/* ECDSA P-256 — RFC 6979 §A.2.5 test vectors.                    */
+/* ============================================================== */
+static void test_ecdsa_p256(void) {
+    printf("== ECDSA P-256 (RFC 6979) ==\n");
+    uint8_t one[32] = {0};
+    uint8_t xy[64], want_xy[64];
+    one[31] = 1;
+    unhex("6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296"
+          "4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5",
+          want_xy, sizeof(want_xy));
+    if (p256_scalar_mul_base(one, xy) == 0) check_eq("k=1 gives P-256 base point", xy, want_xy, 64);
+    else { printf("  FAIL: p256_scalar_mul_base(k=1)\n"); g_fail++; }
+
+    uint8_t priv[32], r[32], s[32], want_r[32], want_s[32];
+    unhex("C9AFA9D845BA75166B5C215767B1D6934E50C3DB36E89B127B8A622B120F6721",
+          priv, sizeof(priv));
+
+    unhex("EFD48B2AACB6A8FD1140DD9CD45E81D69D2C877B56AAF991C34D0EA84EAF3716",
+          want_r, sizeof(want_r));
+    unhex("F7CB1C942D657C41D436C7A1B6E29F65F3E900DBB9AFF4064DC4AB2F843ACDA8",
+          want_s, sizeof(want_s));
+    if (ecdsa_p256_sha256_sign(priv, (const uint8_t*)"sample", 6, r, s) == 0) {
+        check_eq("RFC6979 P-256/SHA-256 sample r", r, want_r, 32);
+        check_eq("RFC6979 P-256/SHA-256 sample s", s, want_s, 32);
+    } else { printf("  FAIL: ECDSA sign sample\n"); g_fail++; }
+
+    unhex("F1ABB023518351CD71D881567B1EA663ED3EFCF6C5132B354F28D3B0B7D38367",
+          want_r, sizeof(want_r));
+    unhex("019F4113742A2B14BD25926B49C649155F267E60D3814B4C0CC84250E46F0083",
+          want_s, sizeof(want_s));
+    if (ecdsa_p256_sha256_sign(priv, (const uint8_t*)"test", 4, r, s) == 0) {
+        check_eq("RFC6979 P-256/SHA-256 test r", r, want_r, 32);
+        check_eq("RFC6979 P-256/SHA-256 test s", s, want_s, 32);
+    } else { printf("  FAIL: ECDSA sign test\n"); g_fail++; }
+
+    uint8_t der[72];
+    int der_len = ecdsa_p256_encode_der(want_r, want_s, der, sizeof(der));
+    if (der_len > 0 && der[0] == 0x30) { printf("  PASS: DER encoding produced %d bytes\n", der_len); g_pass++; }
+    else { printf("  FAIL: DER encoding\n"); g_fail++; }
 }
 
 /* ============================================================== */
@@ -2322,6 +2366,53 @@ static void test_tls13_build_messages(void) {
              { printf("  PASS: Finished rejects undersized buf\n"); g_pass++; }
         else { printf("  FAIL: Finished accepted undersized buf\n"); g_fail++; }
     }
+
+    /* NewSessionTicket: max_early_data == 0 -> empty extensions; > 0
+     * -> single early_data extension carrying max_early_data_size. */
+    {
+        const uint8_t nonce[4]  = { 0x01, 0x02, 0x03, 0x04 };
+        const uint8_t tid[8]    = { 0xa0, 0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7 };
+        uint8_t buf[128];
+
+        int n0 = tls13_build_new_session_ticket(buf, sizeof(buf),
+                                                7200, 0xdeadbeef,
+                                                nonce, sizeof(nonce),
+                                                tid,   sizeof(tid),
+                                                0u);
+        /* Wire: hdr(4) + lifetime(4) + age_add(4) + nonce_len(1)
+         *     + nonce(4) + id_len(2) + id(8) + ext_block_len(2). */
+        size_t exp0 = 4 + 4 + 4 + 1 + 4 + 2 + 8 + 2;
+        if (n0 == (int)exp0 && buf[0] == 0x04
+            && buf[n0 - 2] == 0x00 && buf[n0 - 1] == 0x00)
+             { printf("  PASS: NST max_early_data=0 -> empty exts\n"); g_pass++; }
+        else { printf("  FAIL: NST(0) n=%d exp=%zu last=%02x%02x\n",
+                      n0, exp0, buf[n0 - 2], buf[n0 - 1]); g_fail++; }
+
+        int n1 = tls13_build_new_session_ticket(buf, sizeof(buf),
+                                                7200, 0xdeadbeef,
+                                                nonce, sizeof(nonce),
+                                                tid,   sizeof(tid),
+                                                4096u);
+        /* Adds 8 bytes: ext_type(2)+ext_len(2)+max_early_data_size(4). */
+        size_t exp1 = exp0 + 8;
+        const uint8_t* eb = buf + n1 - 10;   /* ext_block_len + 8 ext bytes */
+        if (n1 == (int)exp1
+            && eb[0] == 0x00 && eb[1] == 0x08             /* exts block len */
+            && eb[2] == 0x00 && eb[3] == 0x2a             /* type=early_data*/
+            && eb[4] == 0x00 && eb[5] == 0x04             /* ext_len=4      */
+            && eb[6] == 0x00 && eb[7] == 0x00
+            && eb[8] == 0x10 && eb[9] == 0x00)            /* 4096 = 0x1000  */
+             { printf("  PASS: NST max_early_data=4096 -> early_data ext\n"); g_pass++; }
+        else { printf("  FAIL: NST(4096) n=%d exp=%zu\n", n1, exp1); g_fail++; }
+
+        /* Truncated buf must be rejected for the larger payload. */
+        if (tls13_build_new_session_ticket(buf, exp1 - 1, 7200, 0,
+                                           nonce, sizeof(nonce),
+                                           tid,   sizeof(tid),
+                                           4096u) == -1)
+             { printf("  PASS: NST rejects undersized buf\n"); g_pass++; }
+        else { printf("  FAIL: NST accepted undersized buf\n"); g_fail++; }
+    }
 }
 
 /* ============================================================== */
@@ -4181,6 +4272,7 @@ static void test_engine_handshake_roundtrip(void) {
         if (pw_tls_engine_emit_session_ticket(eng, 7200, 0xdeadbeef,
                                               nonce, sizeof(nonce),
                                               tid,   sizeof(tid),
+                                              0,     /* max_early_data: NST without early_data ext */
                                               derived_psk) != 0)
              { printf("  FAIL: emit_session_ticket\n"); g_fail++; free(eng); return; }
         printf("  PASS: pw_tls_engine_emit_session_ticket OK\n"); g_pass++;
@@ -5454,6 +5546,7 @@ int main(void) {
     test_poly1305();
     test_aead_chacha20_poly1305();
     test_x25519();
+    test_ecdsa_p256();
     test_ed25519();
     test_tls13_keysched();
     test_tls13_record();

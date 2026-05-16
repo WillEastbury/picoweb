@@ -110,6 +110,50 @@ static inline uint32_t metrics_bucket_for_tsc(uint64_t delta_tsc) {
     return b;
 }
 
+/* ===========================================================
+ * Per-stage timing
+ *
+ * Eight named stages are accumulated globally (sum_ticks, count,
+ * max_ticks). Single worker today; relaxed atomics make this safe
+ * to extend to multi-worker without revisiting hot-path code.
+ *
+ * Exposed in /stats as <stage>_avg_us. Stage IDs are stable —
+ * /stats consumers depend on field order and width.
+ * =========================================================== */
+
+enum {
+    METRICS_STAGE_TLS_RX     = 0,  /* rx_buf -> rx_ack -> step setup     */
+    METRICS_STAGE_TLS_STEP   = 1,  /* pw_tls_step (handshake or NOP)     */
+    METRICS_STAGE_TLS_PARSE  = 2,  /* HTTP request parse over plaintext  */
+    METRICS_STAGE_TLS_BUILD  = 3,  /* build_http_response_iov            */
+    METRICS_STAGE_TLS_SEAL   = 4,  /* pw_tls_app_seal_iov                */
+    METRICS_STAGE_TLS_NST    = 5,  /* maybe_emit_session_ticket          */
+    METRICS_STAGE_TLS_TX     = 6,  /* tx_buf copy + tx_ack               */
+    METRICS_STAGE_COUNT      = 7,
+};
+
+typedef struct {
+    uint64_t sum_ticks;
+    uint64_t count;
+    uint64_t max_ticks;
+    char     _pad[40];
+} __attribute__((aligned(64))) metric_stage_t;
+
+extern metric_stage_t g_stages[METRICS_STAGE_COUNT];
+
+static inline void metrics_stage_add(int s, uint64_t delta_tsc) {
+    metric_stage_t* st = &g_stages[s];
+    __atomic_add_fetch(&st->sum_ticks, delta_tsc, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&st->count,     1,         __ATOMIC_RELAXED);
+    uint64_t prev = __atomic_load_n(&st->max_ticks, __ATOMIC_RELAXED);
+    while (delta_tsc > prev &&
+           !__atomic_compare_exchange_n(&st->max_ticks, &prev, delta_tsc,
+                                        false,
+                                        __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
+        /* prev was reloaded by CAS; loop. */
+    }
+}
+
 /* Hot-path: record one request. Caller passes its per-worker metrics. */
 static inline void metrics_record(metrics_t* m,
                                   uint64_t start_tsc, uint64_t end_tsc) {

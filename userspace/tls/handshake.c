@@ -12,9 +12,12 @@
 #include "handshake.h"
 
 #include <string.h>
+#include <stdio.h>
 #include "../crypto/ed25519.h"
+#include "../crypto/ecdsa.h"
 #include "../crypto/hkdf.h"
 #include "../crypto/hmac.h"
+#include "../crypto/p256.h"
 #include "../crypto/rsa.h"
 #include "../crypto/sha256.h"
 #include "../crypto/util.h"
@@ -586,12 +589,16 @@ int tls13_build_new_session_ticket(uint8_t* out, size_t out_cap,
                                    const uint8_t* ticket_nonce,
                                    size_t nonce_len,
                                    const uint8_t* ticket_id,
-                                   size_t id_len) {
+                                   size_t id_len,
+                                   uint32_t max_early_data) {
     if (!out || !ticket_nonce || !ticket_id) return -1;
     if (nonce_len == 0 || nonce_len > 255)   return -1;
     if (id_len    == 0 || id_len    > 0xffff) return -1;
-    /* body = 4 + 4 + 1 + nonce + 2 + id + 2 (empty exts) */
-    size_t body = 4 + 4 + 1 + nonce_len + 2 + id_len + 2;
+    /* Optional early_data NST extension (RFC 8446 §4.6.1):
+     *   ext_type(2) + ext_len(2) + max_early_data_size(4) = 8 bytes. */
+    size_t ext_block = (max_early_data > 0) ? 8u : 0u;
+    /* body = 4 + 4 + 1 + nonce + 2 + id + 2 + ext_block */
+    size_t body = 4 + 4 + 1 + nonce_len + 2 + id_len + 2 + ext_block;
     if (body > 0xffffffu)   return -1;
     if (out_cap < 4 + body) return -1;
 
@@ -618,8 +625,17 @@ int tls13_build_new_session_ticket(uint8_t* out, size_t out_cap,
     *p++ = (uint8_t)( id_len       & 0xff);
     memcpy(p, ticket_id, id_len); p += id_len;
 
-    /* Empty extensions block. */
-    *p++ = 0x00; *p++ = 0x00;
+    /* Extensions block: either empty or a single early_data extension. */
+    *p++ = (uint8_t)((ext_block >> 8) & 0xff);
+    *p++ = (uint8_t)( ext_block       & 0xff);
+    if (ext_block) {
+        *p++ = 0x00; *p++ = 0x2a;                 /* type = early_data (42) */
+        *p++ = 0x00; *p++ = 0x04;                 /* extension length = 4   */
+        *p++ = (uint8_t)((max_early_data >> 24) & 0xff);
+        *p++ = (uint8_t)((max_early_data >> 16) & 0xff);
+        *p++ = (uint8_t)((max_early_data >>  8) & 0xff);
+        *p++ = (uint8_t)( max_early_data        & 0xff);
+    }
 
     return (int)(p - out);
 }
@@ -783,6 +799,24 @@ static int emsa_pss_encode_sha256(const uint8_t mhash[32],
     return 0;
 }
 
+static int ecdsa_p256_private_scalar_from_der(const uint8_t* der, size_t der_len,
+                                              uint8_t out_priv[32]) {
+    if (!der || !out_priv || der_len < 34) return -1;
+    static const uint8_t p256_oid[] = {
+        0x06,0x08,0x2a,0x86,0x48,0xce,0x3d,0x03,0x01,0x07
+    };
+    if (!memmem(der, der_len, p256_oid, sizeof(p256_oid))) return -1;
+    for (size_t i = 0; i + 34 <= der_len; i++) {
+        if (der[i] == 0x04 && der[i + 1] == 0x20) {
+            memcpy(out_priv, der + i + 2, 32);
+            uint8_t pub[65];
+            if (p256_derive_pubkey(out_priv, pub) == 0) return 0;
+        }
+    }
+    secure_zero(out_priv, 32);
+    return -1;
+}
+
 int tls13_build_certificate_verify_ex(uint8_t* out, size_t out_cap,
                                       const uint8_t transcript_hash[32],
                                       uint16_t sig_scheme,
@@ -828,6 +862,21 @@ int tls13_build_certificate_verify_ex(uint8_t* out, size_t out_cap,
             return -1;
         }
 
+        /* Self-check: verify sig^65537 mod n == em */
+        {
+            int vrc = pw_rsa_self_check(&rk, em, rk.n_len, sig, rk.n_len);
+            if (vrc != 0) {
+                fprintf(stderr, "RSA-PSS self-check FAILED: rc=%d n_len=%zu\n",
+                        vrc, rk.n_len);
+                secure_zero(&rk, sizeof(rk));
+                secure_zero(signed_data, sizeof(signed_data));
+                secure_zero(mhash, sizeof(mhash));
+                secure_zero(em, sizeof(em));
+                secure_zero(sig, sizeof(sig));
+                return -1;
+            }
+        }
+
         size_t sig_len = rk.n_len;
         size_t wire_len = 4u + 2u + 2u + sig_len;
         if (wire_len > out_cap || sig_len > 0xffffu) {
@@ -855,6 +904,60 @@ int tls13_build_certificate_verify_ex(uint8_t* out, size_t out_cap,
         secure_zero(mhash, sizeof(mhash));
         secure_zero(em, sizeof(em));
         secure_zero(sig, sizeof(sig));
+        return (int)(p - out);
+    }
+    if (sig_scheme == TLS13_SIG_SCHEME_ECDSA_SECP256R1_SHA256) {
+        if (!out || !transcript_hash || !key_der || key_der_len == 0) return -1;
+        uint8_t priv[32];
+        if (ecdsa_p256_private_scalar_from_der(key_der, key_der_len, priv) != 0) return -1;
+
+        uint8_t signed_data[TLS13_CV_SIGNED_LEN];
+        if (tls13_build_certificate_verify_signed_data(signed_data, transcript_hash, 1) != 0) {
+            secure_zero(priv, sizeof(priv));
+            return -1;
+        }
+
+        uint8_t r[32], s[32], der[72];
+        if (ecdsa_p256_sha256_sign(priv, signed_data, sizeof(signed_data), r, s) != 0) {
+            secure_zero(priv, sizeof(priv));
+            secure_zero(signed_data, sizeof(signed_data));
+            return -1;
+        }
+        int der_len_i = ecdsa_p256_encode_der(r, s, der, sizeof(der));
+        if (der_len_i <= 0) {
+            secure_zero(priv, sizeof(priv));
+            secure_zero(signed_data, sizeof(signed_data));
+            secure_zero(r, sizeof(r));
+            secure_zero(s, sizeof(s));
+            return -1;
+        }
+        size_t sig_len = (size_t)der_len_i;
+        size_t wire_len = 4u + 2u + 2u + sig_len;
+        if (wire_len > out_cap) {
+            secure_zero(priv, sizeof(priv));
+            secure_zero(signed_data, sizeof(signed_data));
+            secure_zero(r, sizeof(r));
+            secure_zero(s, sizeof(s));
+            secure_zero(der, sizeof(der));
+            return -1;
+        }
+        uint8_t* p = out;
+        *p++ = 0x0f;
+        uint32_t body_len = (uint32_t)(2u + 2u + sig_len);
+        *p++ = (uint8_t)(body_len >> 16);
+        *p++ = (uint8_t)(body_len >> 8);
+        *p++ = (uint8_t)(body_len);
+        *p++ = (uint8_t)(sig_scheme >> 8);
+        *p++ = (uint8_t)(sig_scheme & 0xff);
+        *p++ = (uint8_t)(sig_len >> 8);
+        *p++ = (uint8_t)(sig_len);
+        memcpy(p, der, sig_len);
+        p += sig_len;
+        secure_zero(priv, sizeof(priv));
+        secure_zero(signed_data, sizeof(signed_data));
+        secure_zero(r, sizeof(r));
+        secure_zero(s, sizeof(s));
+        secure_zero(der, sizeof(der));
         return (int)(p - out);
     }
     return -1;

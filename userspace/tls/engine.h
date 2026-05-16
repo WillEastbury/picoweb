@@ -42,10 +42,15 @@
 #include "handshake.h"
 #include "record.h"
 
-/* Per-direction buffer cap. Sized for one full TLS record on the
- * wire (header + max ciphertext). Same number for all four ports
- * keeps the engine struct trivially aligned and predictable. */
+/* RX + APP buffer cap. Sized for one full TLS record on the wire
+ * (header + max ciphertext), which is also enough for request
+ * plaintext in this server. */
 #define PW_TLS_BUF_CAP  (TLS13_RECORD_HEADER_LEN + TLS13_MAX_CIPHERTEXT)
+
+/* TX buffer cap. Must be large enough to queue multi-record responses
+ * in one engine turn because the caller is not guaranteed callbacks on
+ * pure ACK traffic. */
+#define PW_TLS_TX_BUF_CAP (96u * 1024u)
 
 /* Maximum size of the Certificate handshake message the engine will
  * build (includes the 4-byte handshake header). 8 KiB is more than
@@ -116,7 +121,7 @@ typedef struct pw_tls_engine {
     size_t   rx_len;
 
     /* Outbound ciphertext (post-AEAD, pre-TCP). */
-    uint8_t  tx_buf[PW_TLS_BUF_CAP];
+    uint8_t  tx_buf[PW_TLS_TX_BUF_CAP];
     size_t   tx_len;
 
     /* Inbound plaintext (post-AEAD-open, the application will read). */
@@ -317,6 +322,12 @@ int  pw_tls_engine_early_data_accepted(const pw_tls_engine_t* eng);
  * lifetime_s, issued_at_ms) externally; this function does NOT
  * touch any store.
  *
+ * If `max_early_data` > 0, the NST advertises the `early_data`
+ * extension to the client so that subsequent resumptions may carry
+ * 0-RTT application data (RFC 8446 §4.6.1, §4.2.10). The same value
+ * MUST be passed to pw_tls_ticket_store_insert() for the ticket so
+ * server-side acceptance limits match what the client was promised.
+ *
  * Per-ticket PSK is derived as
  *   PSK = HKDF-Expand-Label(RMS, "resumption", ticket_nonce, 32)
  * and written into `out_psk` for the caller to insert into its store.
@@ -329,6 +340,7 @@ int pw_tls_engine_emit_session_ticket(pw_tls_engine_t* eng,
                                       size_t nonce_len,
                                       const uint8_t* ticket_id,
                                       size_t id_len,
+                                      uint32_t max_early_data,
                                       uint8_t out_psk[32]);
 
 /* ---------- state introspection ---------- */
@@ -380,8 +392,8 @@ int pw_tls_app_out_push(pw_tls_engine_t* eng,
  *
  * Constraints:
  *   - engine state must be PW_TLS_ST_APP (handshake is complete)
- *   - sum(iov[i].len) <= TLS13_MAX_PLAINTEXT
- *   - TX must have room for header + plaintext + 1 (type) + AEAD tag
+ *   - TX must have room for all records generated from the iov payload
+ *     (records are chunked at TLS13_MAX_PLAINTEXT)
  *
  * Returns 0 on success, -1 on bad state / overflow / seal failure. */
 int pw_tls_app_seal_iov(pw_tls_engine_t* eng,

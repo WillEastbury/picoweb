@@ -11,6 +11,7 @@
 typedef struct {
     int fd;
     int ifindex;
+    int xdp_map_fd;  /* XSKMAP fd for XDP redirect, or -1 */
     uint32_t queue_id;
 
     uint8_t local_mac[6];

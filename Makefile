@@ -19,6 +19,7 @@ USERSPACE_TLS_SRC := \
 	userspace/tcp/tcp.c \
 	userspace/io/af_packet.c \
 	userspace/io/af_xdp.c \
+	userspace/xdp/xdp_loader.c \
 	userspace/crypto/util.c \
 	userspace/crypto/cpuid.c \
 	userspace/crypto/sha256.c \
@@ -27,6 +28,8 @@ USERSPACE_TLS_SRC := \
 	userspace/crypto/sha512.c \
 	userspace/crypto/ed25519.c \
 	userspace/crypto/rsa.c \
+	userspace/crypto/p256.c \
+	userspace/crypto/ecdsa.c \
 	userspace/crypto/hmac.c \
 	userspace/crypto/hkdf.c \
 	userspace/crypto/chacha20.c \
@@ -70,4 +73,4 @@ run: $(BIN)
 	./$(BIN) 8080 wwwroot
 
 clean:
-	rm -f src/*.o picoweb picoweb_uring
+	rm -f src/*.o userspace/**/*.o userspace/**/**/*.o picoweb picoweb_uring

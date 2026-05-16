@@ -31,6 +31,17 @@ int af_packet_open(af_packet_t* a, const char* ifname,
                    const uint8_t local_mac[6],
                    const uint8_t peer_mac[6]);
 
+/* Install a classic-BPF filter that accepts only IPv4 TCP frames whose
+ * IP destination equals local_ip (network byte order) and whose TCP
+ * destination port equals dst_port (host byte order). All other
+ * frames are dropped in-kernel before reaching userspace. Also
+ * disables PACKET_IGNORE_OUTGOING reflection so we don't RX our own
+ * transmits. Returns 0 on success, -1 on error. Safe to call once
+ * after open(). */
+int af_packet_install_filter(af_packet_t* a,
+                             uint32_t local_ip_be,
+                             uint16_t dst_port_host);
+
 /* Receive next frame; returns L3 (IPv4) start pointer + length, or
  * -1 on error / non-IPv4 frame. The caller's buffer must be at
  * least 1518 bytes. *csum_not_ready is set to 1 when the kernel

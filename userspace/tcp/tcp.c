@@ -13,6 +13,7 @@
 
 #include "tcp.h"
 
+#include <stdio.h>
 #include <string.h>
 
 static void rtx_on_ack(tcp_conn_t* c, uint32_t ack_no, uint64_t now_ms);
@@ -276,31 +277,35 @@ void tcp_input_at(tcp_stack_t* s, const tcp_seg_t* seg,
                   uint64_t now_ms,
                   tcp_on_data_fn on_data, void* on_data_user,
                   tcp_emit_fn emit, void* emit_user) {
-    /* Reject if not addressed to our local IP. */
+    /* Reject if not addressed to our local IP. Silently drop — these
+     * are stray packets from in-kernel filter races / unfiltered
+     * backends; sending a RST to a third party is wrong, and the
+     * fprintf was a hot-path stall under bursty cluster traffic. */
     if (seg->dst_ip != s->local_ip) {
-        emit_rst(seg, emit, emit_user);
         return;
     }
 
-    /* Port accept check (dispatch lookup or single-port match). */
+    /* Port accept check (dispatch lookup or single-port match). Same
+     * reasoning as above — drop, don't RST or log. */
     const pw_service_t* svc = NULL;
     int port_ok = port_accepts(s, seg->dst_port, &svc);
     if (!port_ok) {
-        emit_rst(seg, emit, emit_user);
         return;
     }
 
     tcp_conn_t* c = find_conn(s, seg);
 
     /* No matching PCB. If it's a SYN, allocate one and move to
-     * SYN-RECEIVED; otherwise RST. */
+     * SYN-RECEIVED; otherwise drop silently. (RFC 793 says RST,
+     * but in practice these are almost always stray ACKs from
+     * torn-down sessions or scanner traffic — RSTing them costs
+     * a syscall per packet and tells scanners we're alive.) */
     if (!c) {
         if (!(seg->flags & TCPF_SYN) || (seg->flags & TCPF_ACK)) {
-            emit_rst(seg, emit, emit_user);
             return;
         }
         c = alloc_conn(s);
-        if (!c) { emit_rst(seg, emit, emit_user); return; }
+        if (!c) { return; }
         c->state       = TCP_SYN_RECEIVED;
         c->local_ip    = seg->dst_ip;
         c->remote_ip   = seg->src_ip;
@@ -666,31 +671,34 @@ int tcp_send_at(tcp_conn_t* c,
      * for back-compat. */
     if (now_ms != 0 && (uint32_t)len > tcp_send_window(c)) return -1;
     if (c->rto_ms == 0) c->rto_ms = TCP_RTO_INIT_MS;
-    /* Refresh advertised window for the outbound. */
-    c->rcv_wnd = tcp_advertised_wnd(c);
-    tcp_seg_t s = {0};
-    s.src_ip   = c->local_ip;
-    s.dst_ip   = c->remote_ip;
-    s.src_port = c->local_port;
-    s.dst_port = c->remote_port;
-    s.seq      = c->snd_nxt;
-    s.ack      = c->rcv_nxt;
-    s.flags    = TCPF_ACK | TCPF_PSH;
-    s.window   = c->rcv_wnd;
-    s.payload  = data;
-    s.payload_len = len;
-    emit(&s, emit_user);
-    if (now_ms != 0 && len > 0) {
-        /* The precondition at line ~644 already guarantees rtx_n <
-         * MAX, so this enqueue cannot fail today. Check the return
-         * anyway so a future change to the precondition can't silently
-         * orphan a sent segment with no RTO recovery path. */
-        if (rtx_enqueue(c, c->snd_nxt, (uint32_t)len, data,
-                        TCPF_ACK | TCPF_PSH, now_ms) != 0) {
-            return -1;
+
+    /* Segment the payload into MSS-sized chunks. */
+    size_t sent = 0;
+    while (sent < len) {
+        size_t chunk = len - sent;
+        if (chunk > TCP_MSS) chunk = TCP_MSS;
+        c->rcv_wnd = tcp_advertised_wnd(c);
+        tcp_seg_t s = {0};
+        s.src_ip   = c->local_ip;
+        s.dst_ip   = c->remote_ip;
+        s.src_port = c->local_port;
+        s.dst_port = c->remote_port;
+        s.seq      = c->snd_nxt;
+        s.ack      = c->rcv_nxt;
+        s.flags    = TCPF_ACK | ((sent + chunk >= len) ? TCPF_PSH : 0);
+        s.window   = c->rcv_wnd;
+        s.payload  = data + sent;
+        s.payload_len = chunk;
+        emit(&s, emit_user);
+        if (now_ms != 0 && chunk > 0) {
+            if (rtx_enqueue(c, c->snd_nxt, (uint32_t)chunk, data + sent,
+                            s.flags, now_ms) != 0) {
+                return -1;
+            }
         }
+        c->snd_nxt += (uint32_t)chunk;
+        sent += chunk;
     }
-    c->snd_nxt += (uint32_t)len;
     return (int)len;
 }
 

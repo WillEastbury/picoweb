@@ -27,12 +27,22 @@
 #include "../userspace/tls/cert.h"
 #include "../userspace/tls/engine.h"
 #include "../userspace/tls/pem.h"
+#include "../userspace/tls/ticket_store.h"
 #include "tls_bridge.h"
+#include "metrics.h"
 #include "util.h"
 
 /* Shared connection-tail bytes (same semantics as epoll backend). */
 static const uint8_t CONN_KA[]    = "\r\n";
 static const uint8_t CONN_CLOSE[] = "Connection: close\r\n\r\n";
+
+/* TLS 1.3 session-resumption / 0-RTT tuning (see upstream PR for
+ * rationale). MAX_EARLY <= sizeof(tls_conn_state_t.plain) so a 0-RTT
+ * GET cannot overflow the per-connection plaintext buffer. */
+#define PW_TLS_TICKET_LIFETIME_S    7200u
+#define PW_TLS_TICKET_MAX_EARLY     4096u
+#define PW_TLS_TICKET_ID_LEN        32u
+#define PW_TLS_TICKET_NONCE_LEN     16u
 
 typedef struct tls_worker_ctx tls_worker_ctx_t;
 
@@ -41,11 +51,12 @@ typedef struct {
     uint32_t   req_count;
     size_t     plain_len;
     char       plain[8192];
-    uint8_t    tx_stage[PW_TLS_BUF_CAP];
+    uint8_t    tx_stage[PW_TLS_TX_BUF_CAP];
     size_t     tx_stage_len;
     tls_worker_ctx_t* w;
     tls_bridge_t bridge;
     pw_tls_engine_t eng;
+    int        ticket_emitted;
 } tls_conn_state_t;
 
 struct tls_worker_ctx {
@@ -56,6 +67,7 @@ struct tls_worker_ctx {
     tcp_stack_t stack;
     pw_dispatch_t dispatch;
     tls_conn_state_t conns[TCP_TABLE_SIZE];
+    pw_tls_ticket_store_t ticket_store;
 
     uint8_t* cert_chain_der;
     size_t   cert_chain_len;
@@ -156,6 +168,10 @@ static int load_cert_material(tls_worker_ctx_t* w) {
                              key_der, key_pem_len);
     int is_pkcs1_rsa = 0;
     if (key_len <= 0) {
+        key_len = pem_decode((const char*)key_pem, key_pem_len, "EC PRIVATE KEY",
+                             key_der, key_pem_len);
+    }
+    if (key_len <= 0) {
         key_len = pem_decode((const char*)key_pem, key_pem_len, "RSA PRIVATE KEY",
                              key_der, key_pem_len);
         if (key_len > 0) is_pkcs1_rsa = 1;
@@ -172,6 +188,8 @@ static int load_cert_material(tls_worker_ctx_t* w) {
         w->cert_sig_scheme = TLS13_SIG_SCHEME_ED25519;
     } else if (w->key_type == CERT_KEY_RSA) {
         w->cert_sig_scheme = TLS13_SIG_SCHEME_RSA_PSS_RSAE_SHA256;
+    } else if (w->key_type == CERT_KEY_ECDSA_P256) {
+        w->cert_sig_scheme = TLS13_SIG_SCHEME_ECDSA_SECP256R1_SHA256;
     }
 
     w->cert_chain_der = chain;
@@ -207,7 +225,10 @@ static int if_ipv4_addr(const char* ifname, uint32_t* out_ip_be) {
         if (!p->ifa_addr || p->ifa_addr->sa_family != AF_INET) continue;
         if (strcmp(p->ifa_name, ifname) != 0) continue;
         struct sockaddr_in* sin = (struct sockaddr_in*)p->ifa_addr;
-        *out_ip_be = sin->sin_addr.s_addr;
+        /* rd32() in ip.c reads addresses as big-endian uint32; s_addr is
+         * in network byte order (same bytes, different uint32 on LE).
+         * ntohl converts so the uint32 values match. */
+        *out_ip_be = ntohl(sin->sin_addr.s_addr);
         ok = 0;
         break;
     }
@@ -316,6 +337,41 @@ static int build_http_response_iov(tls_conn_state_t* c,
     return 0;
 }
 
+/* Emit a sealed HTTP/1.1 103 Early Hints record for `req` if the
+ * resource has a precomputed Link header and the request would not
+ * be answered with a 304 or HEAD-only response. Best-effort: any
+ * failure (e.g. tx-buf pressure) is a silent no-op — clients still
+ * receive the same Link headers in the final 200. */
+static void maybe_seal_103(tls_conn_state_t* c,
+                           http_result_t pr, http_request_t* req) {
+    tls_worker_ctx_t* w = c->w;
+    if (!w || !w->cfg || !w->cfg->http_early_hints) return;
+    if (pr != HTTP_OK) return;
+    if (req->method != M_GET) return;
+
+    bool ca = false, ho = false;
+    const resource_t* r = http_select(w->cfg->jt, pr, req, &ca, &ho);
+    if (!r || ho || !r->link_hdr || r->link_hdr_len == 0) return;
+
+    if (req->if_none_match) {
+        const char* etag = NULL;
+        if (req->accept_br && r->brotli)            etag = r->brotli->etag;
+        else if (req->accept_pc && r->compressed)   etag = r->compressed->etag;
+        else if (r->etag[0] != '\0')                etag = r->etag;
+        if (etag && etag_matches(req->if_none_match,
+                                 req->if_none_match_len, etag)) return;
+    }
+
+    static const char status[] = "HTTP/1.1 103 Early Hints\r\n";
+    static const char term[]   = "\r\n";
+    pw_iov_t iov[3] = {
+        { .base = (const uint8_t*)status, .len = sizeof(status) - 1 },
+        { .base = (const uint8_t*)r->link_hdr, .len = r->link_hdr_len },
+        { .base = (const uint8_t*)term, .len = sizeof(term) - 1 },
+    };
+    (void)pw_tls_app_seal_iov(&c->eng, iov, 3);
+}
+
 static void* tls_on_open(void* svc_state, const pw_conn_info_t* info) {
     (void)info;
     svc_state_t* s = (svc_state_t*)svc_state;
@@ -339,6 +395,7 @@ static void* tls_on_open(void* svc_state, const pw_conn_info_t* info) {
             c->in_use = 0;
             return NULL;
         }
+        pw_tls_engine_attach_resumption(&c->eng, &w->ticket_store);
         return c;
     }
     return NULL;
@@ -350,6 +407,56 @@ static void tls_on_close(void* per_conn_state) {
     memset(c, 0, sizeof(*c));
 }
 
+/* Volatile-write zero (the vendored tree dropped secure_memzero from
+ * server_tls.c — define a tiny inline equivalent for the per-ticket
+ * PSK we hand to the store and the engine). */
+static inline void psk_wipe(uint8_t buf[32]) {
+    volatile uint8_t* v = (volatile uint8_t*)buf;
+    for (size_t i = 0; i < 32; i++) v[i] = 0;
+}
+
+/* If state==APP and we have not yet issued a NewSessionTicket on this
+ * connection, derive a fresh ticket and seal it into the TX buffer.
+ * Best-effort: any failure leaves ticket_emitted=0 so a future call
+ * may retry. Called AFTER the HTTP response has been sealed so a
+ * tight TX budget gets spent on user-visible bytes first. */
+static void maybe_emit_session_ticket(tls_conn_state_t* c) {
+    if (c->ticket_emitted) return;
+    if (pw_tls_state(&c->eng) != PW_TLS_ST_APP) return;
+
+    uint8_t ticket_id[PW_TLS_TICKET_ID_LEN];
+    uint8_t nonce[PW_TLS_TICKET_NONCE_LEN];
+    uint8_t age_add_buf[4];
+    uint8_t psk[32];
+
+    if (rng_fill(NULL, ticket_id,   sizeof(ticket_id))   != 0) return;
+    if (rng_fill(NULL, nonce,       sizeof(nonce))       != 0) return;
+    if (rng_fill(NULL, age_add_buf, sizeof(age_add_buf)) != 0) return;
+    uint32_t age_add = ((uint32_t)age_add_buf[0] << 24) |
+                       ((uint32_t)age_add_buf[1] << 16) |
+                       ((uint32_t)age_add_buf[2] <<  8) |
+                       ((uint32_t)age_add_buf[3]);
+
+    if (pw_tls_engine_emit_session_ticket(&c->eng,
+                                          PW_TLS_TICKET_LIFETIME_S,
+                                          age_add,
+                                          nonce,     sizeof(nonce),
+                                          ticket_id, sizeof(ticket_id),
+                                          PW_TLS_TICKET_MAX_EARLY,
+                                          psk) != 0) {
+        psk_wipe(psk);
+        return;
+    }
+    (void)pw_tls_ticket_store_insert(&c->w->ticket_store,
+                                     ticket_id, sizeof(ticket_id),
+                                     psk, age_add,
+                                     PW_TLS_TICKET_LIFETIME_S,
+                                     (uint64_t)metal_now_ms(),
+                                     PW_TLS_TICKET_MAX_EARLY);
+    psk_wipe(psk);
+    c->ticket_emitted = 1;
+}
+
 static pw_disp_status_t tls_on_data(void* per_conn_state,
                                     const uint8_t* data, size_t len,
                                     pw_iov_t* iov_out, unsigned iov_max,
@@ -359,78 +466,159 @@ static pw_disp_status_t tls_on_data(void* per_conn_state,
     *iov_n = 0;
     c->tx_stage_len = 0;
 
+    /* P0 per-stage timing. cntvct/rdtsc reads are <10 cycles. */
+    const uint64_t t_enter = metal_tsc();
+
     size_t cap = 0;
     uint8_t* rx = pw_tls_rx_buf(&c->eng, &cap);
-    if (len > cap) return PW_DISP_RESET;
+    if (len > cap) { fprintf(stderr, "tls: RESET len=%zu > cap=%zu\n", len, cap); return PW_DISP_RESET; }
     if (len) memcpy(rx, data, len);
-    if (pw_tls_rx_ack(&c->eng, len) != 0) return PW_DISP_RESET;
+    if (pw_tls_rx_ack(&c->eng, len) != 0) { fprintf(stderr, "tls: RESET rx_ack failed len=%zu\n", len); return PW_DISP_RESET; }
 
     pw_tls_engine_set_clock(&c->eng, (uint64_t)metal_now_ms());
-    if (pw_tls_step(&c->eng) < 0) return PW_DISP_RESET;
+    const uint64_t t_after_rx = metal_tsc();
+    metrics_stage_add(METRICS_STAGE_TLS_RX, t_after_rx - t_enter);
+    int step_rc = pw_tls_step(&c->eng);
+    if (step_rc < 0) {
+        /* DIAG: dump rxlen/cap and first 32 bytes of rx so we can tell
+         * whether the engine got a real ClientHello (starts 16 03 01/03)
+         * or garbage from the AF_XDP / userspace-TCP layer below.
+         * Throttled (first 50 + every 100th) to avoid log floods. */
+        static _Thread_local unsigned long diag_n = 0;
+        diag_n++;
+        if (diag_n <= 50 || (diag_n % 100) == 0) {
+            char hex[3 * 32 + 1];
+            size_t dump = len < 32 ? len : 32;
+            for (size_t i = 0; i < dump; i++)
+                snprintf(hex + i * 3, 4, "%02x ", rx[i]);
+            hex[dump ? dump * 3 - 1 : 0] = '\0';
+            fprintf(stderr,
+                    "tls: RESET step failed state=%d phase=%d err=%d rxlen=%zu cap=%zu n=%lu rx[0..%zu]=%s\n",
+                    c->eng.state, c->eng.hs_phase, c->eng.last_err,
+                    len, cap, diag_n, dump, hex);
+        } else {
+            fprintf(stderr, "tls: RESET step failed state=%d phase=%d err=%d rxlen=%zu (n=%lu)\n",
+                    c->eng.state, c->eng.hs_phase, c->eng.last_err, len, diag_n);
+        }
+        return PW_DISP_RESET;
+    }
+    /* Hot-path step trace removed: per-call fprintf (with stderr lock)
+     * was costing 100s of µs per request and ~1ms under any contention. */
+    metrics_stage_add(METRICS_STAGE_TLS_STEP, metal_tsc() - t_after_rx);
 
     size_t app_len = 0;
     const uint8_t* app = pw_tls_app_in_buf(&c->eng, &app_len);
     bool close_after = false;
 
+    /* Phase 1 — drain any new plaintext from app_in into c->plain.
+     * 0-RTT early data may arrive while the engine is still in
+     * PW_TLS_ST_HANDSHAKE (state only flips to APP after cFin). We
+     * accept the bytes but defer sealing until APP. */
     if (app_len > 0) {
         if (c->plain_len + app_len > sizeof(c->plain)) {
+            /* Plaintext overflow. If still in handshake (oversize 0-RTT),
+             * we cannot politely return 413 — drop the connection. With
+             * PW_TLS_TICKET_MAX_EARLY <= sizeof(c->plain) this should
+             * never trigger on the 0-RTT path. */
+            if (pw_tls_state(&c->eng) != PW_TLS_ST_APP) {
+                pw_tls_app_in_ack(&c->eng, app_len);
+                fprintf(stderr, "tls: RESET 0-RTT oversize app_len=%zu plain_len=%zu\n", app_len, c->plain_len);
+                return PW_DISP_RESET;
+            }
             http_request_t dummy = {0};
             pw_iov_t resp[PW_IOV_MAX_FRAGS];
             unsigned rn = 0;
+            const uint64_t t_b0 = metal_tsc();
             if (build_http_response_iov(c, HTTP_ERR_413, &dummy, resp, &rn, &close_after) != 0) {
                 pw_tls_app_in_ack(&c->eng, app_len);
                 return PW_DISP_RESET;
             }
+            const uint64_t t_b1 = metal_tsc();
+            metrics_stage_add(METRICS_STAGE_TLS_BUILD, t_b1 - t_b0);
             if (pw_tls_app_seal_iov(&c->eng, resp, rn) != 0) {
                 pw_tls_app_in_ack(&c->eng, app_len);
                 return PW_DISP_RESET;
             }
+            metrics_stage_add(METRICS_STAGE_TLS_SEAL, metal_tsc() - t_b1);
             c->plain_len = 0;
         } else {
             memcpy(c->plain + c->plain_len, app, app_len);
             c->plain_len += app_len;
-            tls_bridge_t* b = &c->bridge;
-            /* Parse and seal as many full requests as we can from the
-             * buffered plaintext. This prevents a pipeline stall when
-             * one TLS record carries multiple HTTP requests. */
-            while (c->plain_len > 0) {
-                int prc = tls_bridge_parse_request(b, (const uint8_t*)c->plain, c->plain_len);
-                if (prc == 0) break;   /* incomplete request, wait for more */
-
-                http_request_t req = b->req;
-                http_result_t pr = (prc == 1) ? HTTP_OK : b->parse_status;
-                pw_iov_t resp[PW_IOV_MAX_FRAGS];
-                unsigned rn = 0;
-                if (build_http_response_iov(c, pr, &req, resp, &rn, &close_after) != 0) {
-                    pw_tls_app_in_ack(&c->eng, app_len);
-                    return PW_DISP_RESET;
-                }
-
-                if (pw_tls_app_seal_iov(&c->eng, resp, rn) != 0) {
-                    /* TX buffer pressure while additional pipelined
-                     * requests are buffered. We cannot safely keep the
-                     * connection open (no callback is guaranteed on pure
-                     * ACK traffic), so flush what we already sealed and
-                     * close. */
-                    close_after = true;
-                    c->plain_len = 0;
-                    break;
-                }
-
-                if (pr == HTTP_OK && req.consumed > 0 && c->plain_len > req.consumed) {
-                    size_t left = c->plain_len - req.consumed;
-                    memmove(c->plain, c->plain + req.consumed, left);
-                    c->plain_len = left;
-                } else {
-                    c->plain_len = 0;
-                }
-
-                if (close_after) break;
-            }
         }
         pw_tls_app_in_ack(&c->eng, app_len);
     }
 
+    /* Phase 2 — parse and seal pipelined HTTP requests from c->plain.
+     * Runs whenever state==APP and we have buffered plaintext, even if
+     * no new app bytes arrived in this call. This drains 0-RTT data
+     * that was buffered in a prior tls_on_data while still HANDSHAKE,
+     * once cFin arrives in the current segment and flips state to APP. */
+    if (pw_tls_state(&c->eng) == PW_TLS_ST_APP && c->plain_len > 0) {
+        tls_bridge_t* b = &c->bridge;
+        while (c->plain_len > 0) {
+            const uint64_t t_p0 = metal_tsc();
+            int prc = tls_bridge_parse_request(b, (const uint8_t*)c->plain, c->plain_len);
+            const uint64_t t_p1 = metal_tsc();
+            metrics_stage_add(METRICS_STAGE_TLS_PARSE, t_p1 - t_p0);
+            if (prc == 0) break;   /* incomplete request, wait for more */
+
+            http_request_t req = b->req;
+            http_result_t pr = (prc == 1) ? HTTP_OK : b->parse_status;
+            pw_iov_t resp[PW_IOV_MAX_FRAGS];
+            unsigned rn = 0;
+            if (build_http_response_iov(c, pr, &req, resp, &rn, &close_after) != 0) {
+                return PW_DISP_RESET;
+            }
+            const uint64_t t_p2 = metal_tsc();
+            metrics_stage_add(METRICS_STAGE_TLS_BUILD, t_p2 - t_p1);
+
+            /* Best-effort interim 103 Early Hints record. Sealed
+             * separately so the client parser sees a distinct status
+             * line ahead of the 200. */
+            maybe_seal_103(c, pr, &req);
+
+            if (pw_tls_app_seal_iov(&c->eng, resp, rn) != 0) {
+                /* TX buffer pressure while additional pipelined
+                 * requests are buffered. We cannot safely keep the
+                 * connection open (no callback is guaranteed on pure
+                 * ACK traffic), so flush what we already sealed and
+                 * close. */
+                close_after = true;
+                c->plain_len = 0;
+                break;
+            }
+            const uint64_t t_p3 = metal_tsc();
+            metrics_stage_add(METRICS_STAGE_TLS_SEAL, t_p3 - t_p2);
+
+            /* End-to-end per-request latency: parse start through seal
+             * end. Pipelined requests each get their own sample. */
+            if (g_worker_metrics) {
+                metrics_record(g_worker_metrics, t_p0, t_p3);
+            }
+
+            if (pr == HTTP_OK && req.consumed > 0 && c->plain_len > req.consumed) {
+                size_t left = c->plain_len - req.consumed;
+                memmove(c->plain, c->plain + req.consumed, left);
+                c->plain_len = left;
+            } else {
+                c->plain_len = 0;
+            }
+
+            if (close_after) break;
+        }
+    }
+
+    /* Phase 3 — once the response (if any) has been sealed, emit a
+     * NewSessionTicket so future connections can resume (and, since
+     * MAX_EARLY > 0, carry 0-RTT). After response sealing so the NST
+     * cannot starve the user-visible response of TX buffer space. */
+    if (!close_after) {
+        const uint64_t t_n0 = metal_tsc();
+        maybe_emit_session_ticket(c);
+        metrics_stage_add(METRICS_STAGE_TLS_NST, metal_tsc() - t_n0);
+    }
+
+    const uint64_t t_before_tx = metal_tsc();
     size_t tx_len = 0;
     const uint8_t* tx = pw_tls_tx_buf(&c->eng, &tx_len);
     if (tx_len > 0) {
@@ -441,8 +629,10 @@ static pw_disp_status_t tls_on_data(void* per_conn_state,
         iov_out[0].base = c->tx_stage;
         iov_out[0].len = c->tx_stage_len;
         *iov_n = 1;
+        metrics_stage_add(METRICS_STAGE_TLS_TX, metal_tsc() - t_before_tx);
         return close_after ? PW_DISP_OUTPUT_AND_CLOSE : PW_DISP_OUTPUT;
     }
+    metrics_stage_add(METRICS_STAGE_TLS_TX, metal_tsc() - t_before_tx);
     return PW_DISP_NO_OUTPUT;
 }
 
@@ -458,15 +648,17 @@ void* tls_worker_main(void* arg) {
     if (!w) metal_die("tls_worker_main: OOM allocating worker context");
     w->cfg = cfg;
     for (unsigned i = 0; i < TCP_TABLE_SIZE; i++) w->conns[i].in_use = 0;
+    pw_tls_ticket_store_init(&w->ticket_store);
 
     if (load_cert_material(w) != 0) {
         metal_die("tls_worker_main: failed loading TLS cert/key");
     }
-    if (w->key_type != CERT_KEY_ED25519 && w->key_type != CERT_KEY_RSA) {
+    if (w->key_type != CERT_KEY_ED25519 && w->key_type != CERT_KEY_RSA &&
+        w->key_type != CERT_KEY_ECDSA_P256) {
         const char* kt = "unknown";
         if (w->key_type == CERT_KEY_RSA) kt = "rsa";
         else if (w->key_type == CERT_KEY_ECDSA_P256) kt = "ecdsa-p256";
-        metal_die("tls_worker_main: key type '%s' loaded but handshake signing for this type is not implemented yet (supported: Ed25519, RSA-PSS)", kt);
+        metal_die("tls_worker_main: key type '%s' loaded but handshake signing for this type is not implemented yet (supported: Ed25519, RSA-PSS, ECDSA P-256)", kt);
     }
 
     uint8_t local_mac[6];
@@ -491,6 +683,24 @@ void* tls_worker_main(void* arg) {
         if (af_packet_open(&w->afp, cfg->tls_ifname, local_mac, peer_mac) != 0) {
             metal_die("tls_worker_main: af_packet_open(ifname=%s)", cfg->tls_ifname);
         }
+        /* Drop everything the kernel sees on this veth that isn't
+         * for our listener. Without this filter the worker thread
+         * burns ms/burst on unrelated cluster traffic (kubelet
+         * probes, kube-proxy, DNS, stray ACKs from torn-down
+         * sessions) which causes ~60 ms tail spikes between real
+         * requests. */
+        if (af_packet_install_filter(&w->afp, local_ip,
+                                     (uint16_t)cfg->port) != 0) {
+            metal_log("tls_worker_main: af_packet filter install failed; "
+                      "continuing without (variance may be high)");
+        }
+    }
+
+    /* Per-worker end-to-end histogram. The TLS backend was previously
+     * not setting this, so /stats reported total_requests=0 and
+     * p95/p99/p99.9=0 — making tail-latency optimization blind. */
+    if (g_metrics && cfg->worker_index < g_n_workers) {
+        g_worker_metrics = &g_metrics[cfg->worker_index];
     }
 
     pw_dispatch_init(&w->dispatch);
@@ -519,18 +729,39 @@ void* tls_worker_main(void* arg) {
     uint64_t last_tick_ms = 0;
     uint8_t frame[2048];
     for (;;) {
-        const uint8_t* ip = NULL;
-        size_t ip_len = 0;
-        int csum_not_ready = 0;
-        int rr = (w->io_mode == TLS_IO_AF_XDP)
-                   ? af_xdp_recv(&w->xdp, frame, sizeof(frame), &ip, &ip_len)
-                   : af_packet_recv(&w->afp, frame, sizeof(frame), &ip, &ip_len,
+        /* Batched RX drain: pull up to 64 packets per outer iteration
+         * before checking the tick. The previous one-packet-then-tick
+         * loop paid metal_now_ms() per packet, so under 6+ concurrent
+         * handshakes the kernel's AF_XDP RX ring filled and dropped
+         * SYNs because userspace fell behind. Bound keeps tcp_tick()
+         * (RTO timers) responsive on sustained bursts.
+         *
+         * AF_XDP only — af_packet uses blocking recvmsg() and would
+         * stall the tick waiting for packet #2..#N. */
+        if (w->io_mode == TLS_IO_AF_XDP) {
+            for (int i = 0; i < 64; i++) {
+                const uint8_t* ip = NULL;
+                size_t ip_len = 0;
+                int rr = af_xdp_recv(&w->xdp, frame, sizeof(frame), &ip, &ip_len);
+                if (rr != 0) break;
+                tcp_seg_t seg;
+                if (ip_tcp_parse_ex(ip, ip_len, &seg, /*csum_not_ready=*/1) == 0) {
+                    uint64_t now = (uint64_t)metal_now_ms();
+                    tcp_input_at(&w->stack, &seg, now, NULL, NULL, emit_seg, &emit_ctx);
+                }
+            }
+        } else {
+            const uint8_t* ip = NULL;
+            size_t ip_len = 0;
+            int csum_not_ready = 0;
+            int rr = af_packet_recv(&w->afp, frame, sizeof(frame), &ip, &ip_len,
                                     &csum_not_ready);
-        if (rr == 0) {
-            tcp_seg_t seg;
-            if (ip_tcp_parse_ex(ip, ip_len, &seg, csum_not_ready) == 0) {
-                uint64_t now = (uint64_t)metal_now_ms();
-                tcp_input_at(&w->stack, &seg, now, NULL, NULL, emit_seg, &emit_ctx);
+            if (rr == 0) {
+                tcp_seg_t seg;
+                if (ip_tcp_parse_ex(ip, ip_len, &seg, csum_not_ready) == 0) {
+                    uint64_t now = (uint64_t)metal_now_ms();
+                    tcp_input_at(&w->stack, &seg, now, NULL, NULL, emit_seg, &emit_ctx);
+                }
             }
         }
         uint64_t now = (uint64_t)metal_now_ms();

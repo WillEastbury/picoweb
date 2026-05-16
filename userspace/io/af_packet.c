@@ -19,11 +19,16 @@
  * returns -1 in that case. */
 #if defined(__linux__)
 #include <arpa/inet.h>
+#include <linux/filter.h>
 #include <linux/if_packet.h>
 #include <net/ethernet.h>
 #include <net/if.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
+#endif
+
+#ifndef PACKET_IGNORE_OUTGOING
+#define PACKET_IGNORE_OUTGOING 23
 #endif
 
 int af_packet_open(af_packet_t* a, const char* ifname,
@@ -59,6 +64,65 @@ int af_packet_open(af_packet_t* a, const char* ifname,
     sll.sll_ifindex  = a->ifindex;
     if (bind(a->fd, (struct sockaddr*)&sll, sizeof(sll)) < 0) {
         close(a->fd); return -1;
+    }
+
+    /* Bump SO_RCVBUF so bursts of unrelated traffic on the veth don't
+     * cause in-kernel drops while we're servicing a request. Best-
+     * effort: kernel may cap at /proc/sys/net/core/rmem_max. */
+    int rcvbuf = 4 * 1024 * 1024;
+    (void)setsockopt(a->fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+
+    return 0;
+#endif
+}
+
+int af_packet_install_filter(af_packet_t* a,
+                             uint32_t local_ip_be,
+                             uint16_t dst_port_host) {
+#if !defined(__linux__)
+    (void)a; (void)local_ip_be; (void)dst_port_host;
+    return -1;
+#else
+    if (!a || a->fd < 0) return -1;
+
+    /* Don't reflect our own TX back to the RX path. Best-effort:
+     * kernel < 4.20 doesn't have this option; ignore the error. */
+    int one = 1;
+    (void)setsockopt(a->fd, SOL_PACKET, PACKET_IGNORE_OUTGOING,
+                     &one, sizeof(one));
+
+    /* Classic-BPF program:
+     *   if (eth.type != IPv4)            drop;
+     *   if (ip.proto != TCP)             drop;
+     *   if (ip.dst   != local_ip)        drop;
+     *   X = (ip.ihl & 0xf) * 4;          // L4 offset relative to L3
+     *   if (tcp.dst  != dst_port)        drop;
+     *   accept (return 65535).
+     *
+     * BPF offsets are absolute from the start of the link-layer
+     * frame, so L3 starts at +14 (Ethernet) and TCP dst port lives
+     * at L3+ihl*4+2. We use BPF_LDX|BPF_B|BPF_MSH to compute IHL*4
+     * into X, then load the half-word at [X + 14 + 2]. */
+    struct sock_filter prog[] = {
+        { 0x28, 0, 0, 0x0000000c },                       /* ldh [12]                       */
+        { 0x15, 0, 7, 0x00000800 },                       /* jne #ETH_P_IP, drop            */
+        { 0x30, 0, 0, 0x00000017 },                       /* ldb [23]                       */
+        { 0x15, 0, 5, 0x00000006 },                       /* jne #IPPROTO_TCP, drop         */
+        { 0x20, 0, 0, 0x0000001e },                       /* ld  [30]   ; ip dst            */
+        { 0x15, 0, 3, ntohl(local_ip_be) },               /* jne #LOCAL, drop               */
+        { 0xb1, 0, 0, 0x0000000e },                       /* ldxb 4*([14]&0xf)              */
+        { 0x48, 0, 0, 0x00000010 },                       /* ldh [x + 16] ; tcp dst (14+2)  */
+        { 0x15, 0, 1, dst_port_host },                    /* jne #PORT, drop                */
+        { 0x06, 0, 0, 0x0000ffff },                       /* ret #65535                     */
+        { 0x06, 0, 0, 0x00000000 },                       /* drop: ret #0                   */
+    };
+    struct sock_fprog fprog = {
+        .len = (unsigned short)(sizeof(prog) / sizeof(prog[0])),
+        .filter = prog,
+    };
+    if (setsockopt(a->fd, SOL_SOCKET, SO_ATTACH_FILTER,
+                   &fprog, sizeof(fprog)) < 0) {
+        return -1;
     }
     return 0;
 #endif
