@@ -251,9 +251,17 @@ int main(int argc, char** argv) {
     tls_cert_path[0] = '\0';
     tls_key_path[0] = '\0';
     if (backend == PICOWEB_BACKEND_TLS) {
-        if (!tls_ifname || !tls_ifname[0]) {
-            fprintf(stderr, "picoweb: --tls requires --tls-ifname=IFACE\n");
-            return 1;
+        if (tls_ifname && tls_ifname[0]) {
+            fprintf(stderr,
+                "picoweb: --tls-ifname is no longer used (the kernel-socket "
+                "TLS server doesn't need a raw NIC). Ignoring.\n");
+            tls_ifname = NULL;
+        }
+        if (tls_use_xdp) {
+            fprintf(stderr,
+                "picoweb: --tls-xdp is no longer used (AF_XDP path is "
+                "preserved in legacy/, not built into this binary). Ignoring.\n");
+            tls_use_xdp = false;
         }
         if (picoweb_tls_locate_certs(tls_cert_cli, tls_key_cli,
                                      tls_cert_path, tls_key_path,
