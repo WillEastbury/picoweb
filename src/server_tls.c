@@ -729,39 +729,18 @@ void* tls_worker_main(void* arg) {
     uint64_t last_tick_ms = 0;
     uint8_t frame[2048];
     for (;;) {
-        /* Batched RX drain: pull up to 64 packets per outer iteration
-         * before checking the tick. The previous one-packet-then-tick
-         * loop paid metal_now_ms() per packet, so under 6+ concurrent
-         * handshakes the kernel's AF_XDP RX ring filled and dropped
-         * SYNs because userspace fell behind. Bound keeps tcp_tick()
-         * (RTO timers) responsive on sustained bursts.
-         *
-         * AF_XDP only — af_packet uses blocking recvmsg() and would
-         * stall the tick waiting for packet #2..#N. */
-        if (w->io_mode == TLS_IO_AF_XDP) {
-            for (int i = 0; i < 64; i++) {
-                const uint8_t* ip = NULL;
-                size_t ip_len = 0;
-                int rr = af_xdp_recv(&w->xdp, frame, sizeof(frame), &ip, &ip_len);
-                if (rr != 0) break;
-                tcp_seg_t seg;
-                if (ip_tcp_parse_ex(ip, ip_len, &seg, /*csum_not_ready=*/1) == 0) {
-                    uint64_t now = (uint64_t)metal_now_ms();
-                    tcp_input_at(&w->stack, &seg, now, NULL, NULL, emit_seg, &emit_ctx);
-                }
-            }
-        } else {
-            const uint8_t* ip = NULL;
-            size_t ip_len = 0;
-            int csum_not_ready = 0;
-            int rr = af_packet_recv(&w->afp, frame, sizeof(frame), &ip, &ip_len,
+        const uint8_t* ip = NULL;
+        size_t ip_len = 0;
+        int csum_not_ready = (w->io_mode == TLS_IO_AF_XDP) ? 1 : 0;
+        int rr = (w->io_mode == TLS_IO_AF_XDP)
+                   ? af_xdp_recv(&w->xdp, frame, sizeof(frame), &ip, &ip_len)
+                   : af_packet_recv(&w->afp, frame, sizeof(frame), &ip, &ip_len,
                                     &csum_not_ready);
-            if (rr == 0) {
-                tcp_seg_t seg;
-                if (ip_tcp_parse_ex(ip, ip_len, &seg, csum_not_ready) == 0) {
-                    uint64_t now = (uint64_t)metal_now_ms();
-                    tcp_input_at(&w->stack, &seg, now, NULL, NULL, emit_seg, &emit_ctx);
-                }
+        if (rr == 0) {
+            tcp_seg_t seg;
+            if (ip_tcp_parse_ex(ip, ip_len, &seg, csum_not_ready) == 0) {
+                uint64_t now = (uint64_t)metal_now_ms();
+                tcp_input_at(&w->stack, &seg, now, NULL, NULL, emit_seg, &emit_ctx);
             }
         }
         uint64_t now = (uint64_t)metal_now_ms();
