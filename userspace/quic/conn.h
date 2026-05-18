@@ -126,6 +126,22 @@ typedef struct {
     uint8_t drv_handshake_blob [QUIC_CONN_DRV_HANDSHAKE_CAP];
     size_t  drv_handshake_blob_len;
 
+    /* ---- 1-RTT (Application) epoch keys (wave 5 phase 5e7) ----
+     *
+     * Populated by quic_server_finish_handshake once the client
+     * Finished has been verified. AES-128-GCM keys derived from
+     * client/server_application_traffic_secret_0 via the standard
+     * QUIC labels. The Initial-/Handshake-epoch keys are NOT
+     * discarded here — RFC 9001 §4.9 retention is the embedder's
+     * concern.
+     */
+    int                  app_keys_ready;
+    quic_handshake_keys_t app_tx_keys;   /* server-encrypted to client */
+    quic_handshake_keys_t app_rx_keys;   /* client-encrypted to server */
+    uint8_t client_application_traffic_secret_0[32];
+    uint8_t server_application_traffic_secret_0[32];
+    uint8_t master_secret[32];
+
     /* Counters (for tests / metrics; not yet used for ack generation). */
     uint64_t initial_pkts_rcvd;
     uint64_t initial_crypto_bytes_rcvd;
@@ -302,5 +318,27 @@ int quic_conn_recv_handshake(quic_conn_t* c,
 const uint8_t* quic_conn_handshake_rx_peek(const quic_conn_t* c,
                                            size_t* out_len);
 void quic_conn_handshake_rx_advance(quic_conn_t* c, size_t n);
+
+/* ---- 1-RTT (Application) epoch (wave 5 phase 5e7) ------------------
+ *
+ * Once the client Finished has been received and verified, the
+ * connection transitions to the application data phase. This API
+ * pulls the buffered client Finished from the Handshake-epoch
+ * reassembler, verifies it against
+ * client_handshake_traffic_secret + transcript_hash_thru_server_fin,
+ * derives the application-traffic secrets, and installs AES-128-GCM
+ * 1-RTT packet keys on the conn.
+ *
+ * Preconditions: have_handshake_state must be 1 (i.e. the server
+ * driver has already run). The Handshake-epoch rx reassembler must
+ * have at least one complete Finished message at offset 0.
+ *
+ * Returns 0 on success, -1 on any failure (no buffered data, malformed
+ * Finished message, verify_data mismatch, derivation error). On
+ * success, app_keys_ready is set to 1, app_tx_keys / app_rx_keys are
+ * populated, and the consumed Finished bytes are advanced out of the
+ * Handshake reassembler.
+ */
+int quic_server_finish_handshake(quic_conn_t* c);
 
 #endif
