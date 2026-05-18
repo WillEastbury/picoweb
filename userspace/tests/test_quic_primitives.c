@@ -28,6 +28,7 @@
 #include "../quic/transport_params.h"
 #include "../quic/crypto_stream.h"
 #include "../quic/keys.h"
+#include "../quic/tls_ext.h"
 
 static int g_pass = 0;
 static int g_fail = 0;
@@ -1789,6 +1790,135 @@ static void test_quic_key_update(void) {
 }
 
 /* ============================================================== */
+/* QUIC↔TLS extension wiring (RFC 9001 §8.2)                      */
+/* ============================================================== */
+
+static void test_quic_tls_ext_emit_tp(void) {
+    printf("== quic_tls_ext: emit TP TLV ==\n");
+    static const uint8_t tp[] = { 0x01, 0x02, 0xaa, 0xbb, 0xcc };
+    uint8_t buf[16];
+    size_t n = quic_tls_ext_emit_tp(buf, sizeof buf, tp, sizeof tp);
+    check_int("emit returns 4 + body_len", (long)n, (long)(4 + sizeof tp));
+    check_int("ext_type hi byte", buf[0], 0x00);
+    check_int("ext_type lo byte", buf[1], 0x39);
+    check_int("ext_len hi byte",  buf[2], 0x00);
+    check_int("ext_len lo byte",  buf[3], (long)sizeof tp);
+    check_eq("ext_body bytes", buf + 4, tp, sizeof tp);
+
+    /* Empty TP body still emits a valid TLV. */
+    n = quic_tls_ext_emit_tp(buf, sizeof buf, NULL, 0);
+    check_int("empty body: 4 bytes",  (long)n, 4);
+    check_int("empty body: ext_len=0", buf[3], 0);
+}
+
+static void test_quic_tls_ext_emit_overflow(void) {
+    printf("== quic_tls_ext: emit overflow rejected ==\n");
+    static const uint8_t tp[8] = {0};
+    uint8_t small[7];
+    check_int("buf too small", (long)quic_tls_ext_emit_tp(small, sizeof small, tp, sizeof tp), 0);
+    check_int("NULL body with non-zero len rejected",
+              (long)quic_tls_ext_emit_tp(small, sizeof small, NULL, 1), 0);
+}
+
+static void test_quic_tls_ext_find_tp(void) {
+    printf("== quic_tls_ext: find TP in extensions block ==\n");
+    /* Build an extensions block with: server_name(0x0000)=empty,
+     * QUIC TP(0x0039)=[0xaa,0xbb,0xcc], early_data(0x002a)=empty. */
+    uint8_t blk[32];
+    size_t off = 0;
+    blk[off++] = 0x00; blk[off++] = 0x00;            /* type 0x0000 */
+    blk[off++] = 0x00; blk[off++] = 0x00;            /* len 0 */
+    blk[off++] = 0x00; blk[off++] = 0x39;            /* QUIC TP */
+    blk[off++] = 0x00; blk[off++] = 0x03;            /* len 3 */
+    blk[off++] = 0xaa; blk[off++] = 0xbb; blk[off++] = 0xcc;
+    blk[off++] = 0x00; blk[off++] = 0x2a;            /* early_data */
+    blk[off++] = 0x00; blk[off++] = 0x00;            /* len 0 */
+
+    const uint8_t* body = NULL; size_t blen = 0;
+    int rc = quic_tls_ext_find_tp(blk, off, &body, &blen);
+    check_int("find returns 1", rc, 1);
+    check_int("body length 3", (long)blen, 3);
+    static const uint8_t want[] = { 0xaa, 0xbb, 0xcc };
+    check_eq("body bytes", body, want, 3);
+}
+
+static void test_quic_tls_ext_find_absent(void) {
+    printf("== quic_tls_ext: TP absent returns 0 ==\n");
+    /* Just one server_name extension, no TP. */
+    uint8_t blk[] = { 0x00, 0x00, 0x00, 0x00 };
+    const uint8_t* body = NULL; size_t blen = 0;
+    int rc = quic_tls_ext_find_tp(blk, sizeof blk, &body, &blen);
+    check_int("find returns 0", rc, 0);
+    check_int("empty block returns 0",
+              quic_tls_ext_find_tp(blk, 0, &body, &blen), 0);
+}
+
+static void test_quic_tls_ext_find_truncated(void) {
+    printf("== quic_tls_ext: truncated extensions rejected ==\n");
+    const uint8_t* body = NULL; size_t blen = 0;
+    /* TLV header truncated (3 bytes). */
+    uint8_t b1[] = { 0x00, 0x39, 0x00 };
+    check_int("truncated header",
+              quic_tls_ext_find_tp(b1, sizeof b1, &body, &blen), -1);
+    /* TLV body truncated (declared len 5, only 2 follow). */
+    uint8_t b2[] = { 0x00, 0x39, 0x00, 0x05, 0xaa, 0xbb };
+    check_int("truncated body",
+              quic_tls_ext_find_tp(b2, sizeof b2, &body, &blen), -1);
+}
+
+static void test_quic_tls_ext_find_duplicate(void) {
+    printf("== quic_tls_ext: duplicate TP rejected ==\n");
+    uint8_t blk[] = {
+        0x00, 0x39, 0x00, 0x01, 0xaa,
+        0x00, 0x39, 0x00, 0x01, 0xbb,
+    };
+    const uint8_t* body = NULL; size_t blen = 0;
+    check_int("duplicate TP rejected",
+              quic_tls_ext_find_tp(blk, sizeof blk, &body, &blen), -1);
+}
+
+static void test_quic_tls_ext_round_trip(void) {
+    printf("== quic_tls_ext: emit then find round-trip ==\n");
+    /* Encode a real (small) TP set with quic_tp_encode, wrap with
+     * quic_tls_ext_emit_tp, then locate and re-decode. */
+    quic_transport_params_t tp_in;
+    quic_tp_init_defaults(&tp_in);
+    tp_in.max_idle_timeout_ms = 30000;
+    tp_in.initial_max_data    = 65536;
+    tp_in.present = QUIC_TP_F_MAX_IDLE_TIMEOUT | QUIC_TP_F_INITIAL_MAX_DATA;
+
+    uint8_t tp_blob[64];
+    size_t tp_len = quic_tp_encode(&tp_in, tp_blob, sizeof tp_blob);
+    if (!tp_len) { printf("  FAIL: tp_encode\n"); g_fail++; return; }
+
+    uint8_t ext_block[80];
+    size_t  ext_off = 0;
+    /* Prepend a non-QUIC dummy extension to make sure scanning works. */
+    ext_block[ext_off++] = 0xff; ext_block[ext_off++] = 0xff;
+    ext_block[ext_off++] = 0x00; ext_block[ext_off++] = 0x02;
+    ext_block[ext_off++] = 0x12; ext_block[ext_off++] = 0x34;
+
+    size_t emitted = quic_tls_ext_emit_tp(ext_block + ext_off,
+                                          sizeof ext_block - ext_off,
+                                          tp_blob, tp_len);
+    check_int("emit succeeded", (long)emitted, (long)(4 + tp_len));
+    ext_off += emitted;
+
+    const uint8_t* body = NULL; size_t blen = 0;
+    int rc = quic_tls_ext_find_tp(ext_block, ext_off, &body, &blen);
+    check_int("find succeeded", rc, 1);
+    check_int("body len matches tp_len", (long)blen, (long)tp_len);
+
+    quic_transport_params_t tp_out;
+    rc = quic_tp_decode(body, blen, &tp_out);
+    check_int("re-decode succeeded", rc, 1);
+    check_int("max_idle_timeout_ms preserved",
+              (long)tp_out.max_idle_timeout_ms, 30000);
+    check_int("initial_max_data preserved",
+              (long)tp_out.initial_max_data, 65536);
+}
+
+/* ============================================================== */
 
 
 int main(void) {
@@ -1872,6 +2002,14 @@ int main(void) {
     test_quic_keys_from_initial_secret();
     test_quic_keys_unsupported();
     test_quic_key_update();
+
+    test_quic_tls_ext_emit_tp();
+    test_quic_tls_ext_emit_overflow();
+    test_quic_tls_ext_find_tp();
+    test_quic_tls_ext_find_absent();
+    test_quic_tls_ext_find_truncated();
+    test_quic_tls_ext_find_duplicate();
+    test_quic_tls_ext_round_trip();
 
     printf("\n=== RESULTS: PASS=%d FAIL=%d ===\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
