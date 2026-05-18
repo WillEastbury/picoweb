@@ -27,6 +27,7 @@
 #include "../quic/special.h"
 #include "../quic/transport_params.h"
 #include "../quic/crypto_stream.h"
+#include "../quic/keys.h"
 
 static int g_pass = 0;
 static int g_fail = 0;
@@ -1706,6 +1707,88 @@ static void test_crypto_stream_tx_zero_budget(void) {
 }
 
 /* ============================================================== */
+/* QUIC per-epoch key derivation (RFC 9001 §5.1, §6.1)            */
+/* ============================================================== */
+
+static void test_quic_keys_from_initial_secret(void) {
+    printf("== QUIC keys: derive from client_initial_secret (RFC 9001 §A.1) ==\n");
+    /* Per RFC 9001 §A.1:
+     *   client_initial_secret = HKDF-Expand-Label(initial_secret,
+     *                              "client in", "", 32) */
+    uint8_t secret[32];
+    unhex("c00cf151ca5be075ed0ebfb5c80323c4"
+          "2d6b7db67881289af4008f1f6c357aea", secret, 32);
+
+    quic_keys_t k;
+    int rc = quic_keys_from_secret(secret, 32, 16, 16, &k);
+    check_int("derive returns 1", rc, 1);
+    check_int("key_len", k.key_len, 16);
+    check_int("hp_len",  k.hp_len, 16);
+
+    uint8_t expect[16];
+    unhex("1f369613dd76d5467730efcbe3b1a22d", expect, 16);
+    check_eq("client quic key", k.key, expect, 16);
+    unhex("fa044b2f42a3fd3b46fb255c", expect, 12);
+    check_eq("client quic iv",  k.iv,  expect, 12);
+    unhex("9f50449e04a0e810283a1e9933adedd2", expect, 16);
+    check_eq("client quic hp",  k.hp,  expect, 16);
+
+    /* Also: server_initial_secret per RFC 9001 §A.1. */
+    unhex("3c199828fd139efd216c155ad844cc81"
+          "fb82fa8d7446fa7d78be803acdda951b", secret, 32);
+    rc = quic_keys_from_secret(secret, 32, 16, 16, &k);
+    check_int("server derive returns 1", rc, 1);
+    unhex("cf3a5331653c364c88f0f379b6067e37", expect, 16);
+    check_eq("server quic key", k.key, expect, 16);
+    unhex("0ac1493ca1905853b0bba03e", expect, 12);
+    check_eq("server quic iv",  k.iv,  expect, 12);
+    unhex("c206b8d9b9f0f37644430b490eeaa314", expect, 16);
+    check_eq("server quic hp",  k.hp,  expect, 16);
+}
+
+static void test_quic_keys_unsupported(void) {
+    printf("== QUIC keys: unsupported sizes rejected ==\n");
+    uint8_t secret[32] = {0};
+    quic_keys_t k;
+    memset(&k, 0xa5, sizeof k);
+    check_int("rejects key_len=24",
+              quic_keys_from_secret(secret, 32, 24, 16, &k), 0);
+    check_int("rejects hp_len=24",
+              quic_keys_from_secret(secret, 32, 16, 24, &k), 0);
+    check_int("rejects secret_len!=32",
+              quic_keys_from_secret(secret, 16, 16, 16, &k), 0);
+}
+
+static void test_quic_key_update(void) {
+    printf("== QUIC key update: §6.1 derives a new secret ==\n");
+    uint8_t secret[32];
+    unhex("c00cf151ca5be075ed0ebfb5c80323c4"
+          "2d6b7db67881289af4008f1f6c357aea", secret, 32);
+    uint8_t next[32];
+    quic_key_update_next(secret, 32, next);
+
+    /* Property: next != secret, deterministic, non-zero. */
+    check_int("next differs from current",
+              memcmp(next, secret, 32) != 0, 1);
+    int allzero = 1;
+    for (int i = 0; i < 32; i++) if (next[i]) { allzero = 0; break; }
+    check_int("next is non-zero", !allzero, 1);
+
+    /* Idempotency: same input → same output. */
+    uint8_t next2[32];
+    quic_key_update_next(secret, 32, next2);
+    check_eq("derivation deterministic", next2, next, 32);
+
+    /* Keys derived from the new secret must differ from the old. */
+    quic_keys_t k_old, k_new;
+    quic_keys_from_secret(secret, 32, 16, 16, &k_old);
+    quic_keys_from_secret(next,   32, 16, 16, &k_new);
+    check_int("rotated key differs", memcmp(k_new.key, k_old.key, 16) != 0, 1);
+    check_int("rotated iv differs",  memcmp(k_new.iv,  k_old.iv,  12) != 0, 1);
+    check_int("rotated hp differs",  memcmp(k_new.hp,  k_old.hp,  16) != 0, 1);
+}
+
+/* ============================================================== */
 
 
 int main(void) {
@@ -1785,6 +1868,10 @@ int main(void) {
     test_crypto_stream_rx_partial_consume();
     test_crypto_stream_tx_chunks();
     test_crypto_stream_tx_zero_budget();
+
+    test_quic_keys_from_initial_secret();
+    test_quic_keys_unsupported();
+    test_quic_key_update();
 
     printf("\n=== RESULTS: PASS=%d FAIL=%d ===\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
