@@ -201,7 +201,7 @@ maps keys as `card`/`record` integers:
   - `/wal/metadata/schema/{pack}` → pack 2
   - `/wal/metadata/{pack}` → combined fetch (`pack1` + `pack2`)
 - metadata-derived form spec:
-  - `/wal/forms/{pack}` (`GET/HEAD`) → returns a renderable form schema inferred from pack 2 `fields`/`joins` (+ pack 1 `name`)
+  - `/wal/forms/{pack}` (`GET/HEAD`) → returns a minimal JS handoff payload: `{pack, entity, schema}` where `schema` is pack 2 metadata as-is
 - auth endpoints (when `--oidc-cookie-auth` is enabled):
   - `POST /wal/auth/login` body: `{"provider":"google|entra","access_token":"..."}`  
     validates token with provider, then sets short-lived `HttpOnly` cookie

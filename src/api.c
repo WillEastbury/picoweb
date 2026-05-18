@@ -802,42 +802,6 @@ static void trim_inplace(char* s) {
     if (i > 0) memmove(s, s + i, strlen(s + i) + 1);
 }
 
-static bool csv_has_token(const char* csv, const char* token) {
-    if (!csv || !token || !*token) return false;
-    char tmp[512];
-    snprintf(tmp, sizeof(tmp), "%s", csv);
-    char* save = NULL;
-    for (char* t = strtok_r(tmp, ",", &save); t; t = strtok_r(NULL, ",", &save)) {
-        trim_inplace(t);
-        if (strcmp(t, token) == 0) return true;
-    }
-    return false;
-}
-
-static bool schema_relation_pack_for_field(const char* joins_csv, const char* field, uint16_t* out_pack) {
-    if (!joins_csv || !field || !out_pack) return false;
-    char tmp[512];
-    snprintf(tmp, sizeof(tmp), "%s", joins_csv);
-    char* save = NULL;
-    for (char* t = strtok_r(tmp, ",", &save); t; t = strtok_r(NULL, ",", &save)) {
-        trim_inplace(t);
-        char* sep = strchr(t, '=');
-        if (!sep) sep = strchr(t, ':');
-        if (!sep) continue;
-        *sep = '\0';
-        char* p = t;
-        char* f = sep + 1;
-        trim_inplace(p);
-        trim_inplace(f);
-        uint32_t pid = 0;
-        if (!parse_u32_dec(p, strlen(p), PICOWAL_CARD_MAX, &pid)) continue;
-        if (strcmp(f, field) != 0) continue;
-        *out_pack = (uint16_t)pid;
-        return true;
-    }
-    return false;
-}
-
 static bool picowal_read_meta_json(uint16_t meta_pack, uint32_t pack_id, char* out, size_t out_cap) {
     uint32_t key = 0;
     if (!picowal_db_pack_key(meta_pack, pack_id, &key)) return false;
@@ -846,6 +810,8 @@ static bool picowal_read_meta_json(uint16_t meta_pack, uint32_t pack_id, char* o
     out[n] = '\0';
     return true;
 }
+
+static bool json_escape_copy(const char* src, char* out, size_t out_cap);
 
 static bool picowal_build_form_spec(uint32_t pack_id, char** out_json, size_t* out_len,
                                     int* out_status, char* err, size_t err_cap) {
@@ -860,16 +826,6 @@ static bool picowal_build_form_spec(uint32_t pack_id, char** out_json, size_t* o
         snprintf(err, err_cap, "schema not found");
         return false;
     }
-    char fields_csv[1024];
-    if (!json_extract_string_field(schema, "fields", fields_csv, sizeof(fields_csv)) || !fields_csv[0]) {
-        if (out_status) *out_status = 400;
-        snprintf(err, err_cap, "schema fields missing");
-        return false;
-    }
-    char required_csv[512] = {0};
-    (void)json_extract_string_field(schema, "required", required_csv, sizeof(required_csv));
-    char joins_csv[512] = {0};
-    (void)json_extract_string_field(schema, "joins", joins_csv, sizeof(joins_csv));
 
     char name_doc[4097];
     char pack_name[128] = {0};
@@ -885,48 +841,16 @@ static bool picowal_build_form_spec(uint32_t pack_id, char** out_json, size_t* o
         return false;
     }
 
+    char esc_name[256] = {0};
+    bool has_name = pack_name[0] && json_escape_copy(pack_name, esc_name, sizeof(esc_name));
     size_t o = 0;
-    int n = 0;
-    if (pack_name[0]) {
-        n = snprintf(out + o, cap - o, "{\"pack\":%u,\"entity\":\"%s\",\"fields\":[", pack_id, pack_name);
+    int n;
+    if (has_name) {
+        n = snprintf(out + o, cap - o, "{\"pack\":%u,\"entity\":\"%s\",\"schema\":%s}",
+                     pack_id, esc_name, schema);
     } else {
-        n = snprintf(out + o, cap - o, "{\"pack\":%u,\"entity\":null,\"fields\":[", pack_id);
+        n = snprintf(out + o, cap - o, "{\"pack\":%u,\"entity\":null,\"schema\":%s}", pack_id, schema);
     }
-    if (n <= 0 || (size_t)n >= cap - o) { free(out); snprintf(err, err_cap, "render failed"); return false; }
-    o += (size_t)n;
-
-    char fields_copy[1024];
-    snprintf(fields_copy, sizeof(fields_copy), "%s", fields_csv);
-    char* save = NULL;
-    bool first = true;
-    for (char* t = strtok_r(fields_copy, ",", &save); t; t = strtok_r(NULL, ",", &save)) {
-        trim_inplace(t);
-        if (!t[0]) continue;
-        bool required = required_csv[0] && csv_has_token(required_csv, t);
-        uint16_t rel_pack = 0;
-        bool is_rel = joins_csv[0] && schema_relation_pack_for_field(joins_csv, t, &rel_pack);
-        const char* input = "text";
-        if (is_rel) input = "relation";
-        else if (strlen(t) > 3 && strcmp(t + strlen(t) - 3, "_id") == 0) input = "number";
-
-        n = snprintf(out + o, cap - o, "%s{\"name\":\"%s\",\"input\":\"%s\",\"required\":%s",
-                     first ? "" : ",", t, input, required ? "true" : "false");
-        if (n <= 0 || (size_t)n >= cap - o) { free(out); snprintf(err, err_cap, "render failed"); return false; }
-        o += (size_t)n;
-        if (is_rel) {
-            n = snprintf(out + o, cap - o, ",\"relation_pack\":%u", (unsigned)rel_pack);
-            if (n <= 0 || (size_t)n >= cap - o) { free(out); snprintf(err, err_cap, "render failed"); return false; }
-            o += (size_t)n;
-        }
-        n = snprintf(out + o, cap - o, "}");
-        if (n <= 0 || (size_t)n >= cap - o) { free(out); snprintf(err, err_cap, "render failed"); return false; }
-        o += (size_t)n;
-        first = false;
-    }
-
-    n = snprintf(out + o, cap - o,
-                 "],\"actions\":{\"create\":\"%s%u\",\"update\":\"%s%u/{record}\"}}",
-                 g_picowal_prefix, pack_id, g_picowal_prefix, pack_id);
     if (n <= 0 || (size_t)n >= cap - o) { free(out); snprintf(err, err_cap, "render failed"); return false; }
     o += (size_t)n;
 

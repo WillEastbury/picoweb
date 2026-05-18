@@ -112,9 +112,9 @@ assert_code 200 "GET  form orders" "http://127.0.0.1:$PORT/wal/forms/12"
 form_out=$(cat /tmp/picowal-test-body)
 if echo "$form_out" | grep -q '"pack":12' && \
    echo "$form_out" | grep -q '"entity":"orders"' && \
-   echo "$form_out" | grep -q '"name":"name"' && \
-   echo "$form_out" | grep -q '"name":"13_id"' && \
-   echo "$form_out" | grep -q '"relation_pack":13'; then
+   echo "$form_out" | grep -q '"schema":' && \
+   echo "$form_out" | grep -q '"fields":"name,13_id,status,email"' && \
+   ! echo "$form_out" | grep -q '"actions"'; then
     echo "ok   metadata form output"
 else
     echo "FAIL metadata form output: $form_out"
