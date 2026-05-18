@@ -29,6 +29,7 @@
 #include "../quic/crypto_stream.h"
 #include "../quic/keys.h"
 #include "../quic/tls_ext.h"
+#include "../quic/conn.h"
 
 static int g_pass = 0;
 static int g_fail = 0;
@@ -1919,6 +1920,124 @@ static void test_quic_tls_ext_round_trip(void) {
 }
 
 /* ============================================================== */
+/* QUIC connection: Initial-epoch rx pump                         */
+/* ============================================================== */
+
+static void test_conn_recv_a2_client_initial(void) {
+    printf("== conn rx: drive RFC 9001 §A.2 client Initial ==\n");
+
+    quic_conn_t conn;
+    quic_conn_init_server(&conn);
+
+    /* Pre-condition: no keys, no peer addrs. */
+    check_int("pre: keys not ready", conn.initial_keys_ready, 0);
+    check_int("pre: peer addrs unknown", conn.peer_addrs_known, 0);
+
+    uint8_t wire[1500];
+    size_t wire_n = unhex(CLIENT_INITIAL_PROTECTED_HEX, wire, sizeof wire);
+
+    int rc = quic_conn_recv_initial(&conn, wire, wire_n);
+    check_int("recv_initial returns 0", rc, 0);
+    check_int("post: keys derived", conn.initial_keys_ready, 1);
+    check_int("post: peer addrs known", conn.peer_addrs_known, 1);
+    /* RFC 9001 §A.2: client DCID = 8394c8f03e515708 (8 bytes). SCID
+     * is empty per the appendix. */
+    check_int("peer_dcid_len 8", (long)conn.peer_dcid_len, 8);
+    uint8_t want_dcid[8];
+    unhex("8394c8f03e515708", want_dcid, 8);
+    check_eq("peer_dcid bytes", conn.peer_dcid, want_dcid, 8);
+    check_int("peer_scid_len 0", (long)conn.peer_scid_len, 0);
+    check_int("initial_pkts_rcvd 1", (long)conn.initial_pkts_rcvd, 1);
+    check_int("initial_ack_eliciting_rcvd 1",
+              (long)conn.initial_ack_eliciting_rcvd, 1);
+    check_int("initial_crypto_bytes_rcvd 241",
+              (long)conn.initial_crypto_bytes_rcvd, 241);
+
+    /* Reassembled CH bytes should be visible in the rx prefix. */
+    size_t n = 0;
+    const uint8_t* p = quic_conn_initial_rx_peek(&conn, &n);
+    check_int("rx peek len 241", (long)n, 241);
+    /* TLS 1.3 ClientHello handshake type byte. */
+    if (p) check_int("first byte = 0x01 (ClientHello)", p[0], 0x01);
+
+    /* Advance and verify it's empty. */
+    quic_conn_initial_rx_advance(&conn, n);
+    p = quic_conn_initial_rx_peek(&conn, &n);
+    check_int("rx empty after advance", p == NULL, 1);
+    check_int("rx peek len 0 after advance", (long)n, 0);
+}
+
+static void test_conn_recv_dcid_pin(void) {
+    printf("== conn rx: DCID is pinned across packets in same epoch ==\n");
+
+    quic_conn_t conn;
+    quic_conn_init_server(&conn);
+
+    uint8_t wire[1500];
+    size_t wire_n = unhex(CLIENT_INITIAL_PROTECTED_HEX, wire, sizeof wire);
+    check_int("first packet ok",
+              quic_conn_recv_initial(&conn, wire, wire_n), 0);
+
+    /* Mutate the DCID byte in the second copy and retry — should fail. */
+    uint8_t wire2[1500];
+    memcpy(wire2, wire, wire_n);
+    /* DCID starts at offset 6 (byte0 + version[4] + dcid_len[1]). */
+    wire2[6] ^= 0xff;
+    check_int("second packet with different DCID rejected",
+              quic_conn_recv_initial(&conn, wire2, wire_n), -1);
+}
+
+static void test_conn_recv_rejects_short_garbage(void) {
+    printf("== conn rx: garbage / short / bad version rejected ==\n");
+    quic_conn_t conn;
+    quic_conn_init_server(&conn);
+    uint8_t junk[3] = { 0xff, 0xff, 0xff };
+    check_int("too short", quic_conn_recv_initial(&conn, junk, sizeof junk), -1);
+
+    /* 7-byte buffer with non-long-header byte0. */
+    uint8_t bad_hdr[16] = { 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00 };
+    check_int("short-header rejected",
+              quic_conn_recv_initial(&conn, bad_hdr, sizeof bad_hdr), -1);
+
+    /* Long-header but version 0 (version negotiation) — rejected as
+     * non-Initial. */
+    uint8_t vn[16] = { 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
+    check_int("version 0 rejected",
+              quic_conn_recv_initial(&conn, vn, sizeof vn), -1);
+
+    /* Long-header Initial form but wrong version. */
+    uint8_t bad_ver[16] = { 0xc0, 0xff, 0x00, 0x00, 0x01, 0x00, 0x00 };
+    check_int("wrong version rejected",
+              quic_conn_recv_initial(&conn, bad_ver, sizeof bad_ver), -1);
+
+    /* Type bits != Initial (0x10 = Handshake). */
+    uint8_t hs[16] = { 0xe0, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00 };
+    check_int("non-Initial long header rejected",
+              quic_conn_recv_initial(&conn, hs, sizeof hs), -1);
+}
+
+static void test_conn_recv_rejects_aead_failure(void) {
+    printf("== conn rx: AEAD failure rejected ==\n");
+    quic_conn_t conn;
+    quic_conn_init_server(&conn);
+    uint8_t wire[1500];
+    size_t wire_n = unhex(CLIENT_INITIAL_PROTECTED_HEX, wire, sizeof wire);
+    /* Flip a byte deep in the protected payload (well past the
+     * header so HP-mask sample isn't disturbed in a way that
+     * randomly succeeds). */
+    wire[wire_n - 30] ^= 0x01;
+    check_int("AEAD-corrupted Initial rejected",
+              quic_conn_recv_initial(&conn, wire, wire_n), -1);
+    /* Keys should have been derived even though AEAD failed,
+     * because we derived them from the visible DCID before
+     * attempting decryption. peer_addrs likewise. */
+    check_int("keys still derived from header DCID",
+              conn.initial_keys_ready, 1);
+    check_int("no Initial counted",
+              (long)conn.initial_pkts_rcvd, 0);
+}
+
+/* ============================================================== */
 
 
 int main(void) {
@@ -2010,6 +2129,11 @@ int main(void) {
     test_quic_tls_ext_find_truncated();
     test_quic_tls_ext_find_duplicate();
     test_quic_tls_ext_round_trip();
+
+    test_conn_recv_a2_client_initial();
+    test_conn_recv_dcid_pin();
+    test_conn_recv_rejects_short_garbage();
+    test_conn_recv_rejects_aead_failure();
 
     printf("\n=== RESULTS: PASS=%d FAIL=%d ===\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
