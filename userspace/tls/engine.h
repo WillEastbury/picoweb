@@ -317,6 +317,12 @@ int  pw_tls_engine_early_data_accepted(const pw_tls_engine_t* eng);
  * lifetime_s, issued_at_ms) externally; this function does NOT
  * touch any store.
  *
+ * If `max_early_data` > 0, the NST advertises the `early_data`
+ * extension to the client so that subsequent resumptions may carry
+ * 0-RTT application data (RFC 8446 §4.6.1, §4.2.10). The same value
+ * MUST be passed to pw_tls_ticket_store_insert() for the ticket so
+ * server-side acceptance limits match what the client was promised.
+ *
  * Per-ticket PSK is derived as
  *   PSK = HKDF-Expand-Label(RMS, "resumption", ticket_nonce, 32)
  * and written into `out_psk` for the caller to insert into its store.
@@ -329,6 +335,7 @@ int pw_tls_engine_emit_session_ticket(pw_tls_engine_t* eng,
                                       size_t nonce_len,
                                       const uint8_t* ticket_id,
                                       size_t id_len,
+                                      uint32_t max_early_data,
                                       uint8_t out_psk[32]);
 
 /* ---------- state introspection ---------- */

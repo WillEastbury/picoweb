@@ -2322,6 +2322,53 @@ static void test_tls13_build_messages(void) {
              { printf("  PASS: Finished rejects undersized buf\n"); g_pass++; }
         else { printf("  FAIL: Finished accepted undersized buf\n"); g_fail++; }
     }
+
+    /* NewSessionTicket: max_early_data == 0 -> empty extensions; > 0
+     * -> single early_data extension carrying max_early_data_size. */
+    {
+        const uint8_t nonce[4]  = { 0x01, 0x02, 0x03, 0x04 };
+        const uint8_t tid[8]    = { 0xa0, 0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7 };
+        uint8_t buf[128];
+
+        int n0 = tls13_build_new_session_ticket(buf, sizeof(buf),
+                                                7200, 0xdeadbeef,
+                                                nonce, sizeof(nonce),
+                                                tid,   sizeof(tid),
+                                                0u);
+        /* Wire: hdr(4) + lifetime(4) + age_add(4) + nonce_len(1)
+         *     + nonce(4) + id_len(2) + id(8) + ext_block_len(2). */
+        size_t exp0 = 4 + 4 + 4 + 1 + 4 + 2 + 8 + 2;
+        if (n0 == (int)exp0 && buf[0] == 0x04
+            && buf[n0 - 2] == 0x00 && buf[n0 - 1] == 0x00)
+             { printf("  PASS: NST max_early_data=0 -> empty exts\n"); g_pass++; }
+        else { printf("  FAIL: NST(0) n=%d exp=%zu last=%02x%02x\n",
+                      n0, exp0, buf[n0 - 2], buf[n0 - 1]); g_fail++; }
+
+        int n1 = tls13_build_new_session_ticket(buf, sizeof(buf),
+                                                7200, 0xdeadbeef,
+                                                nonce, sizeof(nonce),
+                                                tid,   sizeof(tid),
+                                                4096u);
+        /* Adds 8 bytes: ext_type(2)+ext_len(2)+max_early_data_size(4). */
+        size_t exp1 = exp0 + 8;
+        const uint8_t* eb = buf + n1 - 10;   /* ext_block_len + 8 ext bytes */
+        if (n1 == (int)exp1
+            && eb[0] == 0x00 && eb[1] == 0x08             /* exts block len */
+            && eb[2] == 0x00 && eb[3] == 0x2a             /* type=early_data*/
+            && eb[4] == 0x00 && eb[5] == 0x04             /* ext_len=4      */
+            && eb[6] == 0x00 && eb[7] == 0x00
+            && eb[8] == 0x10 && eb[9] == 0x00)            /* 4096 = 0x1000  */
+             { printf("  PASS: NST max_early_data=4096 -> early_data ext\n"); g_pass++; }
+        else { printf("  FAIL: NST(4096) n=%d exp=%zu\n", n1, exp1); g_fail++; }
+
+        /* Truncated buf must be rejected for the larger payload. */
+        if (tls13_build_new_session_ticket(buf, exp1 - 1, 7200, 0,
+                                           nonce, sizeof(nonce),
+                                           tid,   sizeof(tid),
+                                           4096u) == -1)
+             { printf("  PASS: NST rejects undersized buf\n"); g_pass++; }
+        else { printf("  FAIL: NST accepted undersized buf\n"); g_fail++; }
+    }
 }
 
 /* ============================================================== */
@@ -4181,6 +4228,7 @@ static void test_engine_handshake_roundtrip(void) {
         if (pw_tls_engine_emit_session_ticket(eng, 7200, 0xdeadbeef,
                                               nonce, sizeof(nonce),
                                               tid,   sizeof(tid),
+                                              0,     /* max_early_data: NST without early_data ext */
                                               derived_psk) != 0)
              { printf("  FAIL: emit_session_ticket\n"); g_fail++; free(eng); return; }
         printf("  PASS: pw_tls_engine_emit_session_ticket OK\n"); g_pass++;

@@ -586,12 +586,16 @@ int tls13_build_new_session_ticket(uint8_t* out, size_t out_cap,
                                    const uint8_t* ticket_nonce,
                                    size_t nonce_len,
                                    const uint8_t* ticket_id,
-                                   size_t id_len) {
+                                   size_t id_len,
+                                   uint32_t max_early_data) {
     if (!out || !ticket_nonce || !ticket_id) return -1;
     if (nonce_len == 0 || nonce_len > 255)   return -1;
     if (id_len    == 0 || id_len    > 0xffff) return -1;
-    /* body = 4 + 4 + 1 + nonce + 2 + id + 2 (empty exts) */
-    size_t body = 4 + 4 + 1 + nonce_len + 2 + id_len + 2;
+    /* Optional early_data NST extension (RFC 8446 §4.6.1):
+     *   ext_type(2) + ext_len(2) + max_early_data_size(4) = 8 bytes. */
+    size_t ext_block = (max_early_data > 0) ? 8u : 0u;
+    /* body = 4 + 4 + 1 + nonce + 2 + id + 2 + ext_block */
+    size_t body = 4 + 4 + 1 + nonce_len + 2 + id_len + 2 + ext_block;
     if (body > 0xffffffu)   return -1;
     if (out_cap < 4 + body) return -1;
 
@@ -618,8 +622,17 @@ int tls13_build_new_session_ticket(uint8_t* out, size_t out_cap,
     *p++ = (uint8_t)( id_len       & 0xff);
     memcpy(p, ticket_id, id_len); p += id_len;
 
-    /* Empty extensions block. */
-    *p++ = 0x00; *p++ = 0x00;
+    /* Extensions block: either empty or a single early_data extension. */
+    *p++ = (uint8_t)((ext_block >> 8) & 0xff);
+    *p++ = (uint8_t)( ext_block       & 0xff);
+    if (ext_block) {
+        *p++ = 0x00; *p++ = 0x2a;                 /* type = early_data (42) */
+        *p++ = 0x00; *p++ = 0x04;                 /* extension length = 4   */
+        *p++ = (uint8_t)((max_early_data >> 24) & 0xff);
+        *p++ = (uint8_t)((max_early_data >> 16) & 0xff);
+        *p++ = (uint8_t)((max_early_data >>  8) & 0xff);
+        *p++ = (uint8_t)( max_early_data        & 0xff);
+    }
 
     return (int)(p - out);
 }
