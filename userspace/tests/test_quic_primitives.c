@@ -21,6 +21,7 @@
 #include "../quic/initial.h"
 #include "../quic/packet.h"
 #include "../quic/frames.h"
+#include "../quic/loss.h"
 
 static int g_pass = 0;
 static int g_fail = 0;
@@ -790,6 +791,177 @@ static void test_frame_decode_errors(void) {
 }
 
 /* ============================================================== */
+/* Phase 4b — RFC 9002 loss detection                              */
+/* ============================================================== */
+
+static void test_rtt_first_sample(void) {
+    printf("== RTT: first sample (RFC 9002 §5.3) ==\n");
+    quic_rtt_t r; quic_rtt_init(&r);
+    quic_rtt_sample(&r, 10000, 500, 0);  /* 10 ms sample, 0.5 ms ack_delay */
+    check_int("first_sample flag set", r.first_sample, 1);
+    check_int("smoothed_rtt = sample", (long)r.smoothed_rtt, 10000);
+    check_int("rttvar = sample/2",     (long)r.rttvar,       5000);
+    check_int("min_rtt = sample",      (long)r.min_rtt,      10000);
+    check_int("latest_rtt = sample",   (long)r.latest_rtt,   10000);
+}
+
+static void test_rtt_subsequent_samples(void) {
+    printf("== RTT: subsequent samples ==\n");
+    quic_rtt_t r; quic_rtt_init(&r);
+    quic_rtt_sample(&r, 10000, 0, 0);  /* srtt=10000 rttvar=5000 */
+    /* Second sample 12000us, ack_delay 1000us. min_rtt=10000.
+     * 12000 >= 10000+1000 ⇒ adjusted = 11000.
+     * rttvar' = (3*5000 + |10000-11000|)/4 = (15000+1000)/4 = 4000.
+     * srtt'   = (7*10000 + 11000)/8 = 81000/8 = 10125. */
+    quic_rtt_sample(&r, 12000, 1000, 25000);
+    check_int("rttvar after 2nd",  (long)r.rttvar,       4000);
+    check_int("srtt after 2nd",    (long)r.smoothed_rtt, 10125);
+    check_int("min_rtt unchanged", (long)r.min_rtt,      10000);
+
+    /* Third sample 8000us — below min_rtt+ack_delay, so no ack_delay sub. */
+    /* adjusted = 8000. rttvar' = (3*4000 + |10125-8000|)/4 = (12000+2125)/4 = 3531.
+     * srtt'    = (7*10125 + 8000)/8 = 78875/8 = 9859. min_rtt=8000. */
+    quic_rtt_sample(&r, 8000, 5000, 25000);
+    check_int("min_rtt drops to 8000", (long)r.min_rtt, 8000);
+    check_int("rttvar after 3rd",      (long)r.rttvar, 3531);
+    check_int("srtt after 3rd",        (long)r.smoothed_rtt, 9859);
+}
+
+static void test_rtt_caps_ack_delay(void) {
+    printf("== RTT: ack_delay capped by max_ack_delay ==\n");
+    quic_rtt_t r; quic_rtt_init(&r);
+    quic_rtt_sample(&r, 10000, 0, 0);
+    /* Sample 20000us, peer reports ack_delay=15000, but max=2500.
+     * Effective delay = 2500. adjusted = 17500.
+     * rttvar' = (3*5000 + |10000-17500|)/4 = (15000+7500)/4 = 5625.
+     * srtt'   = (7*10000 + 17500)/8 = 87500/8 = 10937. */
+    quic_rtt_sample(&r, 20000, 15000, 2500);
+    check_int("srtt with capped delay", (long)r.smoothed_rtt, 10937);
+    check_int("rttvar with capped delay", (long)r.rttvar, 5625);
+}
+
+static void test_loss_on_sent_and_ack(void) {
+    printf("== loss: send + ack basic ==\n");
+    quic_loss_t l; quic_loss_init(&l);
+    quic_rtt_t  r; quic_rtt_init(&r);
+
+    quic_loss_on_sent(&l, /*pn*/0, /*now*/2900, /*size*/100, /*elicit*/1, /*inflight*/1);
+    quic_loss_on_sent(&l, /*pn*/1, /*now*/2950, /*size*/100, /*elicit*/1, /*inflight*/1);
+    check_int("eliciting in flight", (long)l.ack_eliciting_in_flight, 2);
+
+    quic_pn_range_t r1[] = { {1, 1} };
+    size_t lost_count = 0;
+    size_t newly = quic_loss_on_ack(&l, &r, r1, 1,
+                                    /*ack_delay*/0, /*max_ack_delay*/25000,
+                                    /*now*/3000, NULL, 0, &lost_count);
+    check_int("newly_acked", (long)newly, 1);
+    check_int("eliciting now 1", (long)l.ack_eliciting_in_flight, 1);
+    check_int("largest_acked tracked", (long)l.largest_acked, 1);
+    check_int("first RTT sample taken", r.first_sample, 1);
+    check_int("RTT sample == 50us", (long)r.smoothed_rtt, 50);
+    check_int("no losses yet", (long)lost_count, 0);
+}
+
+static void test_loss_packet_threshold(void) {
+    printf("== loss: packet threshold ==\n");
+    quic_loss_t l; quic_loss_init(&l);
+    quic_rtt_t  r; quic_rtt_init(&r);
+
+    /* Send pn 0..4, all eliciting. */
+    for (uint64_t pn = 0; pn < 5; pn++) {
+        quic_loss_on_sent(&l, pn, 1000 + pn, 100, 1, 1);
+    }
+    /* ACK pn 4 only. Threshold = 3 ⇒ pn 0, 1 are lost (4-pn >= 3). */
+    quic_pn_range_t rg[] = { {4, 4} };
+    uint64_t lost[8];
+    size_t lost_count = 0;
+    quic_loss_on_ack(&l, &r, rg, 1, 0, 25000, 5000, lost, 8, &lost_count);
+    check_int("packet-threshold lost count", (long)lost_count, 2);
+    /* PNs 0 and 1 should be reported (order independent — sort). */
+    if (lost_count == 2) {
+        uint64_t lo = lost[0] < lost[1] ? lost[0] : lost[1];
+        uint64_t hi = lost[0] < lost[1] ? lost[1] : lost[0];
+        check_int("lost lo == 0", (long)lo, 0);
+        check_int("lost hi == 1", (long)hi, 1);
+    }
+}
+
+static void test_loss_time_threshold(void) {
+    printf("== loss: time threshold ==\n");
+    quic_loss_t l; quic_loss_init(&l);
+    quic_rtt_t  r; quic_rtt_init(&r);
+
+    /* Prime RTT to 10000us so loss_delay = 9/8*10000 = 11250us. */
+    quic_rtt_sample(&r, 10000, 0, 0);
+
+    /* Send pn 0 at t=0, pn 1 at t=100000. */
+    quic_loss_on_sent(&l, 0, 0,      100, 1, 1);
+    quic_loss_on_sent(&l, 1, 100000, 100, 1, 1);
+
+    /* ACK pn 1 at t=110000. pn 0 is within packet threshold (gap=1<3),
+     * but its send time (0) <= now-loss_delay (110000-11250=98750), so
+     * it should be marked lost by time threshold. */
+    quic_pn_range_t rg[] = { {1, 1} };
+    uint64_t lost[4]; size_t lost_count = 0;
+    quic_loss_on_ack(&l, &r, rg, 1, 0, 25000, 110000, lost, 4, &lost_count);
+    check_int("time-threshold lost count", (long)lost_count, 1);
+    if (lost_count == 1) check_int("lost pn", (long)lost[0], 0);
+}
+
+static void test_loss_no_rtt_for_non_eliciting(void) {
+    printf("== loss: ACK of non-eliciting does not sample RTT ==\n");
+    quic_loss_t l; quic_loss_init(&l);
+    quic_rtt_t  r; quic_rtt_init(&r);
+    /* pn 0 is non-eliciting (e.g. pure-ACK packet). */
+    quic_loss_on_sent(&l, 0, 1000, 50, /*elicit*/0, /*inflight*/0);
+    quic_pn_range_t rg[] = { {0, 0} };
+    quic_loss_on_ack(&l, &r, rg, 1, 0, 25000, 3000, NULL, 0, NULL);
+    check_int("no RTT sample taken", r.first_sample, 0);
+    check_int("eliciting count still 0", (long)l.ack_eliciting_in_flight, 0);
+}
+
+static void test_loss_pto(void) {
+    printf("== loss: PTO formula ==\n");
+    quic_rtt_t r; quic_rtt_init(&r);
+    /* No sample → 0. */
+    check_int("PTO==0 before sample", (long)quic_loss_pto_us(&r, 0), 0);
+
+    quic_rtt_sample(&r, 10000, 0, 0);  /* srtt=10000 rttvar=5000 */
+    /* PTO = srtt + max(4*rttvar, 1000) + max_ack_delay
+     *     = 10000 + max(20000, 1000) + 25000
+     *     = 55000us */
+    check_int("PTO formula",
+              (long)quic_loss_pto_us(&r, 25000), 55000);
+
+    /* Deadline back-off: with no eliciting in flight ⇒ 0. */
+    quic_loss_t l; quic_loss_init(&l);
+    check_int("deadline 0 with nothing in flight",
+              (long)quic_loss_pto_deadline(&l, &r, 25000), 0);
+
+    /* After sending an eliciting packet at t=10000, deadline = 10000+55000. */
+    quic_loss_on_sent(&l, 0, 10000, 100, 1, 1);
+    check_int("deadline base", (long)quic_loss_pto_deadline(&l, &r, 25000),
+              10000 + 55000);
+
+    /* pto_count=2 ⇒ shift base by 4. */
+    l.pto_count = 2;
+    check_int("deadline backed off",
+              (long)quic_loss_pto_deadline(&l, &r, 25000),
+              10000 + 4 * 55000);
+}
+
+static void test_loss_pto_resets_on_ack(void) {
+    printf("== loss: ACK resets pto_count ==\n");
+    quic_loss_t l; quic_loss_init(&l);
+    quic_rtt_t  r; quic_rtt_init(&r);
+    quic_loss_on_sent(&l, 0, 1000, 100, 1, 1);
+    l.pto_count = 3;
+    quic_pn_range_t rg[] = { {0, 0} };
+    quic_loss_on_ack(&l, &r, rg, 1, 0, 25000, 2000, NULL, 0, NULL);
+    check_int("pto_count reset", (long)l.pto_count, 0);
+}
+
+/* ============================================================== */
 
 
 int main(void) {
@@ -821,6 +993,16 @@ int main(void) {
     test_frame_decode_a3_payload();
     test_frame_decode_a2_payload();
     test_frame_decode_errors();
+
+    test_rtt_first_sample();
+    test_rtt_subsequent_samples();
+    test_rtt_caps_ack_delay();
+    test_loss_on_sent_and_ack();
+    test_loss_packet_threshold();
+    test_loss_time_threshold();
+    test_loss_no_rtt_for_non_eliciting();
+    test_loss_pto();
+    test_loss_pto_resets_on_ack();
 
     printf("\n=== RESULTS: PASS=%d FAIL=%d ===\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
