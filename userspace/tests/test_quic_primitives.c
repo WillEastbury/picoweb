@@ -22,6 +22,8 @@
 #include "../quic/packet.h"
 #include "../quic/frames.h"
 #include "../quic/loss.h"
+#include "../quic/cc.h"
+#include "../quic/flow.h"
 
 static int g_pass = 0;
 static int g_fail = 0;
@@ -962,6 +964,130 @@ static void test_loss_pto_resets_on_ack(void) {
 }
 
 /* ============================================================== */
+/* Phase 4c — NewReno congestion control + flow control            */
+/* ============================================================== */
+
+static void test_cc_initial_window(void) {
+    printf("== CC: initial window (RFC 9002 §B) ==\n");
+    /* MDS=1200 ⇒ min(12000, max(2400, 14720)) = min(12000, 14720) = 12000. */
+    check_int("iw(1200) = 12000", (long)quic_cc_initial_window(1200), 12000);
+    /* MDS=1500 ⇒ min(15000, max(3000, 14720)) = min(15000, 14720) = 14720. */
+    check_int("iw(1500) = 14720", (long)quic_cc_initial_window(1500), 14720);
+    /* MDS=8000 ⇒ min(80000, max(16000, 14720)) = min(80000, 16000) = 16000. */
+    check_int("iw(8000) = 16000", (long)quic_cc_initial_window(8000), 16000);
+    check_int("min(1200) = 2400", (long)quic_cc_minimum_window(1200), 2400);
+}
+
+static void test_cc_init(void) {
+    printf("== CC: init state ==\n");
+    quic_cc_t cc;
+    quic_cc_init(&cc, 1200);
+    check_int("cwnd = iw", (long)cc.cwnd, 12000);
+    check_int("bytes_in_flight = 0", (long)cc.bytes_in_flight, 0);
+    check_int("ssthresh = max", cc.ssthresh == UINT64_MAX, 1);
+    check_int("not in recovery", (long)cc.congestion_recovery_start_time, 0);
+    check_int("can send full window", quic_cc_can_send(&cc, 12000), 1);
+    check_int("cannot send beyond window", quic_cc_can_send(&cc, 12001), 0);
+}
+
+static void test_cc_slow_start(void) {
+    printf("== CC: slow start growth ==\n");
+    quic_cc_t cc;
+    quic_cc_init(&cc, 1200);
+    quic_cc_on_sent(&cc, 1200);
+    quic_cc_on_sent(&cc, 1200);
+    check_int("bytes_in_flight 2400", (long)cc.bytes_in_flight, 2400);
+    quic_cc_on_acked(&cc, 1200);
+    check_int("bif drops to 1200", (long)cc.bytes_in_flight, 1200);
+    /* Slow start: cwnd grows by acked bytes (12000 + 1200 = 13200). */
+    check_int("cwnd grew by acked",  (long)cc.cwnd, 13200);
+}
+
+static void test_cc_loss_then_ca(void) {
+    printf("== CC: loss enters CA, RTT-once recovery period ==\n");
+    quic_cc_t cc;
+    quic_cc_init(&cc, 1200);
+    /* Pretend we sent and have 4800 in flight. */
+    quic_cc_on_sent(&cc, 4800);
+    /* Loss of 1200 bytes at t=10000, send_time=5000. */
+    quic_cc_on_lost(&cc, 1200, /*lost_send_time*/5000, /*now*/10000);
+    check_int("ssthresh = cwnd/2 = 6000", (long)cc.ssthresh, 6000);
+    check_int("cwnd = ssthresh = 6000",   (long)cc.cwnd, 6000);
+    check_int("bif decremented",          (long)cc.bytes_in_flight, 3600);
+    check_int("recovery start = now",     (long)cc.congestion_recovery_start_time, 10000);
+
+    /* Second loss inside recovery period: must NOT halve again. */
+    quic_cc_on_lost(&cc, 1200, /*lost_send_time*/8000, /*now*/11000);
+    check_int("cwnd unchanged in recovery", (long)cc.cwnd, 6000);
+    check_int("bif decremented again",      (long)cc.bytes_in_flight, 2400);
+
+    /* Now in CA (cwnd >= ssthresh). On ACK of 1200B:
+     * cwnd += MDS * acked / cwnd = 1200 * 1200 / 6000 = 240. */
+    quic_cc_on_acked(&cc, 1200);
+    check_int("CA growth", (long)cc.cwnd, 6240);
+
+    /* Loss from a packet sent AFTER recovery start ⇒ react again. */
+    quic_cc_on_lost(&cc, 1200, /*lost_send_time*/15000, /*now*/16000);
+    check_int("ssthresh halved again", (long)cc.ssthresh, 3120);
+    check_int("cwnd to new ssthresh",  (long)cc.cwnd, 3120);
+}
+
+static void test_cc_loss_floor_at_min_window(void) {
+    printf("== CC: loss floors cwnd at kMinimumWindow ==\n");
+    quic_cc_t cc;
+    quic_cc_init(&cc, 1200);
+    /* Force a tiny cwnd by hand and trigger loss. */
+    cc.cwnd = 3000;
+    quic_cc_on_lost(&cc, 0, /*lost_send_time*/100, /*now*/200);
+    /* halved=1500 < min=2400 ⇒ ssthresh=2400. */
+    check_int("ssthresh floored", (long)cc.ssthresh, 2400);
+    check_int("cwnd floored",     (long)cc.cwnd, 2400);
+}
+
+static void test_cc_persistent_congestion(void) {
+    printf("== CC: persistent congestion collapses cwnd ==\n");
+    quic_cc_t cc;
+    quic_cc_init(&cc, 1200);
+    cc.cwnd = 50000;
+    cc.congestion_recovery_start_time = 12345;
+    quic_cc_on_persistent_congestion(&cc);
+    check_int("cwnd = kMinimumWindow", (long)cc.cwnd, 2400);
+    check_int("recovery cleared",      (long)cc.congestion_recovery_start_time, 0);
+}
+
+static void test_flow_basic(void) {
+    printf("== flow: consume + available + max-only-grows ==\n");
+    quic_flow_t f;
+    quic_flow_init(&f, 1000);
+    check_int("initial avail", (long)quic_flow_available(&f), 1000);
+    check_int("consume 400 = 400", (long)quic_flow_consume(&f, 400), 400);
+    check_int("avail 600", (long)quic_flow_available(&f), 600);
+    /* Request 1000, only 600 granted. */
+    check_int("consume 1000 = 600", (long)quic_flow_consume(&f, 1000), 600);
+    check_int("avail 0", (long)quic_flow_available(&f), 0);
+    check_int("consume 1 = 0", (long)quic_flow_consume(&f, 1), 0);
+    /* Bump max up. */
+    quic_flow_set_max(&f, 1500);
+    check_int("avail 500 after grow", (long)quic_flow_available(&f), 500);
+    /* Smaller max ignored. */
+    quic_flow_set_max(&f, 100);
+    check_int("smaller max ignored", (long)f.max, 1500);
+}
+
+static void test_flow_should_update(void) {
+    printf("== flow: should_update threshold ==\n");
+    quic_flow_t f;
+    quic_flow_init(&f, 1000);
+    check_int("no update at start",    quic_flow_should_update(&f, 1000), 0);
+    quic_flow_consume(&f, 499);
+    check_int("no update <half",       quic_flow_should_update(&f, 1000), 0);
+    quic_flow_consume(&f, 1);
+    check_int("update at half",        quic_flow_should_update(&f, 1000), 1);
+    quic_flow_consume(&f, 500);
+    check_int("update when exhausted", quic_flow_should_update(&f, 1000), 1);
+}
+
+/* ============================================================== */
 
 
 int main(void) {
@@ -1003,6 +1129,15 @@ int main(void) {
     test_loss_no_rtt_for_non_eliciting();
     test_loss_pto();
     test_loss_pto_resets_on_ack();
+
+    test_cc_initial_window();
+    test_cc_init();
+    test_cc_slow_start();
+    test_cc_loss_then_ca();
+    test_cc_loss_floor_at_min_window();
+    test_cc_persistent_congestion();
+    test_flow_basic();
+    test_flow_should_update();
 
     printf("\n=== RESULTS: PASS=%d FAIL=%d ===\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
