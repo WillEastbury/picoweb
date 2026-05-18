@@ -18,6 +18,8 @@ CRYPTO_SRC := \
     ../crypto/sha512.c           \
     ../crypto/ed25519.c          \
     ../crypto/rsa.c              \
+    ../crypto/p256.c             \
+    ../crypto/ecdsa.c            \
     ../crypto/pool.c             \
     ../crypto/hmac.c             \
     ../crypto/hkdf.c             \

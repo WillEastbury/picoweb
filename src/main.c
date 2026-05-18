@@ -13,7 +13,6 @@
 #include "simd.h"
 #include "tls_certs.h"
 #include "util.h"
-#include "api.h"
 
 static void usage(const char* argv0) {
     fprintf(stderr,
@@ -33,13 +32,12 @@ static void usage(const char* argv0) {
         "  --tls-peer-mac=MAC  optional fixed L2 peer MAC hint for --tls\n"
         "  --tls-xdp           use AF_XDP socket I/O for --tls backend (copy mode)\n"
         "  --tls-xdp-queue=N   AF_XDP queue id (default 0)\n"
-        "  --api-root=PATH  enable JSON-file CRUD API; data lives under PATH\n"
-        "                   (created if missing). Routes: prefix/{coll}/{id}.\n"
-        "                   Methods: GET, HEAD, POST, PUT, DELETE.\n"
-        "                   Currently wired into the epoll backend only.\n"
-        "  --api-prefix=PFX path prefix for the API (default /api/, must end with /)\n"
         "  --http-early-hints  enable HTTP/1.1 103 Early Hints with auto-derived\n"
         "                      Link: rel=preload headers (off by default)\n"
+        "  --tls-busy-poll     legacy busy-spin RX loop (lowest latency; pegs a\n"
+        "                      full core; AVOID under Kubernetes cpu limits — CFS\n"
+        "                      throttling produces ~80ms tail-latency stalls).\n"
+        "                      Default is poll(2)-based RX with 10ms tick wakeups.\n"
         "  --sqpoll     enable IORING_SETUP_SQPOLL: kernel polls our SQ,\n"
         "               eliminating io_uring_enter() syscalls on the submit\n"
         "               path. Costs one kernel thread per worker. Requires\n"
@@ -77,9 +75,8 @@ int main(int argc, char** argv) {
     const char* tls_peer_mac = NULL;
     bool tls_use_xdp = false;
     uint32_t tls_xdp_queue = 0;
-    const char* api_root = NULL;
-    const char* api_prefix = "/api/";
     bool http_early_hints = false;
+    bool tls_busy_poll = false;
 
     /* Two-pass parse: lift flags out of argv first, then handle the
      * remaining positional args exactly as before. This keeps the
@@ -181,20 +178,8 @@ int main(int argc, char** argv) {
             tls_xdp_queue = (uint32_t)q;
             continue;
         }
-        if (strncmp(argv[i], "--api-root=", 11) == 0) {
-            api_root = argv[i] + 11;
-            if (!api_root[0]) {
-                fprintf(stderr, "picoweb: --api-root requires a non-empty path\n");
-                return 1;
-            }
-            continue;
-        }
-        if (strncmp(argv[i], "--api-prefix=", 13) == 0) {
-            api_prefix = argv[i] + 13;
-            if (!api_prefix[0]) {
-                fprintf(stderr, "picoweb: --api-prefix requires a non-empty value\n");
-                return 1;
-            }
+        if (strcmp(argv[i], "--tls-busy-poll") == 0) {
+            tls_busy_poll = true;
             continue;
         }
         if (npos < (int)(sizeof(pos)/sizeof(pos[0]))) {
@@ -305,14 +290,6 @@ int main(int argc, char** argv) {
      * jumptable_build (which calls metrics_build_resources for /stats). */
     metrics_init((int)workers);
 
-    /* Initialise the JSON-file API. Disabled if --api-root not given;
-     * api_path_matches() will return false and the static file path
-     * remains the only route. */
-    api_init(api_root, api_prefix);
-    if (api_root) {
-        metal_log("picoweb: api enabled, root=%s, prefix=%s", api_root, api_prefix);
-    }
-
     /* Build the immutable jump table once on the main thread. */
     static jumptable_t jt;
     if (!jumptable_build(&jt, wwwroot)) {
@@ -340,6 +317,7 @@ int main(int argc, char** argv) {
         cfgs[i].tls_use_xdp           = tls_use_xdp;
         cfgs[i].tls_xdp_queue         = tls_xdp_queue;
         cfgs[i].http_early_hints      = http_early_hints;
+        cfgs[i].tls_busy_poll         = tls_busy_poll;
         /* SQPOLL kernel-thread CPU policy: avoid pinning the kernel
          * polling thread to the same core as its userspace worker
          * (worker i is pinned to (i % nproc)) — they'd thrash one
