@@ -1,6 +1,7 @@
 #include "conn.h"
 #include "frames.h"
 #include "tls_ext.h"
+#include "keys.h"
 
 #include <string.h>
 
@@ -12,6 +13,10 @@ void quic_conn_init_server(quic_conn_t* c)
                         c->rx_initial_data, sizeof c->rx_initial_data,
                         c->rx_initial_bm,   sizeof c->rx_initial_bm);
     quic_crypto_tx_init(&c->tx_initial);
+    quic_crypto_rx_init(&c->rx_handshake,
+                        c->rx_handshake_data, sizeof c->rx_handshake_data,
+                        c->rx_handshake_bm,   sizeof c->rx_handshake_bm);
+    quic_crypto_tx_init(&c->tx_handshake);
 }
 
 void quic_conn_force_derive_initial_keys(quic_conn_t* c,
@@ -325,5 +330,181 @@ size_t quic_conn_emit_initial(quic_conn_t* c, uint8_t* out, size_t out_cap)
 
     quic_crypto_tx_consume(&c->tx_initial, chunk_len);
     c->initial_tx_next_pn++;
+    return n;
+}
+
+/* ---- phase 5e5: Handshake-epoch tx + rx ---------------------------- */
+
+static int hs_keys_install_one(const uint8_t* secret, size_t secret_len,
+                               quic_handshake_keys_t* out)
+{
+    quic_keys_t big;
+    if (!quic_keys_from_secret(secret, secret_len, 16, 16, &big)) return -1;
+    /* Project quic_keys_t (variable-len storage) into the
+     * fixed-size handshake_keys_t (= initial_keys_t = AES-128). */
+    memcpy(out->key, big.key, 16);
+    memcpy(out->iv,  big.iv,  12);
+    memcpy(out->hp,  big.hp,  16);
+    return 0;
+}
+
+int quic_conn_install_handshake_secrets(quic_conn_t* c,
+                                        const uint8_t* tx_secret,
+                                        const uint8_t* rx_secret,
+                                        size_t secret_len)
+{
+    if (!c || !tx_secret || !rx_secret) return -1;
+    if (c->handshake_keys_ready) return 0;
+    quic_handshake_keys_t k_tx, k_rx;
+    if (hs_keys_install_one(tx_secret, secret_len, &k_tx) != 0) return -1;
+    if (hs_keys_install_one(rx_secret, secret_len, &k_rx) != 0) return -1;
+    c->handshake_tx_keys = k_tx;
+    c->handshake_rx_keys = k_rx;
+    c->handshake_keys_ready = 1;
+    return 0;
+}
+
+void quic_conn_handshake_tx_set_pending(quic_conn_t* c,
+                                        const uint8_t* bytes, size_t len)
+{
+    if (!c) return;
+    quic_crypto_tx_set_pending(&c->tx_handshake, bytes, len);
+}
+
+static int frame_allowed_in_handshake(uint8_t t)
+{
+    switch (t) {
+    case QUIC_FT_PADDING:
+    case QUIC_FT_PING:
+    case QUIC_FT_ACK:
+    case QUIC_FT_ACK_ECN:
+    case QUIC_FT_CRYPTO:
+    case QUIC_FT_CONNECTION_CLOSE:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+int quic_conn_recv_handshake(quic_conn_t* c,
+                             const uint8_t* datagram, size_t len)
+{
+    if (!c || !datagram) return -1;
+    if (!c->handshake_keys_ready) return -1;
+    if (len < 7) return -1;
+    /* Long header + fixed bit set; type bits = 10 (Handshake). */
+    if ((datagram[0] & 0xc0) != 0xc0) return -1;
+    if ((datagram[0] & 0x30) != 0x20) return -1;
+    uint32_t version = ((uint32_t)datagram[1] << 24) |
+                       ((uint32_t)datagram[2] << 16) |
+                       ((uint32_t)datagram[3] << 8)  |
+                        (uint32_t)datagram[4];
+    if (version != 0x00000001u) return -1;
+
+    quic_handshake_pkt_t pkt;
+    uint8_t scratch[2048];
+    if (quic_handshake_parse(datagram, len, &c->handshake_rx_keys,
+                             &pkt, scratch, sizeof scratch) != 0) {
+        return -1;
+    }
+    c->handshake_pkts_rcvd++;
+
+    size_t fo = 0;
+    while (fo < pkt.payload_len) {
+        quic_frame_t f;
+        size_t consumed = quic_frame_decode(pkt.payload + fo,
+                                            pkt.payload_len - fo, &f);
+        if (consumed == 0) break;
+        if (consumed == QUIC_FRAME_DECODE_ERROR) return -1;
+        fo += consumed;
+
+        if (!frame_allowed_in_handshake(f.type)) return -1;
+
+        switch (f.type) {
+        case QUIC_FT_CRYPTO: {
+            int rc = quic_crypto_rx_stage(&c->rx_handshake,
+                                          f.u.crypto.offset,
+                                          f.u.crypto.data,
+                                          (size_t)f.u.crypto.length);
+            if (rc < 0) return -1;
+            c->handshake_crypto_bytes_rcvd += f.u.crypto.length;
+            c->handshake_ack_eliciting_rcvd++;
+            break;
+        }
+        case QUIC_FT_PING:
+            c->handshake_ack_eliciting_rcvd++;
+            break;
+        case QUIC_FT_ACK:
+        case QUIC_FT_ACK_ECN:
+        case QUIC_FT_PADDING:
+        case QUIC_FT_CONNECTION_CLOSE:
+            break;
+        default:
+            return -1;
+        }
+    }
+    return 0;
+}
+
+const uint8_t* quic_conn_handshake_rx_peek(const quic_conn_t* c, size_t* out_len)
+{
+    return quic_crypto_rx_peek(&c->rx_handshake, out_len);
+}
+
+void quic_conn_handshake_rx_advance(quic_conn_t* c, size_t n)
+{
+    quic_crypto_rx_advance(&c->rx_handshake, n);
+}
+
+size_t quic_conn_emit_handshake(quic_conn_t* c, uint8_t* out, size_t out_cap)
+{
+    if (!c || !out) return 0;
+    if (!c->peer_addrs_known) return 0;
+    if (!c->handshake_keys_ready) return 0;
+
+    /* Same overhead model as Initial except no token_len byte. */
+    const size_t aead_tag = 16;
+    const size_t hdr_overhead = 1 + 4 + 1 + c->peer_scid_len
+                                + 1 + c->our_scid_len
+                                + 2 /* length varint */
+                                + 2 /* pn_len */;
+    const size_t crypto_frame_overhead = 1 + 8 + 8;
+    const size_t fixed = hdr_overhead + crypto_frame_overhead + aead_tag;
+    if (out_cap <= fixed) return 0;
+    size_t chunk_budget = out_cap - fixed;
+
+    uint64_t       chunk_off = 0;
+    const uint8_t* chunk_ptr = NULL;
+    size_t         chunk_len = 0;
+    if (quic_crypto_tx_next(&c->tx_handshake, chunk_budget,
+                            &chunk_off, &chunk_ptr, &chunk_len) != 1) {
+        return 0;
+    }
+
+    uint8_t frames[2048];
+    if (chunk_len + 32 > sizeof frames) chunk_len = sizeof frames - 32;
+    size_t fn = quic_frame_crypto_encode(frames, sizeof frames,
+                                         chunk_off, chunk_ptr, chunk_len);
+    if (fn == 0) return 0;
+
+    quic_handshake_pkt_t pkt = {0};
+    pkt.version = 0x00000001u;
+    if (c->peer_scid_len > 0)
+        memcpy(pkt.dcid, c->peer_scid, c->peer_scid_len);
+    pkt.dcid_len = c->peer_scid_len;
+    if (c->our_scid_len > 0)
+        memcpy(pkt.scid, c->our_scid, c->our_scid_len);
+    pkt.scid_len = c->our_scid_len;
+    pkt.pn = c->handshake_tx_next_pn;
+    pkt.pn_len = 2;
+    pkt.payload = frames;
+    pkt.payload_len = fn;
+
+    size_t n = quic_handshake_build(out, out_cap, &pkt,
+                                    &c->handshake_tx_keys);
+    if (n == 0) return 0;
+
+    quic_crypto_tx_consume(&c->tx_handshake, chunk_len);
+    c->handshake_tx_next_pn++;
     return n;
 }

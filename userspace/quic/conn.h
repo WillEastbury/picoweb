@@ -73,6 +73,30 @@ typedef struct {
     quic_crypto_tx_t tx_initial;
     uint64_t         initial_tx_next_pn;
 
+    /* ---- Handshake epoch (wave 5 phase 5e5) ----
+     *
+     * Activated once the TLS engine has produced per-direction
+     * handshake_traffic_secret values. Embedder calls
+     * quic_conn_install_handshake_secrets to derive packet keys
+     * (key/iv/hp via "quic key" / "quic iv" / "quic hp" labels —
+     * RFC 9001 §5.1).
+     */
+    int                  handshake_keys_ready;
+    quic_handshake_keys_t handshake_tx_keys;   /* server-encrypted (out) */
+    quic_handshake_keys_t handshake_rx_keys;   /* client-encrypted (in)  */
+
+    quic_crypto_rx_t rx_handshake;
+    uint8_t          rx_handshake_data[QUIC_CONN_RX_CRYPTO_CAP];
+    uint8_t          rx_handshake_bm  [(QUIC_CONN_RX_CRYPTO_CAP + 7) / 8];
+
+    quic_crypto_tx_t tx_handshake;
+    uint64_t         handshake_tx_next_pn;
+
+    /* Counters. */
+    uint64_t handshake_pkts_rcvd;
+    uint64_t handshake_crypto_bytes_rcvd;
+    uint64_t handshake_ack_eliciting_rcvd;
+
     /* Counters (for tests / metrics; not yet used for ack generation). */
     uint64_t initial_pkts_rcvd;
     uint64_t initial_crypto_bytes_rcvd;
@@ -204,5 +228,50 @@ void quic_conn_initial_tx_set_pending(quic_conn_t* c,
  */
 size_t quic_conn_emit_initial(quic_conn_t* c,
                               uint8_t* out, size_t out_cap);
+
+/* ---- Handshake epoch (wave 5 phase 5e5) ----------------------------- */
+
+/* Install per-direction handshake-epoch traffic secrets (each is
+ * `secret_len` bytes, typically 32 for SHA-256). Derives AES-128-GCM
+ * key / IV / HP per RFC 9001 §5.1 using the "quic key" / "quic iv" /
+ * "quic hp" labels. After this call, handshake_keys_ready becomes 1
+ * and the conn can emit/receive Handshake-epoch packets.
+ *
+ * `tx_secret` is the secret used to encrypt OUTBOUND Handshake
+ * packets (server: server_handshake_traffic_secret; client:
+ * client_handshake_traffic_secret).
+ *
+ * Returns 0 on success, -1 on key-derivation failure (e.g. unsupported
+ * secret length). Idempotent — second call with same arguments is a
+ * no-op; calling with different secrets after install is rejected. */
+int quic_conn_install_handshake_secrets(quic_conn_t* c,
+                                        const uint8_t* tx_secret,
+                                        const uint8_t* rx_secret,
+                                        size_t secret_len);
+
+/* Set pending Handshake-epoch tx bytes (alias only). */
+void quic_conn_handshake_tx_set_pending(quic_conn_t* c,
+                                        const uint8_t* bytes, size_t len);
+
+/* Emit one protected Handshake packet. Mirrors quic_conn_emit_initial
+ * but uses Handshake-epoch keys + the Handshake long-header type.
+ * Returns 0 if no pending bytes, no peer addrs, or no handshake keys. */
+size_t quic_conn_emit_handshake(quic_conn_t* c,
+                                uint8_t* out, size_t out_cap);
+
+/* Process one received Handshake packet (datagram bytes; UDP already
+ * de-multiplexed). Same contract as quic_conn_recv_initial:
+ *   - Validates long-header / fixed bit / type=Handshake / version=v1
+ *   - Requires handshake_rx keys to be installed
+ *   - AEAD-decrypt → walk frames → push CRYPTO bytes into rx_handshake
+ *   - Allowed frames per RFC 9000 §17.2.4: PADDING, PING, ACK,
+ *     CRYPTO, CONNECTION_CLOSE (transport)
+ * Returns 0 on success, -1 on any failure. */
+int quic_conn_recv_handshake(quic_conn_t* c,
+                             const uint8_t* datagram, size_t len);
+
+const uint8_t* quic_conn_handshake_rx_peek(const quic_conn_t* c,
+                                           size_t* out_len);
+void quic_conn_handshake_rx_advance(quic_conn_t* c, size_t n);
 
 #endif

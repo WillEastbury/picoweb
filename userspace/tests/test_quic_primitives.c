@@ -2520,6 +2520,173 @@ static void test_handshake_pkt_rejects_bad_version(void) {
               -1);
 }
 
+/* ---------------- phase 5e5: handshake-epoch on conn ----------------- */
+
+/* Helper: install matched handshake secrets on a server conn so it can
+ * encrypt/decrypt against itself (we synthesize a "client" conn with
+ * the secrets swapped). */
+static void install_matched_hs_secrets(quic_conn_t* server,
+                                       quic_conn_t* client_view)
+{
+    static const uint8_t s_secret[32] = {
+        0x11,0x22,0x33,0x44,0x55,0x66,0x77,0x88,
+        0x99,0xaa,0xbb,0xcc,0xdd,0xee,0xff,0x00,
+        0x10,0x20,0x30,0x40,0x50,0x60,0x70,0x80,
+        0x90,0xa0,0xb0,0xc0,0xd0,0xe0,0xf0,0x01,
+    };
+    static const uint8_t c_secret[32] = {
+        0xa1,0xb2,0xc3,0xd4,0xe5,0xf6,0x07,0x18,
+        0x29,0x3a,0x4b,0x5c,0x6d,0x7e,0x8f,0x90,
+        0x01,0x12,0x23,0x34,0x45,0x56,0x67,0x78,
+        0x89,0x9a,0xab,0xbc,0xcd,0xde,0xef,0xf0,
+    };
+    /* server sends with s_secret, receives with c_secret. */
+    if (quic_conn_install_handshake_secrets(server,
+                                            s_secret, c_secret, 32) != 0) {
+        printf("  FATAL: hs install (server)\n"); exit(2);
+    }
+    if (client_view) {
+        /* client view receives with s_secret, sends with c_secret. */
+        if (quic_conn_install_handshake_secrets(client_view,
+                                                c_secret, s_secret, 32) != 0) {
+            printf("  FATAL: hs install (client)\n"); exit(2);
+        }
+    }
+}
+
+static void test_conn_install_handshake_secrets(void) {
+    printf("== conn: install handshake secrets ==\n");
+    quic_conn_t conn;
+    quic_conn_init_server(&conn);
+    install_matched_hs_secrets(&conn, NULL);
+    check_int("hs keys ready", conn.handshake_keys_ready, 1);
+    check_int("rx and tx differ",
+              memcmp(conn.handshake_tx_keys.key,
+                     conn.handshake_rx_keys.key, 16) != 0, 1);
+}
+
+static void test_conn_install_handshake_secrets_idempotent(void) {
+    printf("== conn: install handshake secrets — idempotent ==\n");
+    quic_conn_t conn;
+    quic_conn_init_server(&conn);
+    install_matched_hs_secrets(&conn, NULL);
+    uint8_t saved[16]; memcpy(saved, conn.handshake_tx_keys.key, 16);
+    install_matched_hs_secrets(&conn, NULL);
+    check_int("keys unchanged", memcmp(saved, conn.handshake_tx_keys.key, 16), 0);
+}
+
+static void test_conn_emit_handshake_round_trip(void) {
+    printf("== conn: emit Handshake — round-trip via peer view ==\n");
+    quic_conn_t server, client;
+    server_conn_after_a2(&server);
+    quic_conn_init_server(&client);
+    /* Mirror peer addrs so the client view's recv path is happy. */
+    install_matched_hs_secrets(&server, &client);
+
+    static const uint8_t our_scid[] = {
+        0xb0,0xb1,0xb2,0xb3,0xb4,0xb5,0xb6,0xb7
+    };
+    quic_conn_set_our_scid(&server, our_scid, sizeof our_scid);
+
+    /* On the receiving (client) view, we need DCID+SCID set so we
+     * decode against the same fields the server sends. The server
+     * uses peer_scid (from §A.2 client) as the wire DCID, and our_scid
+     * as SCID. The client view doesn't actually run quic_conn_recv_*
+     * for headers — quic_handshake_parse only needs the keys. So we
+     * decrypt with our installed handshake_rx_keys directly. */
+
+    uint8_t blob[400];
+    for (size_t i = 0; i < sizeof blob; i++) blob[i] = (uint8_t)(i * 7 + 3);
+    quic_conn_handshake_tx_set_pending(&server, blob, sizeof blob);
+
+    uint8_t out[1500];
+    size_t n = quic_conn_emit_handshake(&server, out, sizeof out);
+    check_int("emit produced bytes", n > 0, 1);
+    check_int("hs tx pn incremented",
+              (long)server.handshake_tx_next_pn, 1);
+
+    /* Decrypt via client_view's rx keys (= server's tx). */
+    quic_handshake_pkt_t got;
+    uint8_t scratch[1500];
+    int rc = quic_handshake_parse(out, n, &client.handshake_rx_keys,
+                                  &got, scratch, sizeof scratch);
+    check_int("client decrypt OK", rc, 0);
+    check_int("type=Handshake (0xE0 high nibble)",
+              (out[0] & 0xf0) == 0xe0 ? 0 : 1, 0);
+    check_int("payload non-empty", got.payload_len > 0, 1);
+}
+
+static void test_conn_emit_handshake_no_keys(void) {
+    printf("== conn: emit Handshake — no keys, no emit ==\n");
+    quic_conn_t conn;
+    server_conn_after_a2(&conn);
+    static const uint8_t scid[] = {1,2,3,4,5,6,7,8};
+    quic_conn_set_our_scid(&conn, scid, sizeof scid);
+    uint8_t blob[64]; memset(blob, 0x55, sizeof blob);
+    quic_conn_handshake_tx_set_pending(&conn, blob, sizeof blob);
+    uint8_t out[1500];
+    check_int("no keys → 0", (long)quic_conn_emit_handshake(&conn, out, sizeof out), 0);
+}
+
+static void test_conn_recv_handshake_round_trip(void) {
+    printf("== conn: recv Handshake — pulls CRYPTO bytes ==\n");
+    quic_conn_t server, client;
+    server_conn_after_a2(&server);
+    quic_conn_init_server(&client);
+    install_matched_hs_secrets(&server, &client);
+    /* Client view needs the same peer addrs to *send* (we make it
+     * symmetric by feeding it the same setup). */
+    /* For this test we just exercise server.emit → server.recv
+     * (via the matching key on server side after we swap). */
+
+    static const uint8_t scid[] = {0x10,0x11,0x12,0x13,0x14,0x15,0x16,0x17};
+    quic_conn_set_our_scid(&server, scid, sizeof scid);
+
+    static const uint8_t crypto[] = {
+        0xc0,0xff,0xee,0x42,0x13,0x37,0xaa,0xbb,
+        0xcc,0xdd,0xee,0xff,0x00,0x11,0x22,0x33,
+    };
+    quic_conn_handshake_tx_set_pending(&server, crypto, sizeof crypto);
+
+    uint8_t out[1500];
+    size_t n = quic_conn_emit_handshake(&server, out, sizeof out);
+    if (n == 0) { printf("  FAIL: emit 0\n"); g_fail++; return; }
+
+    /* Feed into the client view's recv pump. */
+    int rc = quic_conn_recv_handshake(&client, out, n);
+    check_int("recv OK", rc, 0);
+    check_int("hs pkts++", (long)client.handshake_pkts_rcvd, 1);
+    check_int("crypto bytes accounted",
+              (long)client.handshake_crypto_bytes_rcvd, (long)sizeof crypto);
+
+    size_t avail = 0;
+    const uint8_t* p = quic_conn_handshake_rx_peek(&client, &avail);
+    check_int("rx avail equals crypto len", (long)avail, (long)sizeof crypto);
+    if (p) check_int("rx bytes match", memcmp(p, crypto, sizeof crypto), 0);
+}
+
+static void test_conn_recv_handshake_rejects_initial_type(void) {
+    printf("== conn: recv Handshake — rejects Initial-type byte ==\n");
+    quic_conn_t conn;
+    quic_conn_init_server(&conn);
+    install_matched_hs_secrets(&conn, NULL);
+    uint8_t fake[64]; memset(fake, 0, sizeof fake);
+    fake[0] = 0xc0; /* long+fixed, type=00 (Initial) */
+    fake[1] = 0; fake[2] = 0; fake[3] = 0; fake[4] = 1;
+    check_int("Initial type rejected",
+              quic_conn_recv_handshake(&conn, fake, sizeof fake), -1);
+}
+
+static void test_conn_recv_handshake_rejects_no_keys(void) {
+    printf("== conn: recv Handshake — no keys → -1 ==\n");
+    quic_conn_t conn;
+    quic_conn_init_server(&conn);
+    uint8_t fake[64]; memset(fake, 0, sizeof fake);
+    fake[0] = 0xe0;
+    check_int("no keys → -1",
+              quic_conn_recv_handshake(&conn, fake, sizeof fake), -1);
+}
+
 /* ============================================================== */
 
 int main(void) {
@@ -2631,6 +2798,14 @@ int main(void) {
     test_handshake_pkt_round_trip();
     test_handshake_pkt_rejects_initial_type();
     test_handshake_pkt_rejects_bad_version();
+
+    test_conn_install_handshake_secrets();
+    test_conn_install_handshake_secrets_idempotent();
+    test_conn_emit_handshake_round_trip();
+    test_conn_emit_handshake_no_keys();
+    test_conn_recv_handshake_round_trip();
+    test_conn_recv_handshake_rejects_initial_type();
+    test_conn_recv_handshake_rejects_no_keys();
 
     printf("\n=== RESULTS: PASS=%d FAIL=%d ===\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
