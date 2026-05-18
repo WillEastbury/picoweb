@@ -55,6 +55,24 @@ typedef struct {
     uint8_t          rx_initial_data[QUIC_CONN_RX_CRYPTO_CAP];
     uint8_t          rx_initial_bm  [(QUIC_CONN_RX_CRYPTO_CAP + 7) / 8];
 
+    /* ---- tx side (wave 5 phase 5e3) ---- */
+
+    /* Initial-epoch packet protection for outbound packets. Same DCID
+     * seed as `initial_keys` but derived with the opposite is_server
+     * sense. Lazily derived once peer_dcid is known. */
+    int                  initial_tx_keys_ready;
+    quic_initial_keys_t  initial_tx_keys;
+
+    /* Our chosen SCID — appears as the SCID in long-header packets we
+     * emit, and as the DCID the peer uses to address us in subsequent
+     * packets after the first server response. */
+    uint8_t  our_scid[QUIC_MAX_CID_LEN];
+    size_t   our_scid_len;
+
+    /* Outbound CRYPTO byte stream + next packet number for Initial. */
+    quic_crypto_tx_t tx_initial;
+    uint64_t         initial_tx_next_pn;
+
     /* Counters (for tests / metrics; not yet used for ack generation). */
     uint64_t initial_pkts_rcvd;
     uint64_t initial_crypto_bytes_rcvd;
@@ -129,5 +147,62 @@ int quic_conn_initial_extract_client_hello(const quic_conn_t* c,
  * driving an actual packet through). Idempotent. */
 void quic_conn_force_derive_initial_keys(quic_conn_t* c,
                                          const uint8_t* dcid, size_t dcid_len);
+
+/* ---- tx side (wave 5 phase 5e3) -------------------------------------
+ *
+ * Outbound Initial-packet emission. The flow:
+ *
+ *   1. Embedder receives the first client Initial via
+ *      quic_conn_recv_initial — that records peer_dcid / peer_scid.
+ *   2. Embedder picks its own SCID (random or deterministic) and
+ *      installs it via quic_conn_set_our_scid.
+ *   3. TLS engine produces a server flight prefix (typically a
+ *      ServerHello). Embedder hands the bytes to
+ *      quic_conn_initial_tx_set_pending — an alias, not a copy; the
+ *      memory must remain valid until the bytes have been emitted.
+ *   4. Embedder calls quic_conn_emit_initial repeatedly until it
+ *      returns 0 (no more pending bytes). Each call produces one
+ *      protected Initial packet on the wire.
+ *
+ * Server-direction Initial keys are lazily derived from peer_dcid
+ * (the same DCID seed used to derive the inbound keys, RFC 9001 §5.2)
+ * with the opposite is_server sense.
+ */
+
+/* Install our SCID (the source connection id we put in long-header
+ * packets we emit). May be 0..QUIC_MAX_CID_LEN bytes. */
+void quic_conn_set_our_scid(quic_conn_t* c,
+                            const uint8_t* scid, size_t scid_len);
+
+/* Set the pending bytes to be emitted in CRYPTO frames during the
+ * Initial epoch. Aliases (no copy) — the buffer must remain valid
+ * for the lifetime of the emission. Resets the pending region; offsets
+ * already consumed are NOT reset (that would re-send already-emitted
+ * bytes with the wrong CRYPTO offset). */
+void quic_conn_initial_tx_set_pending(quic_conn_t* c,
+                                      const uint8_t* bytes, size_t len);
+
+/* Emit one protected Initial packet.
+ *
+ * Builds: a single CRYPTO frame carrying the next chunk of pending
+ * tx bytes, packed into a long-header Initial packet addressed to the
+ * peer (DCID = peer_scid, SCID = our_scid), AEAD-sealed and header-
+ * protected via the lazily-derived server-direction Initial keys.
+ *
+ * Pre-conditions:
+ *   - peer addresses must be known (a prior quic_conn_recv_initial
+ *     must have succeeded), and our_scid must have been installed.
+ *
+ * Returns the number of wire bytes written to `out` (>= 0). 0 means
+ * either there are no pending bytes to send, out_cap is too small to
+ * hold even a minimal packet, or pre-conditions are not met.
+ *
+ * Side effects on success:
+ *   - tx_initial cursor is advanced by the chunk size emitted
+ *   - initial_tx_next_pn is incremented
+ *   - initial_tx_keys are derived if not yet ready
+ */
+size_t quic_conn_emit_initial(quic_conn_t* c,
+                              uint8_t* out, size_t out_cap);
 
 #endif
