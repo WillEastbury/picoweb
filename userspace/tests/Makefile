@@ -71,7 +71,9 @@ QUIC_PRIM_SRC := \
     ../quic/crypto_stream.c      \
     ../quic/keys.c               \
     ../quic/tls_ext.c            \
-    ../quic/conn.c
+    ../quic/conn.c               \
+    ../quic/handshake_driver.c   \
+    ../crypto/x25519.c
 
 .PHONY: all clean test
 

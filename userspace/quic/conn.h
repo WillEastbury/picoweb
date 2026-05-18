@@ -97,6 +97,35 @@ typedef struct {
     uint64_t handshake_crypto_bytes_rcvd;
     uint64_t handshake_ack_eliciting_rcvd;
 
+    /* ---- Handshake-secret persistence (wave 5 phase 5e6) ----
+     *
+     * Populated by quic_server_drive_handshake; consumed by phase 5e7
+     * (client Finished verify + 1-RTT key derivation).
+     */
+    int     have_handshake_state;
+    uint8_t handshake_secret               [32];
+    uint8_t client_handshake_traffic_secret[32];
+    uint8_t server_handshake_traffic_secret[32];
+    /* Transcript hash (SHA-256) up to AND including the server
+     * Finished — fed into tls13_compute_application_secrets to derive
+     * 1-RTT traffic secrets in phase 5e7. */
+    uint8_t transcript_hash_thru_server_fin[32];
+
+    /* ---- Driver-owned scratch (wave 5 phase 5e6) ----
+     *
+     * The Initial / Handshake tx aliases REQUIRE the byte buffers to
+     * outlive set_pending. The handshake driver writes its built
+     * messages into these conn-resident arenas and points the tx
+     * pipelines at them. Sized to comfortably fit a one-shot server
+     * flight: SH < 200B; EE+Cert(ed25519 leaf, ~1 KB)+CV+Fin < 2 KB.
+     */
+#define QUIC_CONN_DRV_INITIAL_CAP   256u
+#define QUIC_CONN_DRV_HANDSHAKE_CAP 8192u
+    uint8_t drv_initial_blob   [QUIC_CONN_DRV_INITIAL_CAP];
+    size_t  drv_initial_blob_len;
+    uint8_t drv_handshake_blob [QUIC_CONN_DRV_HANDSHAKE_CAP];
+    size_t  drv_handshake_blob_len;
+
     /* Counters (for tests / metrics; not yet used for ack generation). */
     uint64_t initial_pkts_rcvd;
     uint64_t initial_crypto_bytes_rcvd;
