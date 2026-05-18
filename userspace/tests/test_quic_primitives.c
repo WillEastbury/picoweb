@@ -20,6 +20,7 @@
 #include "../quic/varint.h"
 #include "../quic/initial.h"
 #include "../quic/packet.h"
+#include "../quic/frames.h"
 
 static int g_pass = 0;
 static int g_fail = 0;
@@ -578,6 +579,218 @@ static void test_quic_initial_parse_a2(void) {
 }
 
 /* ============================================================== */
+/* Phase 4a — QUIC frame codec (RFC 9000 §19)                     */
+/* ============================================================== */
+
+static void test_frame_padding_and_ping(void) {
+    printf("== QUIC frames: PADDING + PING ==\n");
+    uint8_t buf[16];
+    /* PADDING: encode 5 zeros, decode collapses to one frame. */
+    size_t n = quic_frame_padding_encode(buf, sizeof buf, 5);
+    check_int("padding encoded len", (long)n, 5);
+    quic_frame_t f;
+    size_t c = quic_frame_decode(buf, n, &f);
+    check_int("padding consumed", (long)c, 5);
+    check_int("padding type", f.type, QUIC_FT_PADDING);
+    check_int("padding count", (long)f.u.padding_count, 5);
+
+    /* PING: 1 byte 0x01. */
+    n = quic_frame_ping_encode(buf, sizeof buf);
+    check_int("ping encoded len", (long)n, 1);
+    c = quic_frame_decode(buf, n, &f);
+    check_int("ping consumed", (long)c, 1);
+    check_int("ping type", f.type, QUIC_FT_PING);
+
+    /* HANDSHAKE_DONE: 1 byte 0x1e. */
+    n = quic_frame_handshake_done_encode(buf, sizeof buf);
+    check_int("hs_done encoded len", (long)n, 1);
+    c = quic_frame_decode(buf, n, &f);
+    check_int("hs_done type", f.type, QUIC_FT_HANDSHAKE_DONE);
+}
+
+static void test_frame_crypto_roundtrip(void) {
+    printf("== QUIC frames: CRYPTO round-trip ==\n");
+    uint8_t buf[300];
+    uint8_t payload[241];
+    for (size_t i = 0; i < sizeof payload; i++) payload[i] = (uint8_t)(i & 0xff);
+    size_t n = quic_frame_crypto_encode(buf, sizeof buf, 0,
+                                        payload, sizeof payload);
+    /* 1 (type) + 1 (offset varint) + 2 (length 241 -> 0x40f1) + 241. */
+    check_int("crypto encoded len", (long)n, 1 + 1 + 2 + 241);
+    quic_frame_t f;
+    size_t c = quic_frame_decode(buf, n, &f);
+    check_int("crypto consumed", (long)c, (long)n);
+    check_int("crypto type", f.type, QUIC_FT_CRYPTO);
+    check_int("crypto offset", (long)f.u.crypto.offset, 0);
+    check_int("crypto length", (long)f.u.crypto.length, 241);
+    check_eq("crypto data view", f.u.crypto.data, payload, sizeof payload);
+
+    /* Larger offset that needs 2-byte varint. */
+    n = quic_frame_crypto_encode(buf, sizeof buf, 12345,
+                                 payload, 10);
+    c = quic_frame_decode(buf, n, &f);
+    check_int("crypto2 consumed", (long)c, (long)n);
+    check_int("crypto2 offset", (long)f.u.crypto.offset, 12345);
+    check_int("crypto2 length", (long)f.u.crypto.length, 10);
+}
+
+static void test_frame_ack_roundtrip(void) {
+    printf("== QUIC frames: ACK round-trip ==\n");
+    uint8_t buf[32];
+    /* ACKs packets [10..15], so largest=15, first_range=5, no extra. */
+    size_t n = quic_frame_ack_encode(buf, sizeof buf, 15, 1234, 5);
+    check_int("ack encoded byte0", buf[0], 0x02);
+    quic_frame_t f;
+    size_t c = quic_frame_decode(buf, n, &f);
+    check_int("ack consumed", (long)c, (long)n);
+    check_int("ack type", f.type, QUIC_FT_ACK);
+    check_int("ack largest", (long)f.u.ack.largest, 15);
+    check_int("ack delay raw", (long)f.u.ack.delay, 1234);
+    check_int("ack range_count", (long)f.u.ack.range_count, 0);
+    check_int("ack first_range", (long)f.u.ack.first_range, 5);
+    check_int("ack ecn off", f.u.ack.has_ecn, 0);
+}
+
+static void test_frame_stream_roundtrip(void) {
+    printf("== QUIC frames: STREAM round-trip ==\n");
+    uint8_t buf[64];
+    const uint8_t data[] = "hello, h3";
+    size_t n = quic_frame_stream_encode(buf, sizeof buf,
+                                        4 /* stream id */, 100 /* offset */,
+                                        data, sizeof data - 1, 1 /* fin */);
+    check_int("stream byte0 has off|len|fin",
+              buf[0], 0x08 | 0x04 | 0x02 | 0x01);
+    quic_frame_t f;
+    size_t c = quic_frame_decode(buf, n, &f);
+    check_int("stream consumed", (long)c, (long)n);
+    check_int("stream type", f.type, QUIC_FT_STREAM);
+    check_int("stream id", (long)f.u.stream.stream_id, 4);
+    check_int("stream offset", (long)f.u.stream.offset, 100);
+    check_int("stream length", (long)f.u.stream.length, sizeof data - 1);
+    check_int("stream fin", f.u.stream.fin, 1);
+    check_eq("stream data view", f.u.stream.data, data, sizeof data - 1);
+}
+
+static void test_frame_close_roundtrip(void) {
+    printf("== QUIC frames: CONNECTION_CLOSE round-trip ==\n");
+    uint8_t buf[64];
+    const uint8_t reason[] = "bye";
+    /* Transport close: 0x1c, error 0x07 (FRAME_ENCODING_ERROR), frame_type 0. */
+    size_t n = quic_frame_close_encode(buf, sizeof buf, 0, 0x07, 0,
+                                       reason, sizeof reason - 1);
+    quic_frame_t f;
+    size_t c = quic_frame_decode(buf, n, &f);
+    check_int("close consumed", (long)c, (long)n);
+    check_int("close type", f.type, QUIC_FT_CONNECTION_CLOSE);
+    check_int("close is_app", f.u.close.is_app, 0);
+    check_int("close error", (long)f.u.close.error_code, 0x07);
+    check_int("close frame_type", (long)f.u.close.frame_type, 0);
+    check_int("close reason_len", (long)f.u.close.reason_len, 3);
+    check_eq("close reason", f.u.close.reason, reason, 3);
+
+    /* App close: 0x1d (no frame_type field). */
+    n = quic_frame_close_encode(buf, sizeof buf, 1, 0x100, 0, NULL, 0);
+    c = quic_frame_decode(buf, n, &f);
+    check_int("close_app consumed", (long)c, (long)n);
+    check_int("close_app type", f.type, QUIC_FT_CONNECTION_CLOSE_A);
+    check_int("close_app is_app", f.u.close.is_app, 1);
+    check_int("close_app error", (long)f.u.close.error_code, 0x100);
+    check_int("close_app reason_len", (long)f.u.close.reason_len, 0);
+}
+
+/* RFC 9001 §A.3 server frames: ACK followed by CRYPTO(ServerHello). */
+static void test_frame_decode_a3_payload(void) {
+    printf("== QUIC frames: decode RFC 9001 §A.3 server payload ==\n");
+    uint8_t frames[256];
+    size_t frames_n = unhex(SERVER_INITIAL_FRAMES_HEX, frames, sizeof frames);
+    check_int("a3 frames length", (long)frames_n, 99);
+
+    size_t off = 0;
+    quic_frame_t f;
+    /* Frame 1: ACK 0x02 largest=0 delay=0 range_count=0 first_range=0. */
+    size_t c = quic_frame_decode(frames + off, frames_n - off, &f);
+    check_int("a3 frame1 consumed", (long)c, 5);
+    check_int("a3 frame1 type", f.type, QUIC_FT_ACK);
+    check_int("a3 frame1 largest", (long)f.u.ack.largest, 0);
+    check_int("a3 frame1 first_range", (long)f.u.ack.first_range, 0);
+    off += c;
+
+    /* Frame 2: CRYPTO 0x06 offset=0 length=0x405a (=90) data=ServerHello. */
+    c = quic_frame_decode(frames + off, frames_n - off, &f);
+    check_int("a3 frame2 type", f.type, QUIC_FT_CRYPTO);
+    check_int("a3 frame2 offset", (long)f.u.crypto.offset, 0);
+    check_int("a3 frame2 length", (long)f.u.crypto.length, 90);
+    /* ServerHello starts with 0x02 (handshake type) 0x00 0x00 0x56 (length=86). */
+    check_int("a3 frame2 sh type", f.u.crypto.data[0], 0x02);
+    check_int("a3 frame2 sh len_lo", f.u.crypto.data[3], 0x56);
+    off += c;
+    check_int("a3 fully consumed", (long)off, (long)frames_n);
+}
+
+/* RFC 9001 §A.2 client decrypted payload: CRYPTO(ClientHello) + PADDING. */
+static void test_frame_decode_a2_payload(void) {
+    printf("== QUIC frames: decode RFC 9001 §A.2 client payload ==\n");
+    /* Re-derive client keys, parse the wire packet, then iterate frames. */
+    uint8_t dcid_seed[8];
+    unhex("8394c8f03e515708", dcid_seed, 8);
+    quic_initial_keys_t client_keys;
+    quic_initial_derive(dcid_seed, sizeof dcid_seed, 0, &client_keys);
+
+    uint8_t wire[1500];
+    size_t wire_n = unhex(CLIENT_INITIAL_PROTECTED_HEX, wire, sizeof wire);
+    quic_initial_pkt_t pkt;
+    uint8_t scratch[2048];
+    int rc = quic_initial_parse(wire, wire_n, &client_keys, &pkt,
+                                scratch, sizeof scratch);
+    check_int("a2 parse returns 0", rc, 0);
+    if (rc != 0) return;
+
+    /* Frame 1: CRYPTO offset=0 length=241 (varint 0x40 0xf1). */
+    quic_frame_t f;
+    size_t c = quic_frame_decode(pkt.payload, pkt.payload_len, &f);
+    check_int("a2 frame1 type", f.type, QUIC_FT_CRYPTO);
+    check_int("a2 frame1 offset", (long)f.u.crypto.offset, 0);
+    check_int("a2 frame1 length", (long)f.u.crypto.length, 241);
+    /* ClientHello handshake type. */
+    check_int("a2 frame1 ch type", f.u.crypto.data[0], 0x01);
+
+    /* Frame 2: PADDING run to end of payload. */
+    size_t consumed = c;
+    c = quic_frame_decode(pkt.payload + consumed,
+                          pkt.payload_len - consumed, &f);
+    check_int("a2 frame2 type", f.type, QUIC_FT_PADDING);
+    check_int("a2 frame2 spans rest",
+              (long)f.u.padding_count,
+              (long)(pkt.payload_len - consumed));
+    consumed += c;
+    check_int("a2 fully consumed", (long)consumed, (long)pkt.payload_len);
+}
+
+static void test_frame_decode_errors(void) {
+    printf("== QUIC frames: decode error paths ==\n");
+    quic_frame_t f;
+    /* Truncated CRYPTO: type + offset + length, but data missing. */
+    uint8_t buf1[] = { 0x06, 0x00, 0x40, 0x05, 0x01, 0x02 };  /* len=5, only 2 */
+    size_t c = quic_frame_decode(buf1, sizeof buf1, &f);
+    check_int("crypto truncated rejected", c == QUIC_FRAME_DECODE_ERROR, 1);
+
+    /* Truncated STREAM: OFF|LEN bits, length larger than remaining bytes. */
+    uint8_t buf2[] = { 0x0e, 0x04, 0x00, 0x40, 0x10, 0xaa };
+    c = quic_frame_decode(buf2, sizeof buf2, &f);
+    check_int("stream truncated rejected", c == QUIC_FRAME_DECODE_ERROR, 1);
+
+    /* NEW_TOKEN with length=0 is illegal per RFC 9000 §19.7. */
+    uint8_t buf3[] = { 0x07, 0x00 };
+    c = quic_frame_decode(buf3, sizeof buf3, &f);
+    check_int("new_token zero-len rejected", c == QUIC_FRAME_DECODE_ERROR, 1);
+
+    /* Empty input returns 0 (not an error). */
+    c = quic_frame_decode(NULL, 0, &f);
+    check_int("empty input returns 0", (long)c, 0);
+}
+
+/* ============================================================== */
+
 
 int main(void) {
     test_udp_build_parse_roundtrip();
@@ -599,6 +812,15 @@ int main(void) {
     test_quic_initial_keys_a1();
     test_quic_initial_build_a3();
     test_quic_initial_parse_a2();
+
+    test_frame_padding_and_ping();
+    test_frame_crypto_roundtrip();
+    test_frame_ack_roundtrip();
+    test_frame_stream_roundtrip();
+    test_frame_close_roundtrip();
+    test_frame_decode_a3_payload();
+    test_frame_decode_a2_payload();
+    test_frame_decode_errors();
 
     printf("\n=== RESULTS: PASS=%d FAIL=%d ===\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
