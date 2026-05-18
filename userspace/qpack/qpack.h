@@ -89,4 +89,40 @@ size_t qpack_encode_prefix_empty(uint8_t* out, size_t cap);
 /* Static table size (RFC 9204 Appendix A). */
 #define QPACK_STATIC_TABLE_SIZE 99u
 
+/* ---- Static Huffman codec (RFC 7541 Appendix B) ----------------- */
+
+/* Compute the exact encoded byte length for `in_len` source bytes. */
+size_t qpack_huffman_encoded_len(const uint8_t* in, size_t in_len);
+
+/* Encode `in` into `out`. Returns bytes written, or 0 on overflow. */
+size_t qpack_huffman_encode(uint8_t* out, size_t cap,
+                            const uint8_t* in, size_t in_len);
+
+/* Decode `in` into `out`. Returns bytes written, or (size_t)-1 on
+ * malformed input (invalid bit-pattern, EOS symbol present, padding
+ * not all-1s, or padding > 7 bits). Returns (size_t)-2 if the output
+ * buffer is too small (well-formed input but cannot fit). */
+size_t qpack_huffman_decode(uint8_t* out, size_t cap,
+                            const uint8_t* in, size_t in_len);
+
+#define QPACK_HUFF_ERR_INVALID  ((size_t)-1)
+#define QPACK_HUFF_ERR_OVERFLOW ((size_t)-2)
+
+/* Decode a complete encoded field section, with a caller-supplied
+ * scratch buffer used to hold any Huffman-decoded name/value strings.
+ * Field pointers in `out` may point either into `in` (for non-Huffman
+ * literals and indexed strings via the static table) or into `scratch`
+ * (for Huffman-decoded literals).
+ *
+ * `scratch_used_out` (optional) returns the number of scratch bytes
+ * actually consumed.
+ *
+ * Returns QPACK_OK on success, or a QPACK_ERR_* code on failure. */
+qpack_status_t qpack_decode_field_section_huff(const uint8_t* in, size_t in_len,
+                                               qpack_field_t* out,
+                                               size_t* out_count_in_out,
+                                               uint8_t* scratch,
+                                               size_t scratch_cap,
+                                               size_t* scratch_used_out);
+
 #endif

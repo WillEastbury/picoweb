@@ -3658,6 +3658,183 @@ static void test_qpack_realistic_response(void) {
               memcmp(fields[2].name, "content-type", 12) == 0, 1);
 }
 
+/* ===== phase 6d2 — Huffman codec + huff-aware decode ============= */
+
+static void test_huff_roundtrip(const char* what, const uint8_t* in, size_t in_len) {
+    printf("== huff: round-trip %s ==\n", what);
+    uint8_t enc[512];
+    size_t  expect = qpack_huffman_encoded_len(in, in_len);
+    size_t  got    = qpack_huffman_encode(enc, sizeof enc, in, in_len);
+    check_int("encoded length matches predicted", got == expect, 1);
+    uint8_t dec[512];
+    size_t  dl = qpack_huffman_decode(dec, sizeof dec, enc, got);
+    check_int("decoded length matches input", dl == in_len, 1);
+    check_int("decoded bytes match input",
+              in_len == 0 || memcmp(dec, in, in_len) == 0, 1);
+}
+
+static void test_huff_rfc7541_c41(void) {
+    /* RFC 7541 Appendix C.4.1: "www.example.com" ⇒ 12 bytes Huffman.
+     *   f1e3 c2e5 f23a 6ba0 ab90 f4ff */
+    static const uint8_t in[]  = "www.example.com";
+    static const uint8_t exp[] = {0xf1,0xe3,0xc2,0xe5,0xf2,0x3a,0x6b,0xa0,0xab,0x90,0xf4,0xff};
+    printf("== huff: RFC 7541 C.4.1 www.example.com ==\n");
+    uint8_t enc[32];
+    size_t  got = qpack_huffman_encode(enc, sizeof enc, in, sizeof in - 1);
+    check_int("encoded length 12", (long)got, 12);
+    check_int("encoded bytes match RFC vector", memcmp(enc, exp, 12) == 0, 1);
+    uint8_t dec[32];
+    size_t  dl = qpack_huffman_decode(dec, sizeof dec, exp, sizeof exp);
+    check_int("decoded length 15", (long)dl, 15);
+    check_int("decoded matches", memcmp(dec, in, 15) == 0, 1);
+}
+
+static void test_huff_rfc7541_c43(void) {
+    /* RFC 7541 Appendix C.4.3: "custom-key" / "custom-value" via
+     * Huffman are two strings; here we just exercise "custom-key". */
+    static const uint8_t in[]  = "custom-key";
+    static const uint8_t exp[] = {0x25,0xa8,0x49,0xe9,0x5b,0xa9,0x7d,0x7f};
+    printf("== huff: RFC 7541 C.4.3 custom-key ==\n");
+    uint8_t enc[16];
+    size_t  got = qpack_huffman_encode(enc, sizeof enc, in, sizeof in - 1);
+    check_int("encoded length 8", (long)got, 8);
+    check_int("encoded matches RFC vector", memcmp(enc, exp, 8) == 0, 1);
+}
+
+static void test_huff_all_bytes(void) {
+    printf("== huff: round-trip all 256 byte values ==\n");
+    uint8_t in[256];
+    for (int i = 0; i < 256; ++i) in[i] = (uint8_t)i;
+    uint8_t enc[1024];
+    size_t  got = qpack_huffman_encode(enc, sizeof enc, in, 256);
+    check_int("encode succeeded", got != 0, 1);
+    uint8_t dec[256];
+    size_t  dl = qpack_huffman_decode(dec, sizeof dec, enc, got);
+    check_int("decode length 256", (long)dl, 256);
+    check_int("bytes round-trip", memcmp(dec, in, 256) == 0, 1);
+}
+
+static void test_huff_empty(void) {
+    printf("== huff: empty input encodes/decodes to empty ==\n");
+    uint8_t enc[8];
+    size_t  got = qpack_huffman_encode(enc, sizeof enc, NULL, 0);
+    check_int("encoded length 0", (long)got, 0);
+    uint8_t dec[8];
+    size_t  dl = qpack_huffman_decode(dec, sizeof dec, NULL, 0);
+    check_int("decoded length 0", (long)dl, 0);
+}
+
+static void test_huff_decode_rejects_eos(void) {
+    /* All-zero byte starts code 0x00000... never reaching a leaf in
+     * <=8 bits, so single 0x00 byte should be rejected (no symbol +
+     * padding != all-1s). */
+    printf("== huff: rejects 0x00 byte (no leaf, padding wrong) ==\n");
+    uint8_t in[]  = {0x00};
+    uint8_t out[8];
+    size_t  r = qpack_huffman_decode(out, sizeof out, in, 1);
+    check_int("returns invalid", r == (size_t)-1, 1);
+}
+
+static void test_huff_decode_rejects_excess_padding(void) {
+    /* "0" is symbol 48 with code 0x00 length 5. Encoded: 5 bits 00000
+     * + 3 bits padding 111 = byte 0x07. So 0x07 should decode to "0".
+     * But 0x07 0xff ⇒ 0x07 already produced "0", then 0xff = 8 bits
+     * padding which is > 7 ⇒ error. */
+    printf("== huff: rejects > 7 bits trailing padding ==\n");
+    uint8_t in[]  = {0x07, 0xff};
+    uint8_t out[8];
+    size_t  r = qpack_huffman_decode(out, sizeof out, in, 2);
+    check_int("returns invalid on > 7 bit padding", r == (size_t)-1, 1);
+}
+
+static void test_qpack_decode_huff_value(void) {
+    printf("== qpack: huff decode literal value ==\n");
+    /* Build literal-with-static-name for index 92 (server) and value
+     * "picoweb" Huffman-encoded. */
+    static const uint8_t plain[] = "picoweb";
+    uint8_t huff[16];
+    size_t  hl = qpack_huffman_encode(huff, sizeof huff, plain, 7);
+    uint8_t buf[64]; size_t off = 0;
+    off += qpack_encode_prefix_empty(buf + off, sizeof buf - off);
+    /* Literal w/ name ref: 0101_xxxx, idx=92 ⇒ first byte 0x5x then
+     * cont. We can use existing encoder for the name part by writing
+     * a non-Huffman literal then patching the value, OR build by hand. */
+    /* By hand: 0x50 | (92 fits in 4 bits? no, 92 ≥ 15) ⇒ first byte
+     * 0x5f, then varint cont (92-15=77) → 77 fits in one byte, no
+     * cont ⇒ 0x4d. Then value: H=1 + len in 7-bit prefix. hl < 127
+     * so single byte 0x80|hl. */
+    buf[off++] = 0x5f;
+    buf[off++] = 77;
+    buf[off++] = (uint8_t)(0x80 | hl);
+    memcpy(buf + off, huff, hl); off += hl;
+
+    qpack_field_t fields[4]; size_t nf = 4;
+    uint8_t       scratch[64]; size_t sused = 0;
+    qpack_status_t st = qpack_decode_field_section_huff(buf, off, fields, &nf,
+                                                         scratch, sizeof scratch, &sused);
+    check_int("OK", st, QPACK_OK);
+    check_int("1 field", (long)nf, 1);
+    check_int("name=server",
+              fields[0].name_len == 6 && memcmp(fields[0].name, "server", 6) == 0, 1);
+    check_int("value=picoweb",
+              fields[0].value_len == 7 && memcmp(fields[0].value, "picoweb", 7) == 0, 1);
+}
+
+static void test_qpack_decode_huff_literal_name(void) {
+    printf("== qpack: huff decode literal name+value ==\n");
+    static const uint8_t nm[] = "x-trace";
+    static const uint8_t vl[] = "abc";
+    uint8_t hn[16], hv[16];
+    size_t  hnl = qpack_huffman_encode(hn, sizeof hn, nm, 7);
+    size_t  hvl_ = qpack_huffman_encode(hv, sizeof hv, vl, 3);
+
+    uint8_t buf[64]; size_t off = 0;
+    off += qpack_encode_prefix_empty(buf + off, sizeof buf - off);
+    /* 001 N(=0) H(=1) name-len*(3). hnl encoded with 3-bit prefix +
+     * H bit (0x28 = 0010_1000). hnl < 7? for "x-trace" hnl=6, fits in
+     * 3 bits. So first byte = 0x28 | 6 = 0x2e. */
+    if (hnl < 7) {
+        buf[off++] = (uint8_t)(0x28 | hnl);
+    } else {
+        buf[off++] = 0x2f;
+        buf[off++] = (uint8_t)(hnl - 7);
+    }
+    memcpy(buf + off, hn, hnl); off += hnl;
+    /* value: H + 7-bit prefix len */
+    buf[off++] = (uint8_t)(0x80 | hvl_);
+    memcpy(buf + off, hv, hvl_); off += hvl_;
+
+    qpack_field_t fields[4]; size_t nf = 4;
+    uint8_t       scratch[64]; size_t sused = 0;
+    qpack_status_t st = qpack_decode_field_section_huff(buf, off, fields, &nf,
+                                                         scratch, sizeof scratch, &sused);
+    check_int("OK", st, QPACK_OK);
+    check_int("1 field", (long)nf, 1);
+    check_int("name=x-trace",
+              fields[0].name_len == 7 && memcmp(fields[0].name, "x-trace", 7) == 0, 1);
+    check_int("value=abc",
+              fields[0].value_len == 3 && memcmp(fields[0].value, "abc", 3) == 0, 1);
+    check_int("scratch used > 0", sused > 0, 1);
+}
+
+static void test_qpack_huff_decode_overflow(void) {
+    printf("== qpack: huff decode reports OVERFLOW on small scratch ==\n");
+    static const uint8_t plain[] = "the-quick-brown-fox-jumps-over";
+    uint8_t huff[64];
+    size_t  hl = qpack_huffman_encode(huff, sizeof huff, plain, sizeof plain - 1);
+    uint8_t buf[80]; size_t off = 0;
+    off += qpack_encode_prefix_empty(buf + off, sizeof buf - off);
+    buf[off++] = 0x5f; buf[off++] = 77; /* lit/static-name idx 92 */
+    buf[off++] = (uint8_t)(0x80 | hl);
+    memcpy(buf + off, huff, hl); off += hl;
+
+    qpack_field_t fields[4]; size_t nf = 4;
+    uint8_t       scratch[8];   /* too small */
+    qpack_status_t st = qpack_decode_field_section_huff(buf, off, fields, &nf,
+                                                         scratch, sizeof scratch, NULL);
+    check_int("OUTPUT_OVERFLOW", st, QPACK_ERR_OUTPUT_OVERFLOW);
+}
+
 /* ============================================================== */
 
 int main(void) {
@@ -3830,6 +4007,25 @@ int main(void) {
     test_qpack_decode_truncated();
     test_qpack_encode_oor_index();
     test_qpack_realistic_response();
+
+    /* phase 6d2 — Huffman codec */
+    {
+        static const uint8_t a[] = "hello";
+        test_huff_roundtrip("\"hello\"", a, sizeof a - 1);
+        static const uint8_t b[] = "/index.html";
+        test_huff_roundtrip("\"/index.html\"", b, sizeof b - 1);
+        static const uint8_t c[] = "Mozilla/5.0 (X11; Linux x86_64)";
+        test_huff_roundtrip("UA string", c, sizeof c - 1);
+    }
+    test_huff_rfc7541_c41();
+    test_huff_rfc7541_c43();
+    test_huff_all_bytes();
+    test_huff_empty();
+    test_huff_decode_rejects_eos();
+    test_huff_decode_rejects_excess_padding();
+    test_qpack_decode_huff_value();
+    test_qpack_decode_huff_literal_name();
+    test_qpack_huff_decode_overflow();
 
     printf("\n=== RESULTS: PASS=%d FAIL=%d ===\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
