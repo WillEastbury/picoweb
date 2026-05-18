@@ -174,10 +174,20 @@ http_result_t http_parse(char* buf, size_t buf_len, http_request_t* out) {
             break;
         case 14:
             if (metal_ieq(p, 14, "Content-Length", 14)) {
+                /* Strict numeric parse: reject non-digits, overflow, and
+                 * a second conflicting Content-Length header. */
+                if (tl == 0) return HTTP_ERR_400;
+                size_t cl = 0;
                 for (size_t i = 0; i < tl; i++) {
-                    if (tval[i] != '0') { body_present = true; break; }
+                    char c = tval[i];
+                    if (c < '0' || c > '9') return HTTP_ERR_400;
+                    size_t nd = (size_t)(c - '0');
+                    if (cl > (((size_t)-1) - nd) / 10) return HTTP_ERR_413;
+                    cl = cl * 10 + nd;
                 }
-                if (tl == 0) body_present = true;
+                if (body_present && out->content_length != cl) return HTTP_ERR_400;
+                out->content_length = cl;
+                if (cl > 0) body_present = true;
             }
             break;
         case 15:
@@ -188,7 +198,9 @@ http_result_t http_parse(char* buf, size_t buf_len, http_request_t* out) {
             break;
         case 17:
             if (metal_ieq(p, 17, "Transfer-Encoding", 17)) {
-                body_present = true;
+                /* We don't speak chunked. Reject any TE outright; safer
+                 * than mis-framing the next request on this connection. */
+                return HTTP_ERR_400;
             }
             break;
         default:

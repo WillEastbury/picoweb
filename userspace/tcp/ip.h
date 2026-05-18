@@ -59,8 +59,8 @@ uint16_t tcp_checksum(uint32_t src_ip, uint32_t dst_ip,
  * Returns 0 on success, -1 on malformed / wrong proto / bad csum. */
 int ip_tcp_parse(const uint8_t* frame, size_t len, tcp_seg_t* out);
 
-/* Extended parse: `skip_csum` non-zero skips IP/TCP checksum
- * verification (used when kernel flags TP_STATUS_CSUMNOTREADY). */
+/* Extended parse: `skip_csum` non-zero skips TCP checksum only
+ * (used when kernel flags TP_STATUS_CSUMNOTREADY). */
 int ip_tcp_parse_ex(const uint8_t* frame, size_t len, tcp_seg_t* out,
                     int skip_csum);
 

@@ -6,12 +6,14 @@
 #include <stdbool.h>
 
 #include "jumptable.h"
+#include "api.h"
 
 #define METAL_READ_BUF 8192
 
 typedef enum {
-    ST_READING = 0,
-    ST_WRITING = 1
+    ST_READING        = 0,
+    ST_READING_BODY   = 2,   /* request headers parsed; draining body bytes */
+    ST_WRITING        = 1
 } conn_state_t;
 
 typedef struct conn {
@@ -56,6 +58,28 @@ typedef struct conn {
     /* Inline read buffer — the only writable runtime memory on the
      * request path. */
     char     read_buf[METAL_READ_BUF];
+
+    /* ===== JSON-file API state =====
+     *
+     * When dispatch_one detects an API request whose body has not yet
+     * fully arrived, it stashes the request shape here, transitions to
+     * ST_READING_BODY, and resumes once `read_off >= api_total_needed`.
+     *
+     * `api_resp` holds the prepared response (status line + headers in
+     * api_resp.head, body in api_resp.body). The iovec segments point
+     * into `api_resp.head` and `api_resp.body` while ST_WRITING; both
+     * are released by api_resp_release() in post_send. */
+    api_resp_t api_resp;
+    bool       api_pending;             /* true => api_resp owns memory */
+    /* These mirror http_request_t fields needed to dispatch after the
+     * body fully arrives, since read-buffer compaction may invalidate
+     * the original pointers. The request body itself stays in
+     * read_buf at offset api_headers_len. */
+    http_method_t api_method;
+    uint16_t      api_headers_len;      /* bytes 0..api_headers_len = HTTP head */
+    uint16_t      api_body_needed;      /* Content-Length of the request */
+    uint8_t       api_path_len;
+    char          api_path[256];        /* request-target copy (see above) */
 } conn_t;
 
 /* A per-worker pool of connection slots, mmapped at startup. */
