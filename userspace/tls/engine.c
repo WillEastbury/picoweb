@@ -58,9 +58,11 @@ int pw_tls_engine_configure_server(pw_tls_engine_t* eng,
     if (eng->state != PW_TLS_ST_HANDSHAKE) return -1;
     if (eng->hs_phase != PW_TLS_HS_WAIT_CH) return -1;
     if (cert_sig_scheme != TLS13_SIG_SCHEME_ED25519 &&
-        cert_sig_scheme != TLS13_SIG_SCHEME_RSA_PSS_RSAE_SHA256) return -1;
+        cert_sig_scheme != TLS13_SIG_SCHEME_RSA_PSS_RSAE_SHA256 &&
+        cert_sig_scheme != TLS13_SIG_SCHEME_ECDSA_SECP256R1_SHA256) return -1;
     if (cert_sig_scheme == TLS13_SIG_SCHEME_ED25519 && !seed_ed25519) return -1;
-    if (cert_sig_scheme == TLS13_SIG_SCHEME_RSA_PSS_RSAE_SHA256 &&
+    if ((cert_sig_scheme == TLS13_SIG_SCHEME_RSA_PSS_RSAE_SHA256 ||
+         cert_sig_scheme == TLS13_SIG_SCHEME_ECDSA_SECP256R1_SHA256) &&
         (!cert_key_der || cert_key_der_len == 0)) return -1;
 
     /* Validate cert chain fits in the per-message stack scratch the
@@ -152,6 +154,7 @@ int pw_tls_engine_emit_session_ticket(pw_tls_engine_t* eng,
                                       size_t nonce_len,
                                       const uint8_t* ticket_id,
                                       size_t id_len,
+                                      uint32_t max_early_data,
                                       uint8_t out_psk[32]) {
     if (!eng || !ticket_nonce || !ticket_id || !out_psk)         return -1;
     if (eng->state != PW_TLS_ST_APP || eng->has_rms != 1)        return -1;
@@ -170,7 +173,8 @@ int pw_tls_engine_emit_session_ticket(pw_tls_engine_t* eng,
     int nst_len = tls13_build_new_session_ticket(nst, sizeof(nst),
                                                  lifetime_s, age_add,
                                                  ticket_nonce, nonce_len,
-                                                 ticket_id, id_len);
+                                                 ticket_id, id_len,
+                                                 max_early_data);
     if (nst_len <= 0) { secure_zero(out_psk, 32); return -1; }
 
     size_t need = TLS13_RECORD_HEADER_LEN + (size_t)nst_len + 1 + TLS13_AEAD_TAG_LEN;
@@ -569,6 +573,15 @@ static int try_drive_handshake_server(pw_tls_engine_t* eng) {
             eng->selected_psk_identity = (int)i;
             memcpy(eng->selected_psk, t->psk, 32);
 
+            /* Snapshot whether this ticket is still eligible for 0-RTT
+             * BEFORE consuming it. pw_tls_ticket_consume_for_0rtt()
+             * marks `used`, after which can_early_data() returns 0; if
+             * we read it after consume we would always reject 0-RTT,
+             * but if we accepted 0-RTT based on the unchecked
+             * max_early_data field we would also accept replays of an
+             * already-used ticket. */
+            int can_early = pw_tls_ticket_can_early_data(t);
+
             /* Mark the ticket consumed unconditionally on successful
              * binder match. RFC 8446 §4.6.1 + §8: a server SHOULD
              * treat tickets as single-use to bound replay windows;
@@ -578,13 +591,11 @@ static int try_drive_handshake_server(pw_tls_engine_t* eng) {
             (void)pw_tls_ticket_consume_for_0rtt(t);
 
             /* 0-RTT acceptance: client must have sent early_data AND
-             * the ticket must permit it. We only accept 0-RTT for the
-             * FIRST offered identity (RFC 8446 §4.2.10), which is the
-             * one we matched at i=0. Note: the ticket has already been
-             * marked used above, so can_early_data() is checked against
-             * the pre-consume snapshot via the local flags we recorded. */
-            if (i == 0 && ch.offers_early_data
-                && t->max_early_data > 0) {
+             * the ticket must permit it AND must not have been used
+             * for a previous 0-RTT (or non-0-RTT) handshake. We only
+             * accept 0-RTT for the FIRST offered identity (RFC 8446
+             * §4.2.10), which is the one we matched at i=0. */
+            if (i == 0 && ch.offers_early_data && can_early) {
                 eng->early_data_accepted = 1;
                 eng->early_data_max      = t->max_early_data;
                 eng->early_data_seen     = 0;
@@ -600,6 +611,8 @@ static int try_drive_handshake_server(pw_tls_engine_t* eng) {
             !ch.offers_ed25519) return -1;
         if (eng->cert_sig_scheme == TLS13_SIG_SCHEME_RSA_PSS_RSAE_SHA256 &&
             !ch.offers_rsa_pss_rsae_sha256) return -1;
+        if (eng->cert_sig_scheme == TLS13_SIG_SCHEME_ECDSA_SECP256R1_SHA256 &&
+            !ch.offers_ecdsa_secp256r1_sha256) return -1;
     }
 
     /* Generate server randomness and X25519 ephemeral keypair. */

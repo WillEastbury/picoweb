@@ -18,6 +18,8 @@ CRYPTO_SRC := \
     ../crypto/sha512.c           \
     ../crypto/ed25519.c          \
     ../crypto/rsa.c              \
+    ../crypto/p256.c             \
+    ../crypto/ecdsa.c            \
     ../crypto/pool.c             \
     ../crypto/hmac.c             \
     ../crypto/hkdf.c             \
@@ -48,7 +50,7 @@ QUIC_PRIM_SRC := \
 
 .PHONY: all clean test
 
-all: test_crypto test_quic_primitives
+all: test_crypto test_quic_primitives test_preload
 
 test_crypto: test_crypto.c $(CRYPTO_SRC)
 	$(CC) $(CFLAGS) -o $@ $^
@@ -56,9 +58,13 @@ test_crypto: test_crypto.c $(CRYPTO_SRC)
 test_quic_primitives: test_quic_primitives.c $(QUIC_PRIM_SRC)
 	$(CC) $(CFLAGS) -o $@ $^
 
-test: test_crypto test_quic_primitives
+test_preload: test_preload.c ../../src/preload.c
+	$(CC) $(CFLAGS) -I../../src -o $@ $^
+
+test: test_crypto test_quic_primitives test_preload
 	./test_crypto
 	./test_quic_primitives
+	./test_preload
 
 clean:
-	rm -f test_crypto test_quic_primitives
+	rm -f test_crypto test_quic_primitives test_preload
