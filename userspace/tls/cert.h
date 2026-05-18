@@ -81,6 +81,11 @@ typedef struct {
     size_t       arena_used;
 } cert_store_t;
 
+/* Detect private-key type from DER bytes.
+ * Accepts PKCS#8 / PKCS#1 / SEC1 key blobs and returns the best
+ * inferred type, or CERT_KEY_UNKNOWN. */
+cert_key_type_t cert_detect_key_type(const uint8_t* der, size_t der_len);
+
 /* Initialise an empty cert store backed by `arena_storage` (at least
  * `arena_cap` bytes). Returns 0 on success. */
 int cert_store_init(cert_store_t* s, void* arena_storage, size_t arena_cap);

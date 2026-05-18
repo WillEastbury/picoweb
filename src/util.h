@@ -13,6 +13,10 @@ void metal_die(const char* fmt, ...) __attribute__((format(printf, 1, 2), noretu
 /* Monotonic time in milliseconds */
 int64_t metal_now_ms(void);
 
+/* Coarse monotonic time — lower overhead (no vDSO fine-grained read),
+ * acceptable for idle sweep timestamps where ~4ms jitter is fine. */
+int64_t metal_now_ms_coarse(void);
+
 /* FNV-1a 64-bit hash over a sized byte range */
 uint64_t metal_fnv1a(const void* data, size_t len);
 /* FNV-1a 64-bit hash, lowercasing ASCII letters as it goes (for

@@ -50,67 +50,6 @@ static const char* trim_ows(const char* s, size_t len, size_t* out_len) {
     return s + i;
 }
 
-/* Weak ETag comparison for If-None-Match (RFC 7232 §2.3.2).
- * Checks whether `etag` (e.g. W/"abcdef0123456789") appears as a
- * comma-separated token in the If-None-Match header value `inm`.
- * Also matches the wildcard `*`. Strips W/ prefix for weak comparison. */
-bool http_etag_matches(const char* inm, size_t inm_len,
-                       const char* etag, size_t etag_len) {
-    if (!inm || !inm_len || !etag || !etag_len) return false;
-
-    /* Wildcard */
-    for (size_t i = 0; i < inm_len; i++) {
-        if (inm[i] == '*') return true;
-    }
-
-    /* Extract opaque-tag from our ETag (strip W/ prefix if present) */
-    const char* our_tag = etag;
-    size_t our_len = etag_len;
-    if (our_len >= 2 && our_tag[0] == 'W' && our_tag[1] == '/') {
-        our_tag += 2; our_len -= 2;
-    }
-
-    /* Scan comma-separated tokens in If-None-Match */
-    size_t pos = 0;
-    while (pos < inm_len) {
-        /* Skip OWS and commas */
-        while (pos < inm_len && (inm[pos] == ' ' || inm[pos] == '\t'
-                                 || inm[pos] == ',')) pos++;
-        if (pos >= inm_len) break;
-
-        /* Find end of this token */
-        size_t start = pos;
-        /* If quoted, find closing quote (ETags are always quoted) */
-        const char* tp = inm + start;
-        size_t tl;
-        if (tp[0] == 'W' && start + 1 < inm_len && tp[1] == '/') {
-            tp += 2; start += 2;
-        }
-        /* Now tp should point at '"...' */
-        if (start < inm_len && tp[0] == '"') {
-            const char* close = (const char*)memchr(tp + 1, '"',
-                                                    inm_len - start - 1);
-            if (close) {
-                tl = (size_t)(close - tp) + 1; /* include both quotes */
-                pos = (size_t)(close - inm) + 1;
-            } else {
-                break; /* malformed */
-            }
-        } else {
-            /* Unquoted token — skip to comma */
-            while (pos < inm_len && inm[pos] != ',') pos++;
-            tl = (size_t)(inm + pos - tp);
-            /* trim trailing OWS */
-            while (tl > 0 && (tp[tl-1] == ' ' || tp[tl-1] == '\t')) tl--;
-        }
-
-        /* Weak comparison: compare opaque-tags */
-        if (tl == our_len && memcmp(tp, our_tag, our_len) == 0)
-            return true;
-    }
-    return false;
-}
-
 /* ============================================================== */
 /* Parser                                                         */
 /* ============================================================== */
@@ -188,61 +127,77 @@ http_result_t http_parse(char* buf, size_t buf_len, http_request_t* out) {
         size_t tl = 0;
         const char* tval = trim_ows(val, val_len, &tl);
 
-        if (metal_ieq(p, name_len, "Host", 4)) {
-            if (host_seen++) return HTTP_ERR_400;
-            /* Strip :port */
-            const char* colon2 = (const char*)memchr(tval, ':', tl);
-            size_t hostlen = colon2 ? (size_t)(colon2 - tval) : tl;
-            if (hostlen == 0 || hostlen > 253) return HTTP_ERR_400;
-            /* Lowercase in place. tval points into buf (writable). */
-            metal_lower_inplace((char*)(uintptr_t)tval, hostlen);
-            /* Validate hostname charset */
-            for (size_t i = 0; i < hostlen; i++) {
-                char c = tval[i];
-                bool ok = (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')
-                       || c == '.' || c == '-';
-                if (!ok) return HTTP_ERR_400;
+        /* Dispatch by header name length to skip mismatched metal_ieq calls. */
+        switch (name_len) {
+        case 4:
+            if (metal_ieq(p, 4, "Host", 4)) {
+                if (host_seen++) return HTTP_ERR_400;
+                /* Strip :port */
+                const char* colon2 = (const char*)memchr(tval, ':', tl);
+                size_t hostlen = colon2 ? (size_t)(colon2 - tval) : tl;
+                if (hostlen == 0 || hostlen > 253) return HTTP_ERR_400;
+                /* Lowercase in place. tval points into buf (writable). */
+                metal_lower_inplace((char*)(uintptr_t)tval, hostlen);
+                /* Validate hostname charset */
+                for (size_t i = 0; i < hostlen; i++) {
+                    char c = tval[i];
+                    bool ok = (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')
+                           || c == '.' || c == '-';
+                    if (!ok) return HTTP_ERR_400;
+                }
+                out->host = (char*)(uintptr_t)tval;
+                out->host_len = hostlen;
             }
-            out->host = (char*)(uintptr_t)tval;
-            out->host_len = hostlen;
-        } else if (metal_ieq(p, name_len, "Content-Length", 14)) {
-            /* Reject any non-zero CL — we don't drain bodies in v1. */
-            for (size_t i = 0; i < tl; i++) {
-                if (tval[i] != '0') { body_present = true; break; }
-            }
-            if (tl == 0) body_present = true;
-        } else if (metal_ieq(p, name_len, "Transfer-Encoding", 17)) {
-            body_present = true;
-        } else if (metal_ieq(p, name_len, "Connection", 10)) {
-            /* Connection is a comma-separated token list; honour any
-             * "close" token in case-insensitive form. */
-            size_t k = 0;
-            while (k < tl) {
-                while (k < tl && (tval[k] == ' ' || tval[k] == '\t' ||
-                                  tval[k] == ',')) k++;
-                size_t s = k;
-                while (k < tl && tval[k] != ',') k++;
-                size_t e = k;
-                while (e > s && (tval[e - 1] == ' ' || tval[e - 1] == '\t')) e--;
-                if (e - s == 5 && metal_ieq(tval + s, 5, "close", 5)) {
-                    out->client_close = true;
-                    break;
+            break;
+        case 10:
+            if (metal_ieq(p, 10, "Connection", 10)) {
+                size_t k = 0;
+                while (k < tl) {
+                    while (k < tl && (tval[k] == ' ' || tval[k] == '\t' ||
+                                      tval[k] == ',')) k++;
+                    size_t s = k;
+                    while (k < tl && tval[k] != ',') k++;
+                    size_t e = k;
+                    while (e > s && (tval[e - 1] == ' ' || tval[e - 1] == '\t')) e--;
+                    if (e - s == 5 && metal_ieq(tval + s, 5, "close", 5)) {
+                        out->client_close = true;
+                        break;
+                    }
                 }
             }
-        } else if (metal_ieq(p, name_len, "Accept-Encoding", 15)) {
-            /* Substring scan for tokens we serve. Token names are
-             * exact-form (case-sensitive); the rest of the value
-             * (q-values, other tokens) is ignored. */
-            if (metal_compress_accepted(tval, tl)) out->accept_pc = true;
-            if (brotli_accepted(tval, tl)) out->accept_br = true;
-        } else if (metal_ieq(p, name_len, "If-None-Match", 13)) {
-            out->if_none_match = tval;
-            out->if_none_match_len = tl;
+            break;
+        case 13:
+            if (metal_ieq(p, 13, "If-None-Match", 13)) {
+                out->if_none_match = tval;
+                out->if_none_match_len = tl;
+            }
+            break;
+        case 14:
+            if (metal_ieq(p, 14, "Content-Length", 14)) {
+                for (size_t i = 0; i < tl; i++) {
+                    if (tval[i] != '0') { body_present = true; break; }
+                }
+                if (tl == 0) body_present = true;
+            }
+            break;
+        case 15:
+            if (metal_ieq(p, 15, "Accept-Encoding", 15)) {
+                if (metal_compress_accepted(tval, tl)) out->accept_pc = true;
+                if (brotli_accepted(tval, tl)) out->accept_br = true;
+            }
+            break;
+        case 17:
+            if (metal_ieq(p, 17, "Transfer-Encoding", 17)) {
+                body_present = true;
+            }
+            break;
+        default:
+            break;
         }
         p = eol + 2;
     }
 
-    if (host_seen == 0) return HTTP_ERR_400;
+    if (host_seen == 0) return HTTP_ERR_409;
 
     /* If the request declared a body, force-close after responding —
      * we can't safely parse the next request because we won't drain. */
@@ -269,6 +224,7 @@ const resource_t* http_select(const jumptable_t* jt,
     /* Parse-level errors: cannot trust framing for next request. */
     switch (pr) {
         case HTTP_ERR_400: *out_close_after = true; return jt->err_400;
+        case HTTP_ERR_409: *out_close_after = true; return jt->err_409;
         case HTTP_ERR_413: *out_close_after = true; return jt->err_413;
         case HTTP_ERR_414: *out_close_after = true; return jt->err_414;
         case HTTP_ERR_505: *out_close_after = true; return jt->err_505;
@@ -289,15 +245,83 @@ const resource_t* http_select(const jumptable_t* jt,
          * request was framed properly (no body declared). */
         return jt->err_405;
     }
-    if (req->method != M_GET && req->method != M_HEAD) {
+    if (__builtin_expect(req->method != M_GET && req->method != M_HEAD, 0)) {
         *out_close_after = true;
         return jt->err_405;
     }
 
     *out_head_only = (req->method == M_HEAD);
 
+    /* Lookup-first: the flat table is authoritative. On a hit (the
+     * overwhelming common case), we skip the linear host scan entirely.
+     * On a miss, we distinguish 404 (known host, missing path) from
+     * 409 (unknown host) via the known_hosts array. */
     const resource_t* r = jumptable_lookup(jt, req->host, req->host_len,
                                            req->path, req->path_len);
-    if (!r) return jt->err_404;
-    return r;
+    if (__builtin_expect(r != NULL, 1)) return r;
+
+    /* Miss — check if host is known at all. */
+    if (!jumptable_host_exists(jt, req->host, req->host_len)) {
+        *out_close_after = true;
+        return jt->err_409;
+    }
+    return jt->err_404;
+}
+
+/* ============================================================== */
+/* ETag / If-None-Match matching (RFC 7232 §3.2)                 */
+/* ============================================================== */
+
+bool etag_matches(const char* inm, size_t inm_len,
+                  const char* etag) {
+    if (!inm || inm_len == 0 || etag[0] == '\0') return false;
+
+    /* Wildcard: matches any current representation. */
+    if (inm_len == 1 && inm[0] == '*') return true;
+
+    /* Extract the opaque-tag from our etag (strip W/ and quotes). */
+    const char* our = etag;
+    size_t our_len = strlen(etag);
+    if (our_len >= 2 && our[0] == 'W' && our[1] == '/') {
+        our += 2; our_len -= 2;
+    }
+    /* our is now "\"<value>\"" — compare including quotes for safety. */
+
+    /* Scan comma-separated tags. */
+    size_t i = 0;
+    while (i < inm_len) {
+        /* Skip OWS and commas. */
+        while (i < inm_len && (inm[i] == ' ' || inm[i] == '\t' ||
+                               inm[i] == ',')) i++;
+        if (i >= inm_len) break;
+
+        /* Parse one entity-tag: optional W/ + quoted-string. */
+        const char* tag_start = inm + i;
+        size_t tag_off = 0;
+
+        /* Skip W/ prefix (weak comparison ignores it). */
+        if (i + 2 <= inm_len && inm[i] == 'W' && inm[i+1] == '/') {
+            i += 2; tag_off += 2;
+        }
+
+        /* Expect opening quote. */
+        if (i >= inm_len || inm[i] != '"') {
+            /* Malformed tag — skip to next comma. */
+            while (i < inm_len && inm[i] != ',') i++;
+            continue;
+        }
+        i++; /* skip opening quote */
+
+        /* Find closing quote. */
+        while (i < inm_len && inm[i] != '"') i++;
+        if (i < inm_len) i++; /* skip closing quote */
+
+        /* The comparable portion is from after W/ to end of quote. */
+        const char* cmp = tag_start + tag_off;
+        size_t cmp_len = (size_t)((inm + i) - cmp);
+
+        if (cmp_len == our_len && memcmp(cmp, our, our_len) == 0)
+            return true;
+    }
+    return false;
 }

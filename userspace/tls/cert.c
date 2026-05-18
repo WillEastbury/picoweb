@@ -84,7 +84,7 @@ static const char* slurp_file(cert_store_t* s, const char* path,
  * Also handles SEC1 ECDSA: starts with 30 .. 02 01 01 04 20 (priv key)
  *   and contains the P-256 named curve OID.
  */
-static cert_key_type_t detect_key_type(const uint8_t* der, size_t der_len) {
+cert_key_type_t cert_detect_key_type(const uint8_t* der, size_t der_len) {
     if (der_len < 8) return CERT_KEY_UNKNOWN;
 
     /* Search the first 64 bytes (OID lives inside the algorithm
@@ -188,7 +188,7 @@ static int add_entry(cert_store_t* s, const char* hostname,
     for (int i = 0; i < chain_count; i++) e->cert_lens[i] = cert_lens[i];
     e->key_der = key;
     e->key_der_len = (size_t)key_len;
-    e->key_type = detect_key_type(key, (size_t)key_len);
+    e->key_type = cert_detect_key_type(key, (size_t)key_len);
 
     if (hl == 0) s->default_idx = s->n_entries;
     s->n_entries++;

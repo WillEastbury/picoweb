@@ -12,10 +12,10 @@
 #include "handshake.h"
 
 #include <string.h>
-
 #include "../crypto/ed25519.h"
 #include "../crypto/hkdf.h"
 #include "../crypto/hmac.h"
+#include "../crypto/rsa.h"
 #include "../crypto/sha256.h"
 #include "../crypto/util.h"
 #include "keysched.h"
@@ -290,6 +290,10 @@ static int parse_extensions(const uint8_t* ext_data, size_t ext_len,
                 uint16_t alg;
                 if (rd_u16(&lp, &lr, &alg) != 0) return -1;
                 if (alg == TLS13_SIG_SCHEME_ED25519) out->offers_ed25519 = 1;
+                if (alg == TLS13_SIG_SCHEME_RSA_PSS_RSAE_SHA256)
+                    out->offers_rsa_pss_rsae_sha256 = 1;
+                if (alg == TLS13_SIG_SCHEME_ECDSA_SECP256R1_SHA256)
+                    out->offers_ecdsa_secp256r1_sha256 = 1;
             }
             if (lr != 0) return -1;                  /* exact consumption */
             break;
@@ -325,7 +329,7 @@ static int parse_extensions(const uint8_t* ext_data, size_t ext_len,
 int tls13_parse_client_hello(const uint8_t* msg, size_t msg_len,
                              tls13_client_hello_t* out) {
     if (!msg || !out) return -1;
-    memset(out, 0, sizeof(*out));
+    secure_zero(out, sizeof(*out));
     out->raw = msg;
     out->raw_len = msg_len;
 
@@ -710,6 +714,150 @@ int tls13_build_certificate_verify(uint8_t* out, size_t out_cap,
     secure_zero(pubkey, sizeof(pubkey));
 
     return (int)(p - out);
+}
+
+static int mgf1_sha256(const uint8_t* seed, size_t seed_len,
+                       uint8_t* out, size_t out_len) {
+    uint32_t ctr = 0;
+    size_t off = 0;
+    while (off < out_len) {
+        uint8_t in[64];
+        if (seed_len + 4 > sizeof(in)) return -1;
+        memcpy(in, seed, seed_len);
+        in[seed_len + 0] = (uint8_t)(ctr >> 24);
+        in[seed_len + 1] = (uint8_t)(ctr >> 16);
+        in[seed_len + 2] = (uint8_t)(ctr >> 8);
+        in[seed_len + 3] = (uint8_t)(ctr);
+        uint8_t h[32];
+        sha256(in, seed_len + 4, h);
+        size_t n = out_len - off;
+        if (n > sizeof(h)) n = sizeof(h);
+        memcpy(out + off, h, n);
+        off += n;
+        ctr++;
+        secure_zero(h, sizeof(h));
+    }
+    return 0;
+}
+
+static int emsa_pss_encode_sha256(const uint8_t mhash[32],
+                                  unsigned mod_bits,
+                                  const uint8_t salt[32],
+                                  uint8_t* em, size_t em_len) {
+    const size_t h_len = 32, s_len = 32;
+    if (!mhash || !salt || !em) return -1;
+    if (mod_bits < 8 || em_len < h_len + s_len + 2) return -1;
+
+    size_t db_len = em_len - h_len - 1;
+    uint8_t mprime[8 + 32 + 32];
+    memset(mprime, 0, 8);
+    memcpy(mprime + 8, mhash, 32);
+    memcpy(mprime + 8 + 32, salt, 32);
+    uint8_t H[32];
+    sha256(mprime, sizeof(mprime), H);
+
+    uint8_t* DB = em;
+    size_t ps_len = db_len - s_len - 1;
+    memset(DB, 0, ps_len);
+    DB[ps_len] = 0x01;
+    memcpy(DB + ps_len + 1, salt, s_len);
+
+    uint8_t db_mask[PW_RSA_MAX_BITS / 8];
+    if (db_len > sizeof(db_mask)) return -1;
+    if (mgf1_sha256(H, sizeof(H), db_mask, db_len) != 0) return -1;
+    for (size_t i = 0; i < db_len; i++) DB[i] ^= db_mask[i];
+
+    unsigned em_bits = mod_bits - 1;
+    unsigned top_clear = (unsigned)(8 * em_len - em_bits);
+    if (top_clear > 0 && top_clear < 8) {
+        DB[0] &= (uint8_t)(0xffu >> top_clear);
+    } else if (top_clear >= 8) {
+        return -1;
+    }
+
+    memcpy(em + db_len, H, h_len);
+    em[em_len - 1] = 0xbc;
+    secure_zero(mprime, sizeof(mprime));
+    secure_zero(H, sizeof(H));
+    secure_zero(db_mask, sizeof(db_mask));
+    return 0;
+}
+
+int tls13_build_certificate_verify_ex(uint8_t* out, size_t out_cap,
+                                      const uint8_t transcript_hash[32],
+                                      uint16_t sig_scheme,
+                                      const uint8_t seed_ed25519[32],
+                                      const uint8_t* key_der, size_t key_der_len,
+                                      const uint8_t* rsa_pss_salt,
+                                      size_t rsa_pss_salt_len) {
+    if (sig_scheme == TLS13_SIG_SCHEME_ED25519) {
+        if (!seed_ed25519) return -1;
+        return tls13_build_certificate_verify(out, out_cap, transcript_hash, seed_ed25519);
+    }
+    if (sig_scheme == TLS13_SIG_SCHEME_RSA_PSS_RSAE_SHA256) {
+        if (!out || !transcript_hash || !key_der || key_der_len == 0) return -1;
+        if (!rsa_pss_salt || rsa_pss_salt_len != 32) return -1;
+
+        pw_rsa_private_key_t rk;
+        if (pw_rsa_private_key_from_der(key_der, key_der_len, &rk) != 0) return -1;
+        if (rk.n_len > PW_RSA_MAX_BITS / 8) return -1;
+
+        uint8_t signed_data[TLS13_CV_SIGNED_LEN];
+        if (tls13_build_certificate_verify_signed_data(signed_data, transcript_hash, 1) != 0) {
+            secure_zero(&rk, sizeof(rk));
+            return -1;
+        }
+        uint8_t mhash[32];
+        sha256(signed_data, sizeof(signed_data), mhash);
+
+        uint8_t em[PW_RSA_MAX_BITS / 8];
+        if (emsa_pss_encode_sha256(mhash, (unsigned)(rk.n_len * 8u),
+                                   rsa_pss_salt, em, rk.n_len) != 0) {
+            secure_zero(&rk, sizeof(rk));
+            secure_zero(signed_data, sizeof(signed_data));
+            secure_zero(mhash, sizeof(mhash));
+            return -1;
+        }
+
+        uint8_t sig[PW_RSA_MAX_BITS / 8];
+        if (pw_rsa_rsasp1(&rk, em, rk.n_len, sig, sizeof(sig)) != 0) {
+            secure_zero(&rk, sizeof(rk));
+            secure_zero(signed_data, sizeof(signed_data));
+            secure_zero(mhash, sizeof(mhash));
+            secure_zero(em, sizeof(em));
+            return -1;
+        }
+
+        size_t sig_len = rk.n_len;
+        size_t wire_len = 4u + 2u + 2u + sig_len;
+        if (wire_len > out_cap || sig_len > 0xffffu) {
+            secure_zero(&rk, sizeof(rk));
+            secure_zero(signed_data, sizeof(signed_data));
+            secure_zero(mhash, sizeof(mhash));
+            secure_zero(em, sizeof(em));
+            secure_zero(sig, sizeof(sig));
+            return -1;
+        }
+        uint8_t* p = out;
+        *p++ = 0x0f;
+        uint32_t body_len = (uint32_t)(2u + 2u + sig_len);
+        *p++ = (uint8_t)(body_len >> 16);
+        *p++ = (uint8_t)(body_len >> 8);
+        *p++ = (uint8_t)(body_len);
+        *p++ = (uint8_t)(sig_scheme >> 8);
+        *p++ = (uint8_t)(sig_scheme & 0xff);
+        *p++ = (uint8_t)(sig_len >> 8);
+        *p++ = (uint8_t)(sig_len);
+        memcpy(p, sig, sig_len);
+        p += sig_len;
+        secure_zero(&rk, sizeof(rk));
+        secure_zero(signed_data, sizeof(signed_data));
+        secure_zero(mhash, sizeof(mhash));
+        secure_zero(em, sizeof(em));
+        secure_zero(sig, sizeof(sig));
+        return (int)(p - out);
+    }
+    return -1;
 }
 
 /* ---------------- Handshake transcript hash ---------------- */

@@ -14,6 +14,7 @@
 #include "../crypto/util.h"
 #include "../crypto/sha256.h"
 #include "../crypto/x25519.h"
+#include "../crypto/rsa.h"
 #include "handshake.h"
 #include "keysched.h"
 #include "record.h"
@@ -45,14 +46,22 @@ void pw_tls_engine_init(pw_tls_engine_t* eng) {
 int pw_tls_engine_configure_server(pw_tls_engine_t* eng,
                                    pw_tls_rng_fn rng_fn,
                                    void* rng_user,
+                                   uint16_t cert_sig_scheme,
                                    const uint8_t seed_ed25519[32],
+                                   const uint8_t* cert_key_der,
+                                   size_t cert_key_der_len,
                                    const uint8_t* cert_chain_der,
                                    const size_t* cert_lens,
                                    unsigned n_certs) {
-    if (!eng || !rng_fn || !seed_ed25519) return -1;
+    if (!eng || !rng_fn) return -1;
     if (n_certs == 0 || !cert_chain_der || !cert_lens) return -1;
     if (eng->state != PW_TLS_ST_HANDSHAKE) return -1;
     if (eng->hs_phase != PW_TLS_HS_WAIT_CH) return -1;
+    if (cert_sig_scheme != TLS13_SIG_SCHEME_ED25519 &&
+        cert_sig_scheme != TLS13_SIG_SCHEME_RSA_PSS_RSAE_SHA256) return -1;
+    if (cert_sig_scheme == TLS13_SIG_SCHEME_ED25519 && !seed_ed25519) return -1;
+    if (cert_sig_scheme == TLS13_SIG_SCHEME_RSA_PSS_RSAE_SHA256 &&
+        (!cert_key_der || cert_key_der_len == 0)) return -1;
 
     /* Validate cert chain fits in the per-message stack scratch the
      * flight emitter uses (PW_TLS_ENGINE_CERT_MSG_MAX). Catching
@@ -68,7 +77,10 @@ int pw_tls_engine_configure_server(pw_tls_engine_t* eng,
 
     eng->rng_fn         = rng_fn;
     eng->rng_user       = rng_user;
-    memcpy(eng->seed_ed25519, seed_ed25519, 32);
+    eng->cert_sig_scheme = cert_sig_scheme;
+    if (seed_ed25519) memcpy(eng->seed_ed25519, seed_ed25519, 32);
+    eng->cert_key_der   = cert_key_der;
+    eng->cert_key_der_len = cert_key_der_len;
     eng->cert_chain_der = cert_chain_der;
     eng->cert_lens      = cert_lens;
     eng->n_certs        = n_certs;
@@ -581,10 +593,14 @@ static int try_drive_handshake_server(pw_tls_engine_t* eng) {
         }
     }
 
-    /* Full handshake requires ed25519 for the CertificateVerify. A
-     * resumption handshake skips Cert+CV entirely so this requirement
-     * is dropped. */
-    if (!eng->resumed && !ch.offers_ed25519) return -1;
+    /* Full handshake requires the peer to offer our configured
+     * CertificateVerify signature scheme. */
+    if (!eng->resumed) {
+        if (eng->cert_sig_scheme == TLS13_SIG_SCHEME_ED25519 &&
+            !ch.offers_ed25519) return -1;
+        if (eng->cert_sig_scheme == TLS13_SIG_SCHEME_RSA_PSS_RSAE_SHA256 &&
+            !ch.offers_rsa_pss_rsae_sha256) return -1;
+    }
 
     /* Generate server randomness and X25519 ephemeral keypair. */
     if (eng->rng_fn(eng->rng_user, eng->server_random, 32) != 0) {
@@ -842,10 +858,26 @@ static int try_emit_server_flight(pw_tls_engine_t* eng) {
         uint8_t th_through_cert[32];
         tls13_transcript_snapshot(&eng->transcript, th_through_cert);
 
-        uint8_t cv[128];
-        int cv_len = tls13_build_certificate_verify(cv, sizeof(cv),
-                                                    th_through_cert,
-                                                    eng->seed_ed25519);
+        uint8_t cv[4 + 2 + 2 + (PW_RSA_MAX_BITS / 8)];
+        uint8_t rsa_pss_salt[32];
+        const uint8_t* salt = NULL;
+        size_t salt_len = 0;
+        if (eng->cert_sig_scheme == TLS13_SIG_SCHEME_RSA_PSS_RSAE_SHA256) {
+            if (eng->rng_fn(eng->rng_user, rsa_pss_salt, sizeof(rsa_pss_salt)) != 0) {
+                secure_zero(th_through_cert, sizeof(th_through_cert));
+                return -1;
+            }
+            salt = rsa_pss_salt;
+            salt_len = sizeof(rsa_pss_salt);
+        }
+        int cv_len = tls13_build_certificate_verify_ex(cv, sizeof(cv),
+                                                       th_through_cert,
+                                                       eng->cert_sig_scheme,
+                                                       eng->seed_ed25519,
+                                                       eng->cert_key_der,
+                                                       eng->cert_key_der_len,
+                                                       salt, salt_len);
+        secure_zero(rsa_pss_salt, sizeof(rsa_pss_salt));
         secure_zero(th_through_cert, sizeof(th_through_cert));
         if (cv_len <= 0) return -1;
         if (seal_one_handshake_msg(eng, cv, (size_t)cv_len) != 0) return -1;

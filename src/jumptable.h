@@ -7,6 +7,11 @@
 
 #include "arena.h"
 
+/* Maximum iovec segments per response. Used for conn_t.segs[],
+ * uring_state_t.iov[], and stack iov[] arrays. Max layout is:
+ *   head + conn_tail + chrome.hdr + body + chrome.ftr = 5. */
+#define METAL_MAX_SEGS 6
+
 /* A per-host header/footer "chrome" pair. Bytes live in the immutable
  * arena. Shared across every HTML resource for the host, so the
  * memory cost is per-host, not per-resource. */
@@ -15,59 +20,57 @@ typedef struct {
     const char* ftr;     size_t ftr_len;
 } __attribute__((aligned(64))) chrome_t;
 
-/* A pre-built compressed variant of a resource. The wire payload is
- * the FULL response body (chrome.hdr || body || chrome.ftr if chromed,
- * else just body) compressed once at startup. When this variant is
- * served the iovec collapses to two segments — head_pc + body_pc —
- * because chrome bytes are baked into the compressed stream.
+/* A pre-built compressed variant of a resource. The compressed payload
+ * is the FULL response body (chrome.hdr || body || chrome.ftr if chromed,
+ * else just body) compressed once at startup. At send time the response
+ * is assembled as iovec(head, conn_tail, body) — three segments.
+ *
+ * The head buffer does NOT contain a Connection header or final CRLF;
+ * the caller appends a shared connection-tail segment at send time.
+ * This eliminates the keepalive/close header duplication.
  *
  * Lives in the immutable arena. Built only for compressible MIME
  * types (text slash any, application/json, application/javascript,
  * application/xml, image/svg+xml) and only kept if it actually
  * shrinks the payload. */
 typedef struct {
-    const char* head_keepalive;  size_t head_keepalive_len;
-    const char* head_close;      size_t head_close_len;
+    const char* head;            size_t head_len;
     const char* body;            size_t body_len;     /* compressed bytes */
+    /* ETag + 304 Not Modified support. */
+    char        etag[32];        /* W/"<len>-<fnv64>" */
+    const char* wire_304;        size_t wire_304_len;
 } __attribute__((aligned(64))) resource_compress_t;
 
-/* A pre-built HTTP response: head (status + headers, ending in \r\n\r\n)
- * in two flavours, plus an optional body and optional chrome.
+/* A pre-built HTTP response. The head contains status + headers ending
+ * in \r\n but WITHOUT a Connection header or the final blank line.
+ * At send time the caller appends a shared connection-tail segment:
+ *   keep-alive: "\r\n"              (HTTP/1.1 default, no explicit header)
+ *   close:      "Connection: close\r\n\r\n"
  *
- * For a chrome'd HTML page the wire payload is three contiguous
- * segments: chrome->hdr || body || chrome->ftr. Total length
- * (= what Content-Length: in the head bakes in) is precomputed at
- * build time. The hot path sendmsg's an iovec of up to 4 entries
- * (head + hdr + body + ftr) — pointers, no copies, no formatting.
+ * For a chrome'd HTML page the wire payload is up to five iovec
+ * segments: head || conn_tail || chrome->hdr || body || chrome->ftr.
+ * Total Content-Length (in the head) = body + chrome; it does NOT
+ * include head or conn_tail.
  *
  * For non-HTML or no-chrome resources, chrome == NULL and the iovec
- * collapses to the original 2 entries (head + body).
+ * collapses to 3 entries (head + conn_tail + body).
  *
- * The optional `compressed` pointer references a precomputed
- * `resource_compress_t` for clients that send Accept-Encoding:
- * picoweb-compress (or BareMetal.Compress legacy alias). NULL if
- * compression wasn't worth it (e.g. binary payload, or compressed
- * size exceeded original). One pointer = 8 bytes, fits in the
- * existing tail padding so resource_t stays at exactly 64 bytes.
+ * The optional `compressed` / `brotli` pointers reference precomputed
+ * compressed variants. NULL if compression wasn't worth it.
  *
  * All pointers reference either immutable arena memory or, for the
  * /stats endpoint specifically, a fixed-length writable region that
- * the metrics updater rewrites in place. Aligned to 64B so the hot
- * fields share a single cache line. */
+ * the metrics updater rewrites in place. Aligned to 128B so the hot
+ * fields share cache lines. */
 typedef struct {
-    const char* head_keepalive;  size_t head_keepalive_len;
-    const char* head_close;      size_t head_close_len;
+    const char* head;            size_t head_len;
     const char* body;            size_t body_len;
     const chrome_t* chrome;      /* NULL if no chrome is applied */
     const resource_compress_t* compressed; /* NULL if no compressed variant */
     const resource_compress_t* brotli;     /* NULL if no Brotli variant */
-    /* Conditional GET: weak ETag computed at startup from body hash.
-     * etag points into arena (e.g. W/"0a1b2c3d4e5f6789").
-     * head_304_* are prebuilt 304 Not Modified response heads.
-     * NULL for dynamic resources (/stats, /health) and errors. */
-    const char* etag;            size_t etag_len;
-    const char* head_304_keepalive; size_t head_304_keepalive_len;
-    const char* head_304_close;     size_t head_304_close_len;
+    /* ETag + 304 Not Modified support. etag[0]=='\0' means no ETag. */
+    char        etag[32];        /* W/"<len>-<fnv64>" */
+    const char* wire_304;        size_t wire_304_len;
 } __attribute__((aligned(128))) resource_t;
 
 /* One flat-table slot. value == NULL marks the slot empty.
@@ -97,9 +100,15 @@ typedef struct {
     const resource_t* err_400;
     const resource_t* err_404;
     const resource_t* err_405;
+    const resource_t* err_409;
     const resource_t* err_413;
     const resource_t* err_414;
     const resource_t* err_505;
+
+    /* Known hostnames for virtual-host validation. Any request whose
+     * Host header is not in this set gets 409 Conflict. */
+    struct { const char* name; size_t len; } known_hosts[128];
+    size_t known_host_count;
 } jumptable_t;
 
 /* Build the jump table by scanning wwwroot/<host>/...
@@ -113,5 +122,10 @@ bool jumptable_build(jumptable_t* jt, const char* wwwroot);
 const resource_t* jumptable_lookup(const jumptable_t* jt,
                                    const char* host, size_t host_len,
                                    const char* path, size_t path_len);
+
+/* Check if a hostname is in the known-host set (case-sensitive,
+ * host should already be lowercased by the parser). */
+bool jumptable_host_exists(const jumptable_t* jt,
+                           const char* host, size_t host_len);
 
 #endif

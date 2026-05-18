@@ -22,14 +22,21 @@ typedef struct conn {
     /* Read side */
     size_t   read_off;          /* bytes valid in read_buf */
 
-    /* Write side — pointers into immutable arena memory, no copies. */
+    /* Write side — segment pointers into immutable arena memory.
+     * Assembled in dispatch_one; consumed by writev-based try_send.
+     * Up to 5 segments: head + conn_tail + [chrome.hdr +] body [+ chrome.ftr].
+     * Compressed variants collapse to 3 (head + conn_tail + body). */
     const resource_t* res;
-    const char*       head_ptr;
-    size_t            head_len;
+    struct { const char* ptr; size_t len; } segs[METAL_MAX_SEGS];
+    uint8_t           seg_count;
     bool              send_body;
     const resource_compress_t* active_variant; /* non-NULL = serving compressed body */
-    size_t            bytes_sent;     /* 0..head_len + (send_body ? body_len : 0) */
+    size_t            wire_total;     /* precomputed total bytes to send */
+    size_t            bytes_sent;     /* 0..wire_total */
     bool              close_after;
+
+    /* Epoll interest tracking — skip redundant epoll_ctl MOD calls */
+    uint32_t          epoll_mask;
 
     /* Per-connection lifetime caps & flags */
     uint32_t req_count;          /* # full requests served on this conn */

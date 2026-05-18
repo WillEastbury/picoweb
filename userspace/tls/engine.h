@@ -143,7 +143,10 @@ typedef struct pw_tls_engine {
     int               configured;
     pw_tls_rng_fn     rng_fn;
     void*             rng_user;
+    uint16_t          cert_sig_scheme;
     uint8_t           seed_ed25519[32];
+    const uint8_t*    cert_key_der;
+    size_t            cert_key_der_len;
     const uint8_t*    cert_chain_der;
     const size_t*     cert_lens;
     unsigned          n_certs;
@@ -234,8 +237,13 @@ void pw_tls_engine_init(pw_tls_engine_t* eng);
  *
  * Inputs:
  *   rng_fn / rng_user     — entropy source (returns 0 on success)
- *   seed_ed25519[32]      — raw Ed25519 seed (use cert_extract_ed25519_seed)
- *                           COPIED into the engine.
+ *   cert_sig_scheme       — CertificateVerify signature scheme
+ *                           (e.g. ed25519, rsa_pss_rsae_sha256).
+ *   seed_ed25519[32]      — raw Ed25519 seed (required when
+ *                           cert_sig_scheme=ed25519), COPIED.
+ *   cert_key_der          — DER private key (required for RSA-PSS),
+ *                           BORROWED.
+ *   cert_key_der_len      — DER key length in bytes.
  *   cert_chain_der        — concatenated DER X.509 chain (server cert
  *                           first). BORROWED — caller MUST keep alive
  *                           for the engine's lifetime.
@@ -247,7 +255,10 @@ void pw_tls_engine_init(pw_tls_engine_t* eng);
 int pw_tls_engine_configure_server(pw_tls_engine_t* eng,
                                    pw_tls_rng_fn rng_fn,
                                    void* rng_user,
+                                   uint16_t cert_sig_scheme,
                                    const uint8_t seed_ed25519[32],
+                                   const uint8_t* cert_key_der,
+                                   size_t cert_key_der_len,
                                    const uint8_t* cert_chain_der,
                                    const size_t* cert_lens,
                                    unsigned n_certs);

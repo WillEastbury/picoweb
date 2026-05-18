@@ -11,6 +11,7 @@ typedef enum {
     HTTP_OK,
     HTTP_ERR_400,
     HTTP_ERR_405,
+    HTTP_ERR_409,
     HTTP_ERR_413,
     HTTP_ERR_414,
     HTTP_ERR_505,
@@ -29,10 +30,10 @@ typedef struct {
     bool   client_close;  /* Connection: close */
     bool   accept_pc;     /* Accept-Encoding contains picoweb-compress / BareMetal.Compress */
     bool   accept_br;     /* Accept-Encoding contains br (Brotli) */
-    const char* if_none_match;    /* raw If-None-Match header value (points into read_buf) */
-    size_t if_none_match_len;
     bool   has_leftover;  /* extra bytes after \r\n\r\n */
     size_t consumed;      /* total bytes consumed from buf */
+    const char* if_none_match;   /* raw If-None-Match value (points into buf) */
+    size_t if_none_match_len;
 } http_request_t;
 
 /* Parse a request from buf[0..buf_len). On HTTP_NEED_MORE the caller
@@ -40,10 +41,10 @@ typedef struct {
  * in-place (host header lowercased, etc). */
 http_result_t http_parse(char* buf, size_t buf_len, http_request_t* out);
 
-/* Weak ETag comparison for conditional GET. Returns true if `etag`
- * matches any token in the If-None-Match header value `inm`. */
-bool http_etag_matches(const char* inm, size_t inm_len,
-                       const char* etag, size_t etag_len);
+/* Check if the client's If-None-Match header value matches our ETag.
+ * Implements RFC 7232 weak comparison: W/ prefix stripped, comma-separated
+ * list, wildcard (*) support. */
+bool etag_matches(const char* inm, size_t inm_len, const char* etag);
 
 /* Pick a response for a parse result + parsed request.
  *  *out_close_after  - the connection should close after this response

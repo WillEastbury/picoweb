@@ -14,6 +14,7 @@
 #include <sys/epoll.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <sys/uio.h>
 #include <unistd.h>
 
 #ifdef __linux__
@@ -101,6 +102,13 @@ static void ep_mod(int ep, int fd, void* ptr, uint32_t events) {
     }
 }
 
+/* Conditional ep_mod: skip syscall if mask is already what we want. */
+static inline void ep_mod_if(int ep, conn_t* c, uint32_t events) {
+    if (c->epoll_mask == events) return;
+    c->epoll_mask = events;
+    ep_mod(ep, c->fd, c, events);
+}
+
 /* Drain MSG_ERRQUEUE on a socket. Returns:
  *   0 - the queue contained only MSG_ZEROCOPY completion notifications
  *       (which we silently discard — our arena memory is immutable, so
@@ -164,11 +172,9 @@ static void close_conn(pool_t* pool, int ep, conn_t* c) {
  * distinguish it from per-connection events. */
 static int g_listen_marker;
 
-static void try_accept(int listen_fd, int ep, pool_t* pool) {
+static void try_accept(int listen_fd, int ep, pool_t* pool, int64_t batch_now_ms) {
     for (;;) {
-        struct sockaddr_in peer;
-        socklen_t plen = sizeof(peer);
-        int c = accept4(listen_fd, (struct sockaddr*)&peer, &plen,
+        int c = accept4(listen_fd, NULL, NULL,
                         SOCK_NONBLOCK | SOCK_CLOEXEC);
         if (c < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) return;
@@ -209,16 +215,18 @@ static void try_accept(int listen_fd, int ep, pool_t* pool) {
         conn->state = ST_READING;
         conn->read_off = 0;
         conn->res = NULL;
-        conn->head_ptr = NULL;
-        conn->head_len = 0;
+        conn->seg_count = 0;
         conn->send_body = false;
         conn->bytes_sent = 0;
+        conn->wire_total = 0;
         conn->close_after = false;
         conn->req_count = 0;
         conn->peer_half_closed = false;
-        conn->last_active_ms = metal_now_ms();
+        conn->last_active_ms = batch_now_ms;
 
-        ep_add(ep, c, conn, EPOLLIN | EPOLLRDHUP);
+        uint32_t mask = EPOLLIN | EPOLLRDHUP;
+        conn->epoll_mask = mask;
+        ep_add(ep, c, conn, mask);
     }
 }
 
@@ -226,94 +234,66 @@ static void try_accept(int listen_fd, int ep, pool_t* pool) {
 /* Send                                                           */
 /* ============================================================== */
 
+/* Shared connection-tail segments. The head buffer does NOT contain
+ * a Connection header or the final blank line (\r\n\r\n). These
+ * static tails are appended as a separate iovec segment at send time.
+ *
+ * HTTP/1.1 defaults to keep-alive, so the common path sends only the
+ * blank-line terminator. Connection: close is explicit when needed. */
+static const char CONN_KA[]    = "\r\n";                          /* 2 bytes */
+static const char CONN_CLOSE[] = "Connection: close\r\n\r\n";    /* 24 bytes */
+#define CONN_KA_LEN    (sizeof(CONN_KA) - 1)
+#define CONN_CLOSE_LEN (sizeof(CONN_CLOSE) - 1)
+
 /* Push as much of the prepared response out as possible. Returns:
  *   1  - response fully sent
  *   0  - partial / EAGAIN (still ST_WRITING)
  *  -1  - socket error / closed; caller should close_conn()
  *
  * Wire layout:
- *   - if no chrome: head || body                       (2 segments)
- *   - if  chrome  : head || chrome.hdr || body || chrome.ftr   (up to 4)
+ *   - if no chrome: head || conn_tail || body                 (3 segments)
+ *   - if  chrome  : head || conn_tail || chrome.hdr || body || chrome.ftr (up to 5)
  *
- * The Content-Length baked into head already accounts for the chrome
- * payload, so the receiver sees one logically contiguous body of
- * (hdr+body+ftr) bytes. We walk the segment list against bytes_sent
- * to compute exactly which iovecs to emit on each call; partial sends
- * resume cleanly with no per-conn iovec storage. */
-static int try_send(conn_t* c) {
-    const resource_t* r = c->res;
-    /* When serving a compressed variant, the wire payload is a
-     * single contiguous blob — chrome bytes are baked into it. */
-    bool encoded = (c->active_variant != NULL);
-    const chrome_t* ch = (c->send_body && !encoded) ? r->chrome : NULL;
-    const char* body_ptr = encoded ? c->active_variant->body : r->body;
-    size_t      body_len = encoded ? c->active_variant->body_len : r->body_len;
+ * All responses use iovec-based sendmsg. Body data is stored ONCE
+ * in the arena — no pre-concatenated wire buffers. Partial sends
+ * are handled by recomputing the iovec from segs[] + bytes_sent. */
 
-    /* Build a fixed-size segment table (cheap on the stack). Using a
-     * uniform walker handles both the chrome and no-chrome cases with
-     * no extra branches in the hot loop. */
-    const char* seg_ptr[4];
-    size_t      seg_len[4];
-    int seg_n = 0;
-    seg_ptr[seg_n] = c->head_ptr;     seg_len[seg_n] = c->head_len;     seg_n++;
-    if (c->send_body) {
-        if (ch && ch->hdr_len) {
-            seg_ptr[seg_n] = ch->hdr; seg_len[seg_n] = ch->hdr_len;     seg_n++;
+/* Build a writev iovec from the connection's seg[] array, skipping
+ * past bytes_sent. Returns the segment count. */
+static inline int build_iov(conn_t* c, struct iovec* iov) {
+    int n = 0;
+    size_t skip = c->bytes_sent;
+    for (int i = 0; i < c->seg_count; i++) {
+        if (skip >= c->segs[i].len) {
+            skip -= c->segs[i].len;
+            continue;
         }
-        if (body_len) {
-            seg_ptr[seg_n] = body_ptr; seg_len[seg_n] = body_len;       seg_n++;
-        }
-        if (ch && ch->ftr_len) {
-            seg_ptr[seg_n] = ch->ftr; seg_len[seg_n] = ch->ftr_len;     seg_n++;
-        }
+        iov[n].iov_base = (void*)(c->segs[i].ptr + skip);
+        iov[n].iov_len = c->segs[i].len - skip;
+        skip = 0;
+        n++;
     }
+    return n;
+}
 
-    size_t total = 0;
-    for (int i = 0; i < seg_n; i++) total += seg_len[i];
-
+static __attribute__((hot)) int try_send(conn_t* c) {
     for (;;) {
-        if (c->bytes_sent >= total) return 1;
+        if (c->bytes_sent >= c->wire_total) return 1;
 
-        /* Walk segments, skipping fully-sent ones; emit a partial
-         * leading segment if bytes_sent lands mid-segment. */
-        struct iovec iov[4];
-        int n = 0;
-        size_t cursor = 0;
-        for (int i = 0; i < seg_n; i++) {
-            size_t end = cursor + seg_len[i];
-            if (c->bytes_sent >= end) {
-                cursor = end;
-                continue;
-            }
-            size_t off = (c->bytes_sent > cursor) ? (c->bytes_sent - cursor) : 0;
-            iov[n].iov_base = (void*)(uintptr_t)(seg_ptr[i] + off);
-            iov[n].iov_len  = seg_len[i] - off;
-            n++;
-            cursor = end;
-        }
+        struct iovec iov[METAL_MAX_SEGS];
+        int n = build_iov(c, iov);
+        if (n == 0) return 1;
 
         struct msghdr m = {0};
         m.msg_iov = iov;
-        m.msg_iovlen = n;
-        /* MSG_ZEROCOPY pays off only above the configured byte threshold
-         * (kernel docs: roughly >10 KB per send). Below that, the per-
-         * send setup cost regresses throughput. We compute the remaining
-         * payload (total - bytes_sent) so a partial-send tail doesn't
-         * waste setup. The zerocopy_threshold value is set once at
-         * startup and never changes; reading it lockless from many
-         * worker threads is safe. */
-        int sm_flags = MSG_NOSIGNAL;
-        if (g_zc_threshold > 0 && (total - c->bytes_sent) >= g_zc_threshold) {
-            sm_flags |= MSG_ZEROCOPY;
-        }
-        ssize_t s = sendmsg(c->fd, &m, sm_flags);
-        if (s < 0 && errno == ENOBUFS && (sm_flags & MSG_ZEROCOPY)) {
-            /* optmem cap hit — too many in-flight zerocopy sends. Retry
-             * this exact iovec without MSG_ZEROCOPY rather than dropping
-             * the connection. The next loop iteration will try again
-             * once we drain the err queue (signalled via EPOLLERR). */
-            sm_flags &= ~MSG_ZEROCOPY;
-            s = sendmsg(c->fd, &m, sm_flags);
+        m.msg_iovlen = (size_t)n;
+        int flags = MSG_NOSIGNAL;
+        if (g_zc_threshold > 0 && (c->wire_total - c->bytes_sent) >= g_zc_threshold)
+            flags |= MSG_ZEROCOPY;
+        ssize_t s = sendmsg(c->fd, &m, flags);
+        if (s < 0 && errno == ENOBUFS && (flags & MSG_ZEROCOPY)) {
+            flags &= ~MSG_ZEROCOPY;
+            s = sendmsg(c->fd, &m, flags);
         }
         if (s < 0) {
             if (errno == EINTR) continue;
@@ -334,13 +314,13 @@ static int try_send(conn_t* c) {
  *   1  - request parsed & response primed; state = ST_WRITING
  *   0  - need more data; still ST_READING
  *  -1  - unrecoverable; caller should close (only for transient cases) */
-static int dispatch_one(conn_t* c, const jumptable_t* jt, uint32_t max_req) {
+static __attribute__((hot)) int dispatch_one(conn_t* c, const jumptable_t* jt, uint32_t max_req) {
     http_request_t req;
     http_result_t pr = http_parse(c->read_buf, c->read_off, &req);
     if (pr == HTTP_NEED_MORE) {
         /* Buffer-full guard applies to current request only (we
          * compact between requests). */
-        if (c->read_off >= sizeof(c->read_buf)) {
+        if (__builtin_expect(c->read_off >= sizeof(c->read_buf), 0)) {
             pr = HTTP_ERR_413;
         } else {
             return 0;
@@ -371,25 +351,92 @@ static int dispatch_one(conn_t* c, const jumptable_t* jt, uint32_t max_req) {
     else if (req.accept_pc && r->compressed != NULL)
         variant = r->compressed;
 
-    /* Conditional GET: if the resource has an ETag and If-None-Match
-     * matches, serve a 304 Not Modified (no body, no compression). */
-    if (r->etag && req.if_none_match &&
-        http_etag_matches(req.if_none_match, req.if_none_match_len,
-                          r->etag, r->etag_len)) {
-        c->active_variant = NULL;
-        c->head_ptr = close_after ? r->head_304_close      : r->head_304_keepalive;
-        c->head_len = close_after ? r->head_304_close_len  : r->head_304_keepalive_len;
-        head_only = true; /* suppress body */
-    } else {
-        c->active_variant = variant;
+    c->active_variant = variant;
+
+    /* Build iovec segments: head + conn_tail + body pieces.
+     * Compressed variants: 3 segments (head + conn_tail + compressed_body).
+     * Identity chromed:    5 segments (head + conn_tail + chrome.hdr + body + chrome.ftr).
+     * Identity plain:      3 segments (head + conn_tail + body).
+     * 304 / HEAD:          2 segments (head + conn_tail). */
+    {
+        const char* head = variant ? variant->head : r->head;
+        size_t head_len  = variant ? variant->head_len : r->head_len;
+
+        int ns = 0;
+        c->segs[ns].ptr = head;
+        c->segs[ns].len = head_len;
+        ns++;
+
+        /* Connection tail: HTTP/1.1 defaults to keep-alive, so the
+         * common path sends only "\r\n" (header terminator). Only
+         * "Connection: close\r\n\r\n" when closing. */
+        c->segs[ns].ptr = close_after ? CONN_CLOSE : CONN_KA;
+        c->segs[ns].len = close_after ? CONN_CLOSE_LEN : CONN_KA_LEN;
+        ns++;
+
+        if (!head_only) {
+            if (variant) {
+                /* Compressed: chrome baked into compressed body. */
+                c->segs[ns].ptr = variant->body;
+                c->segs[ns].len = variant->body_len;
+                ns++;
+            } else {
+                /* Identity: chrome segments + raw body. */
+                if (r->chrome && r->chrome->hdr_len) {
+                    c->segs[ns].ptr = r->chrome->hdr;
+                    c->segs[ns].len = r->chrome->hdr_len;
+                    ns++;
+                }
+                if (r->body_len) {
+                    c->segs[ns].ptr = r->body;
+                    c->segs[ns].len = r->body_len;
+                    ns++;
+                }
+                if (r->chrome && r->chrome->ftr_len) {
+                    c->segs[ns].ptr = r->chrome->ftr;
+                    c->segs[ns].len = r->chrome->ftr_len;
+                    ns++;
+                }
+            }
+        }
+
+        c->seg_count = (uint8_t)ns;
+        size_t total = 0;
+        for (int i = 0; i < ns; i++) total += c->segs[i].len;
+        c->wire_total = total;
+    }
+
+    /* ETag / 304 Not Modified: if the client sent If-None-Match and it
+     * matches the selected variant's ETag, override with the pre-built
+     * 304 wire buffer + conn tail (two segments, no body). */
+    if (pr == HTTP_OK && req.if_none_match &&
+        (req.method == M_GET || req.method == M_HEAD)) {
+        const char* etag;
+        const char* w304;
+        size_t w304_len;
         if (variant) {
-            c->head_ptr = close_after ? variant->head_close      : variant->head_keepalive;
-            c->head_len = close_after ? variant->head_close_len  : variant->head_keepalive_len;
+            etag = variant->etag;
+            w304 = variant->wire_304;
+            w304_len = variant->wire_304_len;
+        } else if (r->etag[0] != '\0') {
+            etag = r->etag;
+            w304 = r->wire_304;
+            w304_len = r->wire_304_len;
         } else {
-            c->head_ptr = close_after ? r->head_close       : r->head_keepalive;
-            c->head_len = close_after ? r->head_close_len   : r->head_keepalive_len;
+            etag = NULL; w304 = NULL; w304_len = 0;
+        }
+        if (etag && w304 && etag_matches(req.if_none_match,
+                                          req.if_none_match_len, etag)) {
+            c->segs[0].ptr = w304;
+            c->segs[0].len = w304_len;
+            c->segs[1].ptr = close_after ? CONN_CLOSE : CONN_KA;
+            c->segs[1].len = close_after ? CONN_CLOSE_LEN : CONN_KA_LEN;
+            c->seg_count = 2;
+            c->wire_total = w304_len + c->segs[1].len;
+            head_only = true;
         }
     }
+
     c->send_body   = !head_only;
     c->bytes_sent  = 0;
     c->close_after = close_after;
@@ -412,8 +459,9 @@ static int dispatch_one(conn_t* c, const jumptable_t* jt, uint32_t max_req) {
  * transition back to ST_READING and try to dispatch any already-buffered
  * next request — bounded by POST_SEND_BUDGET to avoid one client
  * monopolising the worker. Returns true if conn was closed. */
-static bool post_send(conn_t* c, int ep, pool_t* pool,
-                      const jumptable_t* jt, uint32_t max_req) {
+static __attribute__((hot)) bool post_send(conn_t* c, int ep, pool_t* pool,
+                      const jumptable_t* jt, uint32_t max_req,
+                      int64_t batch_now_ms) {
     int budget = POST_SEND_BUDGET;
     while (budget-- > 0) {
         /* Record latency for the request that just completed. Per-worker
@@ -431,14 +479,14 @@ static bool post_send(conn_t* c, int ep, pool_t* pool,
 
         /* Reset write-side state for next request. */
         c->res         = NULL;
-        c->head_ptr    = NULL;
-        c->head_len    = 0;
+        c->seg_count   = 0;
         c->bytes_sent  = 0;
+        c->wire_total  = 0;
         c->send_body   = false;
         c->active_variant = NULL;
         c->state       = ST_READING;
-        /* Refresh idle timer ONLY at request/response boundary. */
-        c->last_active_ms = metal_now_ms();
+        /* Use batched timestamp instead of per-request clock_gettime. */
+        c->last_active_ms = batch_now_ms;
 
         if (c->read_off == 0) {
             /* No buffered next request. If peer half-closed, no more
@@ -447,7 +495,7 @@ static bool post_send(conn_t* c, int ep, pool_t* pool,
                 close_conn(pool, ep, c);
                 return true;
             }
-            ep_mod(ep, c->fd, c, EPOLLIN | EPOLLRDHUP);
+            ep_mod_if(ep, c, EPOLLIN | EPOLLRDHUP);
             return false;
         }
 
@@ -459,14 +507,14 @@ static bool post_send(conn_t* c, int ep, pool_t* pool,
                 close_conn(pool, ep, c);
                 return true;
             }
-            ep_mod(ep, c->fd, c, EPOLLIN | EPOLLRDHUP);
+            ep_mod_if(ep, c, EPOLLIN | EPOLLRDHUP);
             return false;
         }
         /* dr == 1 → ST_WRITING; try to send immediately */
         int sr = try_send(c);
         if (sr < 0) { close_conn(pool, ep, c); return true; }
         if (sr == 0) {
-            ep_mod(ep, c->fd, c, EPOLLOUT | EPOLLRDHUP);
+            ep_mod_if(ep, c, EPOLLOUT | EPOLLRDHUP);
             return false;
         }
         /* sr == 1 → fully sent; loop and check for more leftover work */
@@ -474,7 +522,7 @@ static bool post_send(conn_t* c, int ep, pool_t* pool,
     /* Budget exhausted; yield back to epoll. We're either ST_WRITING
      * waiting for OUT (won't happen since sr==1 to get here) or have
      * leftover bytes to parse next tick. Re-arm IN to get re-dispatched. */
-    ep_mod(ep, c->fd, c, EPOLLIN | EPOLLRDHUP);
+    ep_mod_if(ep, c, EPOLLIN | EPOLLRDHUP);
     return false;
 }
 
@@ -482,8 +530,9 @@ static bool post_send(conn_t* c, int ep, pool_t* pool,
 /* Event handlers                                                 */
 /* ============================================================== */
 
-static void handle_readable(conn_t* c, int ep, pool_t* pool,
-                            const jumptable_t* jt, uint32_t max_req) {
+static __attribute__((hot)) void handle_readable(conn_t* c, int ep, pool_t* pool,
+                            const jumptable_t* jt, uint32_t max_req,
+                            int64_t batch_now_ms) {
     /* Drain everything currently available — LT epoll permits the
      * minimum of one read, but draining reduces wakeups. */
     bool any_read = false;
@@ -523,21 +572,22 @@ static void handle_readable(conn_t* c, int ep, pool_t* pool,
     int sr = try_send(c);
     if (sr < 0) { close_conn(pool, ep, c); return; }
     if (sr == 0) {
-        ep_mod(ep, c->fd, c, EPOLLOUT | EPOLLRDHUP);
+        ep_mod_if(ep, c, EPOLLOUT | EPOLLRDHUP);
         return;
     }
-    post_send(c, ep, pool, jt, max_req);
+    post_send(c, ep, pool, jt, max_req, batch_now_ms);
 }
 
 static void handle_writable(conn_t* c, int ep, pool_t* pool,
-                            const jumptable_t* jt, uint32_t max_req) {
+                            const jumptable_t* jt, uint32_t max_req,
+                            int64_t batch_now_ms) {
     int rc = try_send(c);
     if (rc < 0) { close_conn(pool, ep, c); return; }
     if (rc == 0) {
-        ep_mod(ep, c->fd, c, EPOLLOUT | EPOLLRDHUP);
+        ep_mod_if(ep, c, EPOLLOUT | EPOLLRDHUP);
         return;
     }
-    post_send(c, ep, pool, jt, max_req);
+    post_send(c, ep, pool, jt, max_req, batch_now_ms);
 }
 
 /* ============================================================== */
@@ -591,25 +641,32 @@ void* epoll_worker_main(void* arg) {
               (long long)cfg->idle_ms, cfg->max_requests_per_conn);
 
     struct epoll_event events[EPOLL_BATCH];
-    int64_t last_sweep = metal_now_ms();
+    int64_t last_sweep = metal_now_ms_coarse();
     uint32_t max_req = cfg->max_requests_per_conn;
+    int64_t batch_now_ms = last_sweep;
 
     for (;;) {
-        int64_t now = metal_now_ms();
-        int wait_ms = (int)(IDLE_SWEEP_MS - (now - last_sweep));
+        int wait_ms = (int)(IDLE_SWEEP_MS - (batch_now_ms - last_sweep));
         if (wait_ms < 0) wait_ms = 0;
 
         int n = epoll_wait(ep, events, EPOLL_BATCH, wait_ms);
         if (n < 0) {
-            if (errno == EINTR) continue;
+            if (errno == EINTR) {
+                batch_now_ms = metal_now_ms_coarse();
+                continue;
+            }
             metal_die("epoll_wait");
         }
+
+        /* Batch timestamp: one clock_gettime per epoll_wait return,
+         * used for idle timers and accept timestamps. */
+        batch_now_ms = metal_now_ms_coarse();
 
         for (int i = 0; i < n; i++) {
             void* ptr = events[i].data.ptr;
             uint32_t ev = events[i].events;
             if (ptr == &g_listen_marker) {
-                try_accept(listen_fd, ep, &pool);
+                try_accept(listen_fd, ep, &pool, batch_now_ms);
                 continue;
             }
             conn_t* c = (conn_t*)ptr;
@@ -644,24 +701,23 @@ void* epoll_worker_main(void* arg) {
                  * pipelined-mid-response). EPOLLOUT or peer-RDHUP are
                  * the only signals that move us forward here. */
                 if (ev & (EPOLLOUT | EPOLLHUP | EPOLLRDHUP)) {
-                    handle_writable(c, ep, &pool, cfg->jt, max_req);
+                    handle_writable(c, ep, &pool, cfg->jt, max_req, batch_now_ms);
                 }
                 continue;
             }
 
             /* ST_READING */
             if (ev & EPOLLIN) {
-                handle_readable(c, ep, &pool, cfg->jt, max_req);
+                handle_readable(c, ep, &pool, cfg->jt, max_req, batch_now_ms);
             } else if (ev & (EPOLLHUP | EPOLLRDHUP)) {
                 /* No data and peer is gone */
                 close_conn(&pool, ep, c);
             }
         }
 
-        int64_t now2 = metal_now_ms();
-        if (now2 - last_sweep >= IDLE_SWEEP_MS) {
-            sweep_idle(&pool, ep, now2, cfg->idle_ms);
-            last_sweep = now2;
+        if (batch_now_ms - last_sweep >= IDLE_SWEEP_MS) {
+            sweep_idle(&pool, ep, batch_now_ms, cfg->idle_ms);
+            last_sweep = batch_now_ms;
         }
     }
     return NULL;

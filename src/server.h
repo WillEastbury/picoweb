@@ -1,6 +1,8 @@
 #ifndef METAL_SERVER_H
 #define METAL_SERVER_H
 
+#include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #include "jumptable.h"
@@ -9,6 +11,7 @@ typedef enum {
     PICOWEB_BACKEND_EPOLL = 0,
     PICOWEB_BACKEND_URING,
     PICOWEB_BACKEND_DPDK,
+    PICOWEB_BACKEND_TLS,
 } picoweb_backend_t;
 
 typedef struct {
@@ -25,6 +28,22 @@ typedef struct {
      * payloads bypass it because the per-send setup cost typically
      * outweighs the saved copy below ~10 KB. */
     size_t   zerocopy_threshold;
+
+    /* io_uring SQPOLL: kernel polls our submission queue, eliminating
+     * io_uring_enter() syscalls on the submit path entirely. Costs one
+     * dedicated kernel thread per worker (sleeps after sq_thread_idle_ms
+     * of inactivity). sqpoll_cpu pins the kernel thread to a specific
+     * CPU; -1 = unpinned. Ignored by epoll/dpdk backends. */
+    bool     sqpoll;
+    int      sqpoll_cpu;
+
+    /* Userspace TLS backend knobs. Ignored by epoll/io_uring/dpdk. */
+    const char* tls_cert_path;
+    const char* tls_key_path;
+    const char* tls_ifname;
+    const char* tls_peer_mac;
+    bool        tls_use_xdp;
+    uint32_t    tls_xdp_queue;
 } server_cfg_t;
 
 /* Backend worker entrypoints. Each takes a server_cfg_t* and runs
@@ -33,5 +52,6 @@ typedef struct {
 void* epoll_worker_main(void* arg);
 void* uring_worker_main(void* arg);
 void* dpdk_worker_main(void* arg);
+void* tls_worker_main(void* arg);
 
 #endif

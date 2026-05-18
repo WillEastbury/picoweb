@@ -11,6 +11,13 @@ bool pool_init(pool_t* p, size_t cap) {
     void* mem = mmap(NULL, bytes, PROT_READ | PROT_WRITE,
                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (mem == MAP_FAILED) return false;
+#ifdef MADV_HUGEPAGE
+    /* Pool can be tens of MB (cap × 8KB). With 4KB pages that's
+     * thousands of TLB entries under heavy load — easily blowing
+     * past the dTLB. THP collapses to 2MB pages and keeps the
+     * working set TLB-resident. Best-effort hint. */
+    (void)madvise(mem, bytes, MADV_HUGEPAGE);
+#endif
     p->base = (conn_t*)mem;
     p->cap = cap;
     p->in_use = 0;
@@ -36,8 +43,7 @@ conn_t* pool_alloc(pool_t* p) {
 void pool_free(pool_t* p, conn_t* c) {
     c->fd = -1;
     c->res = NULL;
-    c->head_ptr = NULL;
-    c->head_len = 0;
+    c->seg_count = 0;
     c->bytes_sent = 0;
     c->read_off = 0;
     c->state = ST_READING;

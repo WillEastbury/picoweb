@@ -22,9 +22,9 @@
  *
  * Same business logic as the epoll worker:
  *   - http_parse → http_select → swap to compressed variant if accepted
- *   - sendmsg with up to 4 iovecs (head + chrome.hdr + body + chrome.ftr)
- *     which collapses to (head_pc + body_pc) when serving the precomputed
- *     compressed variant.
+ *   - sendmsg with up to METAL_MAX_SEGS iovecs (head + conn_tail +
+ *     chrome.hdr + body + chrome.ftr) which collapses to (head + conn_tail
+ *     + body_br) when serving the precomputed compressed variant.
  *
  * What's NOT in the spike (call out in README):
  *   - Multishot accept / recv (works on 5.19+; we use one-shot for
@@ -78,6 +78,12 @@ extern metrics_t* g_metrics;
 extern int        g_n_workers;
 extern __thread metrics_t* g_worker_metrics;
 
+/* Shared connection-tail segments — same as server.c. */
+static const char CONN_KA[]    = "\r\n";
+static const char CONN_CLOSE[] = "Connection: close\r\n\r\n";
+#define CONN_KA_LEN    (sizeof(CONN_KA) - 1)
+#define CONN_CLOSE_LEN (sizeof(CONN_CLOSE) - 1)
+
 /* ============================================================== */
 /* Raw io_uring syscalls.                                         */
 /* ============================================================== */
@@ -103,6 +109,7 @@ typedef struct {
     /* Submission ring */
     unsigned*  sq_head;
     unsigned*  sq_tail;
+    unsigned*  sq_flags;       /* IORING_SQ_NEED_WAKEUP / IORING_SQ_CQ_OVERFLOW */
     unsigned   sq_ring_mask;
     unsigned   sq_ring_entries;
     unsigned*  sq_array;
@@ -121,18 +128,59 @@ typedef struct {
     struct io_uring_cqe* cqes;
     void*      cq_ring_ptr;
     size_t     cq_ring_sz;
+
+    /* Mode */
+    bool       sqpoll;        /* IORING_SETUP_SQPOLL active */
 } ring_t;
 
-static bool ring_init(ring_t* r, unsigned entries) {
+static bool ring_init(ring_t* r, unsigned entries, bool sqpoll, int sqpoll_cpu) {
     struct io_uring_params p;
-    memset(&p, 0, sizeof(p));
-    int fd = io_uring_setup(entries, &p);
+    int fd = -1;
+    bool effective_sqpoll = sqpoll;
+
+    /* Tiered setup so that an unsupported sub-feature degrades the
+     * single feature, not the whole thing:
+     *   1) SQPOLL + SQ_AFF (if cpu given)
+     *   2) SQPOLL only      (drop CPU pin)
+     *   3) plain io_uring   (drop SQPOLL too)
+     * Each step retries with a fresh io_uring_params; on success we
+     * use the params from THAT call to compute mmap offsets. */
+    if (sqpoll && sqpoll_cpu >= 0) {
+        memset(&p, 0, sizeof(p));
+        p.flags |= IORING_SETUP_SQPOLL | IORING_SETUP_SQ_AFF;
+        p.sq_thread_idle = 1000;
+        p.sq_thread_cpu  = (uint32_t)sqpoll_cpu;
+        fd = io_uring_setup(entries, &p);
+        if (fd < 0 && (errno == EINVAL || errno == EPERM)) {
+            metal_log("io_uring SQPOLL+AFF unavailable (%s); retrying SQPOLL alone",
+                      strerror(errno));
+            fd = -1;
+        }
+    }
+    if (fd < 0 && sqpoll) {
+        memset(&p, 0, sizeof(p));
+        p.flags |= IORING_SETUP_SQPOLL;
+        p.sq_thread_idle = 1000;
+        fd = io_uring_setup(entries, &p);
+        if (fd < 0 && (errno == EINVAL || errno == EPERM)) {
+            metal_log("io_uring SQPOLL unavailable (%s); falling back to plain io_uring",
+                      strerror(errno));
+            fd = -1;
+            effective_sqpoll = false;
+        }
+    }
+    if (fd < 0) {
+        memset(&p, 0, sizeof(p));
+        fd = io_uring_setup(entries, &p);
+        effective_sqpoll = false;
+    }
     if (fd < 0) {
         metal_log("io_uring_setup(%u) failed: %s", entries, strerror(errno));
         return false;
     }
     memset(r, 0, sizeof(*r));
     r->fd = fd;
+    r->sqpoll = effective_sqpoll;
 
     r->sq_ring_sz = p.sq_off.array + p.sq_entries * sizeof(unsigned);
     r->cq_ring_sz = p.cq_off.cqes + p.cq_entries * sizeof(struct io_uring_cqe);
@@ -176,6 +224,7 @@ static bool ring_init(ring_t* r, unsigned entries) {
      * gave us. From here on we treat them like a fixed-size SPMC ring. */
     r->sq_head        = (unsigned*)((char*)r->sq_ring_ptr + p.sq_off.head);
     r->sq_tail        = (unsigned*)((char*)r->sq_ring_ptr + p.sq_off.tail);
+    r->sq_flags       = (unsigned*)((char*)r->sq_ring_ptr + p.sq_off.flags);
     r->sq_ring_mask   = *(unsigned*)((char*)r->sq_ring_ptr + p.sq_off.ring_mask);
     r->sq_ring_entries= *(unsigned*)((char*)r->sq_ring_ptr + p.sq_off.ring_entries);
     r->sq_array       = (unsigned*)((char*)r->sq_ring_ptr + p.sq_off.array);
@@ -189,14 +238,27 @@ static bool ring_init(ring_t* r, unsigned entries) {
     return true;
 }
 
-/* SPSC SQE handout. Returns NULL if the SQ is full — caller must
- * io_uring_enter to drain. The acquire/release pattern here matches
- * the kernel's published memory-order rules. */
+/* SPSC SQE handout. Returns NULL only after kicking SQPOLL (so the
+ * kernel thread starts draining) and one retry. With the once-per-loop
+ * kick model the SQ can fill mid-drain; without this retry, callers
+ * silently drop accepts/recvs/sends. The retry is a single sq_head
+ * reload — no syscall in the common case (kick is a no-op when SQPOLL
+ * is awake or disabled). */
+static struct io_uring_sqe* ring_get_sqe(ring_t* r);  /* fwd */
+static inline void ring_kick_sqpoll(ring_t* r);       /* fwd */
+
 static struct io_uring_sqe* ring_get_sqe(ring_t* r) {
     unsigned head = atomic_load_explicit((_Atomic unsigned*)r->sq_head,
                                          memory_order_acquire);
     unsigned tail = *r->sq_tail;
-    if (tail - head >= r->sq_ring_entries) return NULL;
+    if (__builtin_expect(tail - head >= r->sq_ring_entries, 0)) {
+        /* SQ appears full. Wake SQPOLL so the kernel drains it (no-op
+         * in plain mode), then reload sq_head and try once more. */
+        ring_kick_sqpoll(r);
+        head = atomic_load_explicit((_Atomic unsigned*)r->sq_head,
+                                    memory_order_acquire);
+        if (tail - head >= r->sq_ring_entries) return NULL;
+    }
     unsigned idx = tail & r->sq_ring_mask;
     return &r->sqes[idx];
 }
@@ -208,6 +270,34 @@ static void ring_publish(ring_t* r) {
     r->sq_array[idx] = idx;
     atomic_store_explicit((_Atomic unsigned*)r->sq_tail, tail + 1,
                           memory_order_release);
+}
+
+/* When SQPOLL is enabled, the kernel poll thread sleeps after
+ * sq_thread_idle ms of no submits. While sleeping it sets
+ * IORING_SQ_NEED_WAKEUP in sq_flags; we must wake it via
+ * io_uring_enter(IORING_ENTER_SQ_WAKEUP) for it to see our SQEs.
+ * In the fast path (steady traffic) the kernel thread is awake and
+ * NEED_WAKEUP is clear — so this becomes a single load + branch
+ * with no syscall. That's the entire point of SQPOLL. */
+#ifndef IORING_SQ_NEED_WAKEUP
+#  define IORING_SQ_NEED_WAKEUP (1U << 0)
+#endif
+/* Thin helper that returns the current sq_flags load. Used by both
+ * the standalone ring_kick_sqpoll() (publish path) and the main loop
+ * (which folds wakeup into its blocking io_uring_enter). */
+static inline unsigned ring_sq_flags(const ring_t* r) {
+    return atomic_load_explicit((const _Atomic unsigned*)r->sq_flags,
+                                memory_order_acquire);
+}
+
+static inline void ring_kick_sqpoll(ring_t* r) {
+    if (!r->sqpoll) return;
+    if (ring_sq_flags(r) & IORING_SQ_NEED_WAKEUP) {
+        /* Best-effort wake; the main loop also folds wakeup into its
+         * blocking enter, so a transient EINTR here is recovered on
+         * the next iteration. */
+        (void)io_uring_enter(r->fd, 0, 0, IORING_ENTER_SQ_WAKEUP, NULL);
+    }
 }
 
 /* IORING_OP_SENDMSG_ZC was added in Linux 6.0; CQE flag F_NOTIF
@@ -259,7 +349,7 @@ static inline uint64_t ud_idx(uint64_t ud) { return ud & 0x00ffffffffffffffULL; 
 /* ============================================================== */
 
 typedef struct {
-    struct iovec  iov[4];
+    struct iovec  iov[METAL_MAX_SEGS];
     struct msghdr mh;
     uint8_t       in_flight;     /* OP_* of the current submitted op (0 = none) */
     uint8_t       last_was_zc;   /* did the most recent send use SENDMSG_ZC?    */
@@ -321,37 +411,22 @@ static bool submit_close(ring_t* r, int fd, size_t conn_idx) {
  * ignore the extra IORING_CQE_F_NOTIF cqe in the OP_SEND handler. */
 static bool submit_sendmsg(ring_t* r, conn_t* c, size_t conn_idx,
                            size_t total_payload) {
-    const resource_t* res = c->res;
-    bool encoded = (c->active_variant != NULL);
-    const chrome_t* ch = (c->send_body && !encoded) ? res->chrome : NULL;
-    const char* body_ptr = encoded ? c->active_variant->body : res->body;
-    size_t      body_len = encoded ? c->active_variant->body_len : res->body_len;
-
-    const char* seg_ptr[4];
-    size_t      seg_len[4];
-    int seg_n = 0;
-    seg_ptr[seg_n] = c->head_ptr;       seg_len[seg_n] = c->head_len;       seg_n++;
-    if (c->send_body) {
-        if (ch && ch->hdr_len) { seg_ptr[seg_n] = ch->hdr; seg_len[seg_n] = ch->hdr_len; seg_n++; }
-        if (body_len)          { seg_ptr[seg_n] = body_ptr; seg_len[seg_n] = body_len;   seg_n++; }
-        if (ch && ch->ftr_len) { seg_ptr[seg_n] = ch->ftr; seg_len[seg_n] = ch->ftr_len; seg_n++; }
-    }
-
-    /* Skip already-sent prefix; emit the partial leading segment. */
     uring_state_t* us = &g_uring_state[conn_idx];
-    int n = 0;
-    size_t cursor = 0;
-    for (int i = 0; i < seg_n; i++) {
-        size_t end = cursor + seg_len[i];
-        if (end <= c->bytes_sent) { cursor = end; continue; }
-        size_t off = c->bytes_sent > cursor ? c->bytes_sent - cursor : 0;
-        us->iov[n].iov_base = (void*)(uintptr_t)(seg_ptr[i] + off);
-        us->iov[n].iov_len  = seg_len[i] - off;
-        n++;
-        cursor = end;
-    }
-    if (n == 0) return false;   /* nothing to send -> caller handles */
 
+    /* Build iovec from conn_t segments, skipping past bytes_sent. */
+    int n = 0;
+    size_t skip = c->bytes_sent;
+    for (int i = 0; i < c->seg_count; i++) {
+        if (skip >= c->segs[i].len) {
+            skip -= c->segs[i].len;
+            continue;
+        }
+        us->iov[n].iov_base = (void*)(c->segs[i].ptr + skip);
+        us->iov[n].iov_len = c->segs[i].len - skip;
+        skip = 0;
+        n++;
+    }
+    if (n == 0) return false;
     memset(&us->mh, 0, sizeof(us->mh));
     us->mh.msg_iov    = us->iov;
     us->mh.msg_iovlen = (size_t)n;
@@ -378,13 +453,13 @@ static bool submit_sendmsg(ring_t* r, conn_t* c, size_t conn_idx,
 
 static void conn_reset_for_next(conn_t* c) {
     c->res         = NULL;
-    c->head_ptr    = NULL;
-    c->head_len    = 0;
+    c->seg_count   = 0;
     c->bytes_sent  = 0;
+    c->wire_total  = 0;
     c->send_body   = false;
     c->active_variant = NULL;
     c->state       = ST_READING;
-    c->last_active_ms = metal_now_ms();
+    c->last_active_ms = metal_now_ms_coarse();
 }
 
 static void conn_init_new(conn_t* c, int fd) {
@@ -392,15 +467,17 @@ static void conn_init_new(conn_t* c, int fd) {
     c->state = ST_READING;
     c->read_off = 0;
     c->res = NULL;
-    c->head_ptr = NULL; c->head_len = 0;
+    c->seg_count = 0;
     c->send_body = false;
     c->active_variant = NULL;
+    c->wire_total = 0;
     c->bytes_sent = 0;
     c->close_after = false;
     c->req_count = 0;
     c->peer_half_closed = false;
     c->req_start_tsc = 0;
-    c->last_active_ms = metal_now_ms();
+    c->last_active_ms = metal_now_ms_coarse();
+    c->epoll_mask = 0;
 }
 
 /* Compute the wire-bytes total for the response c is currently
@@ -408,17 +485,7 @@ static void conn_init_new(conn_t* c, int fd) {
  * or (head + body) for the precomputed compressed variant. Used both
  * to detect "send done" and to pick SENDMSG vs SENDMSG_ZC. */
 static inline size_t conn_total_payload(const conn_t* c) {
-    size_t total = c->head_len;
-    if (c->send_body) {
-        const resource_t* rs = c->res;
-        if (c->active_variant != NULL) {
-            total += c->active_variant->body_len;
-        } else {
-            total += rs->body_len;
-            if (rs->chrome) total += rs->chrome->hdr_len + rs->chrome->ftr_len;
-        }
-    }
-    return total;
+    return c->wire_total;
 }
 
 /* Apply parser result + dispatch a response. Returns true on success
@@ -443,24 +510,82 @@ static bool dispatch_one(conn_t* c, const jumptable_t* jt, uint32_t max_req) {
     else if (req.accept_pc && r->compressed != NULL)
         variant = r->compressed;
 
-    /* Conditional GET: 304 Not Modified */
-    if (r->etag && req.if_none_match &&
-        http_etag_matches(req.if_none_match, req.if_none_match_len,
-                          r->etag, r->etag_len)) {
-        c->active_variant = NULL;
-        c->head_ptr = close_after ? r->head_304_close      : r->head_304_keepalive;
-        c->head_len = close_after ? r->head_304_close_len  : r->head_304_keepalive_len;
-        head_only = true;
-    } else {
-        c->active_variant = variant;
+    c->active_variant = variant;
+
+    /* Build iovec segments — same logic as epoll backend.
+     * head + conn_tail + body pieces. */
+    {
+        const char* head = variant ? variant->head : r->head;
+        size_t head_len  = variant ? variant->head_len : r->head_len;
+
+        int ns = 0;
+        c->segs[ns].ptr = head;
+        c->segs[ns].len = head_len;
+        ns++;
+
+        c->segs[ns].ptr = close_after ? CONN_CLOSE : CONN_KA;
+        c->segs[ns].len = close_after ? CONN_CLOSE_LEN : CONN_KA_LEN;
+        ns++;
+
+        if (!head_only) {
+            if (variant) {
+                c->segs[ns].ptr = variant->body;
+                c->segs[ns].len = variant->body_len;
+                ns++;
+            } else {
+                if (r->chrome && r->chrome->hdr_len) {
+                    c->segs[ns].ptr = r->chrome->hdr;
+                    c->segs[ns].len = r->chrome->hdr_len;
+                    ns++;
+                }
+                if (r->body_len) {
+                    c->segs[ns].ptr = r->body;
+                    c->segs[ns].len = r->body_len;
+                    ns++;
+                }
+                if (r->chrome && r->chrome->ftr_len) {
+                    c->segs[ns].ptr = r->chrome->ftr;
+                    c->segs[ns].len = r->chrome->ftr_len;
+                    ns++;
+                }
+            }
+        }
+
+        c->seg_count = (uint8_t)ns;
+        size_t total = 0;
+        for (int i = 0; i < ns; i++) total += c->segs[i].len;
+        c->wire_total = total;
+    }
+
+    /* ETag / 304 Not Modified — same logic as epoll backend. */
+    if (pr == HTTP_OK && req.if_none_match &&
+        (req.method == M_GET || req.method == M_HEAD)) {
+        const char* etag;
+        const char* w304;
+        size_t w304_len;
         if (variant) {
-            c->head_ptr = close_after ? variant->head_close      : variant->head_keepalive;
-            c->head_len = close_after ? variant->head_close_len  : variant->head_keepalive_len;
+            etag = variant->etag;
+            w304 = variant->wire_304;
+            w304_len = variant->wire_304_len;
+        } else if (r->etag[0] != '\0') {
+            etag = r->etag;
+            w304 = r->wire_304;
+            w304_len = r->wire_304_len;
         } else {
-            c->head_ptr = close_after ? r->head_close : r->head_keepalive;
-            c->head_len = close_after ? r->head_close_len : r->head_keepalive_len;
+            etag = NULL; w304 = NULL; w304_len = 0;
+        }
+        if (etag && w304 && etag_matches(req.if_none_match,
+                                          req.if_none_match_len, etag)) {
+            c->segs[0].ptr = w304;
+            c->segs[0].len = w304_len;
+            c->segs[1].ptr = close_after ? CONN_CLOSE : CONN_KA;
+            c->segs[1].len = close_after ? CONN_CLOSE_LEN : CONN_KA_LEN;
+            c->seg_count = 2;
+            c->wire_total = w304_len + c->segs[1].len;
+            head_only = true;
         }
     }
+
     c->send_body  = !head_only;
     c->bytes_sent = 0;
     c->close_after = close_after;
@@ -520,7 +645,8 @@ void* uring_worker_main(void* arg) {
      * The CQ defaults to 2x SQ which gives us slack for batched
      * accept+recv+send completions. */
     ring_t r;
-    if (!ring_init(&r, 1024)) metal_die("ring_init failed");
+    if (!ring_init(&r, 1024, cfg->sqpoll, cfg->sqpoll_cpu))
+        metal_die("ring_init failed");
 
     pool_t pool;
     if (!pool_init(&pool, cfg->pool_cap)) metal_die("pool_init failed");
@@ -529,17 +655,33 @@ void* uring_worker_main(void* arg) {
     g_uring_state = (uring_state_t*)calloc(g_uring_state_n, sizeof(uring_state_t));
     if (!g_uring_state) metal_die("uring_state alloc failed");
 
-    metal_log("worker %d ready (io_uring): listen=:%d pool=%zu maxreqs=%u",
-              cfg->worker_index, cfg->port, pool.cap, cfg->max_requests_per_conn);
+    metal_log("worker %d ready (io_uring%s): listen=:%d pool=%zu maxreqs=%u",
+              cfg->worker_index, r.sqpoll ? "+sqpoll" : "",
+              cfg->port, pool.cap, cfg->max_requests_per_conn);
 
     /* Prime: post one accept so the loop has work. */
     if (!submit_accept(&r, lfd)) metal_die("initial accept submit failed");
     unsigned pending_submit = 1;
 
     for (;;) {
-        /* Submit anything queued, then block until at least 1 CQE. */
-        int submitted = io_uring_enter(r.fd, pending_submit, 1,
+        int submitted;
+        if (r.sqpoll) {
+            /* SQPOLL: kernel polls the SQ; we never count submits.
+             * Fold the SQ_WAKEUP flag into the blocking GETEVENTS
+             * enter so we have exactly one syscall per loop iteration
+             * (and no race window where a kick syscall fails between
+             * the wake and the wait). */
+            unsigned ef = IORING_ENTER_GETEVENTS;
+            if (ring_sq_flags(&r) & IORING_SQ_NEED_WAKEUP)
+                ef |= IORING_ENTER_SQ_WAKEUP;
+            submitted = io_uring_enter(r.fd, 0, 1, ef, NULL);
+            (void)pending_submit;
+        } else {
+            /* Plain mode: submit pending SQEs and block on a CQ event
+             * in one syscall. */
+            submitted = io_uring_enter(r.fd, pending_submit, 1,
                                        IORING_ENTER_GETEVENTS, NULL);
+        }
         if (submitted < 0) {
             if (errno == EINTR) continue;
             metal_log("io_uring_enter wait: %s", strerror(errno));
@@ -596,7 +738,7 @@ void* uring_worker_main(void* arg) {
                     continue;
                 }
                 c->read_off += (size_t)res;
-                c->last_active_ms = metal_now_ms();
+                c->last_active_ms = metal_now_ms_coarse();
 
                 if (!dispatch_one(c, cfg->jt, cfg->max_requests_per_conn)) {
                     if (submit_close(&r, c->fd, idx)) to_submit++;
