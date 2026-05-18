@@ -30,4 +30,13 @@ int pw_rsa_rsasp1(const pw_rsa_private_key_t* key,
                   const uint8_t* em, size_t em_len,
                   uint8_t* sig_out, size_t sig_out_cap);
 
+/* Self-check: verify sig^65537 mod n == em (e = 65537).
+ * Returns 0 if sig verifies, negative on error or mismatch. */
+int pw_rsa_self_check(const pw_rsa_private_key_t* key,
+                      const uint8_t* em, size_t em_len,
+                      const uint8_t* sig, size_t sig_len);
+
+/* Diagnostic: convert limbs to big-endian bytes */
+void limbs_to_be_diag(const uint64_t* limbs, size_t n_len, uint8_t* out);
+
 #endif

@@ -13,6 +13,7 @@
 #include "simd.h"
 #include "tls_certs.h"
 #include "util.h"
+#include "../userspace/crypto/ecdsa.h"
 
 static void usage(const char* argv0) {
     fprintf(stderr,
@@ -34,10 +35,6 @@ static void usage(const char* argv0) {
         "  --tls-xdp-queue=N   AF_XDP queue id (default 0)\n"
         "  --http-early-hints  enable HTTP/1.1 103 Early Hints with auto-derived\n"
         "                      Link: rel=preload headers (off by default)\n"
-        "  --tls-busy-poll     legacy busy-spin RX loop (lowest latency; pegs a\n"
-        "                      full core; AVOID under Kubernetes cpu limits — CFS\n"
-        "                      throttling produces ~80ms tail-latency stalls).\n"
-        "                      Default is poll(2)-based RX with 10ms tick wakeups.\n"
         "  --sqpoll     enable IORING_SETUP_SQPOLL: kernel polls our SQ,\n"
         "               eliminating io_uring_enter() syscalls on the submit\n"
         "               path. Costs one kernel thread per worker. Requires\n"
@@ -76,7 +73,6 @@ int main(int argc, char** argv) {
     bool tls_use_xdp = false;
     uint32_t tls_xdp_queue = 0;
     bool http_early_hints = false;
-    bool tls_busy_poll = false;
 
     /* Two-pass parse: lift flags out of argv first, then handle the
      * remaining positional args exactly as before. This keeps the
@@ -178,10 +174,6 @@ int main(int argc, char** argv) {
             tls_xdp_queue = (uint32_t)q;
             continue;
         }
-        if (strcmp(argv[i], "--tls-busy-poll") == 0) {
-            tls_busy_poll = true;
-            continue;
-        }
         if (npos < (int)(sizeof(pos)/sizeof(pos[0]))) {
             pos[npos++] = argv[i];
         } else {
@@ -259,9 +251,17 @@ int main(int argc, char** argv) {
     tls_cert_path[0] = '\0';
     tls_key_path[0] = '\0';
     if (backend == PICOWEB_BACKEND_TLS) {
-        if (!tls_ifname || !tls_ifname[0]) {
-            fprintf(stderr, "picoweb: --tls requires --tls-ifname=IFACE\n");
-            return 1;
+        if (tls_ifname && tls_ifname[0]) {
+            fprintf(stderr,
+                "picoweb: --tls-ifname is no longer used (the kernel-socket "
+                "TLS server doesn't need a raw NIC). Ignoring.\n");
+            tls_ifname = NULL;
+        }
+        if (tls_use_xdp) {
+            fprintf(stderr,
+                "picoweb: --tls-xdp is no longer used (AF_XDP path is "
+                "preserved in legacy/, not built into this binary). Ignoring.\n");
+            tls_use_xdp = false;
         }
         if (picoweb_tls_locate_certs(tls_cert_cli, tls_key_cli,
                                      tls_cert_path, tls_key_path,
@@ -290,6 +290,21 @@ int main(int argc, char** argv) {
      * jumptable_build (which calls metrics_build_resources for /stats). */
     metrics_init((int)workers);
 
+    /* Spawn the ECDSA-P256 precompute pool + producer thread. Each
+     * pooled tuple lets a TLS handshake skip the dominant k*G and
+     * scalar_inv ops, dropping per-sign cost from ~5-50 ms to a few
+     * mod-muls. Failure is non-fatal: sign() transparently falls back
+     * to the inline RFC 6979 path. Only meaningful for the TLS
+     * backend, but cheap enough to start unconditionally. */
+    if (backend == PICOWEB_BACKEND_TLS) {
+        if (ecdsa_p256_precomp_init(64) != 0) {
+            metal_log("warning: ecdsa precompute pool init failed; "
+                      "sign() will use inline path");
+        } else {
+            metal_log("ecdsa precompute pool: cap=64, producer thread started");
+        }
+    }
+
     /* Build the immutable jump table once on the main thread. */
     static jumptable_t jt;
     if (!jumptable_build(&jt, wwwroot)) {
@@ -317,7 +332,6 @@ int main(int argc, char** argv) {
         cfgs[i].tls_use_xdp           = tls_use_xdp;
         cfgs[i].tls_xdp_queue         = tls_xdp_queue;
         cfgs[i].http_early_hints      = http_early_hints;
-        cfgs[i].tls_busy_poll         = tls_busy_poll;
         /* SQPOLL kernel-thread CPU policy: avoid pinning the kernel
          * polling thread to the same core as its userspace worker
          * (worker i is pinned to (i % nproc)) — they'd thrash one
@@ -347,20 +361,29 @@ int main(int argc, char** argv) {
             metal_die("pthread_create #%ld", i);
         }
         if (attr_p) pthread_attr_destroy(&attr);
-        /* Pin worker N to core (N % nproc). With SO_REUSEPORT each
-         * worker has its own listen socket and per-worker state, so
-         * keeping each on a fixed core preserves L1/L2 cache locality
-         * and matches the kernel's RPS hashing for steady throughput.
+        /* Pin worker N to a CPU. We deliberately AVOID CPU 0 when
+         * possible because the veth NET_RX softirq for inbound traffic
+         * tends to run on CPU 0 (it hashes the first interrupt-handling
+         * core), and a busy-polling user thread on the same core fights
+         * those softirqs for cycles — under burst load this manifests as
+         * XDP-layer RX drops because softirq slice doesn't run long
+         * enough to push frames into the XSK ring before the user thread
+         * resumes.
+         * Mapping: worker N -> CPU ((N + 1) % nproc). With workers=1 and
+         * nproc>=2, that puts the worker on CPU 1 and leaves CPU 0 free
+         * for kernel softirqs. With nproc==1 we have no choice and stay
+         * on CPU 0. With workers>1 we still cycle across all cores.
          * Best-effort: failure is logged and ignored. */
 #ifdef __linux__
         long nproc = sysconf(_SC_NPROCESSORS_ONLN);
         if (nproc >= 1) {
+            long target = (nproc >= 2) ? ((i + 1) % nproc) : 0;
             cpu_set_t cpus;
             CPU_ZERO(&cpus);
-            CPU_SET((int)(i % nproc), &cpus);
+            CPU_SET((int)target, &cpus);
             if (pthread_setaffinity_np(threads[i], sizeof(cpus), &cpus) != 0) {
                 metal_log("pthread_setaffinity_np worker %ld -> cpu %ld: %s",
-                          i, i % nproc, strerror(errno));
+                          i, target, strerror(errno));
             }
         }
 #endif

@@ -42,8 +42,9 @@
  *     the network before feeding it to the engine
  *   - any caller-side scratch that must hold a full ciphertext record
  *
- * The engine's own internal RX/TX/APP_IN/APP_OUT buffers also use
- * this size (PW_TLS_BUF_CAP in engine.h); keep them in sync.
+ * The engine's RX + APP buffers use this size (PW_TLS_BUF_CAP in
+ * engine.h). TX uses a larger dedicated cap because responses may span
+ * multiple records.
  *
  * 5 + (16384 + 256 + 16) = 16661 bytes (~16.27 KiB).
  */

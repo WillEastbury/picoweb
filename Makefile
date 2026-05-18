@@ -19,6 +19,7 @@ USERSPACE_TLS_SRC := \
 	userspace/tcp/tcp.c \
 	userspace/io/af_packet.c \
 	userspace/io/af_xdp.c \
+	userspace/xdp/xdp_loader.c \
 	userspace/crypto/util.c \
 	userspace/crypto/cpuid.c \
 	userspace/crypto/sha256.c \
@@ -44,7 +45,11 @@ USERSPACE_TLS_SRC := \
 	userspace/tls/engine.c \
 	userspace/tls/ticket_store.c
 
-SRC := $(wildcard src/*.c) $(USERSPACE_TLS_SRC)
+ALL_SRC := $(wildcard src/*.c)
+# Old AF_PACKET/AF_XDP TLS server is preserved in the tree but excluded
+# from the build. The kernel-socket TLS server (server_tls_kernel.c) is
+# the one path that defines tls_worker_main in the default binary.
+SRC := $(filter-out src/server_tls.c,$(ALL_SRC)) $(USERSPACE_TLS_SRC)
 OBJ := $(SRC:.c=.o)
 BIN := picoweb
 
@@ -72,4 +77,4 @@ run: $(BIN)
 	./$(BIN) 8080 wwwroot
 
 clean:
-	rm -f src/*.o picoweb picoweb_uring
+	rm -f src/*.o userspace/**/*.o userspace/**/**/*.o picoweb picoweb_uring

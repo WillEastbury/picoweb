@@ -12,8 +12,9 @@
 #include "handshake.h"
 
 #include <string.h>
-#include "../crypto/ecdsa.h"
+#include <stdio.h>
 #include "../crypto/ed25519.h"
+#include "../crypto/ecdsa.h"
 #include "../crypto/hkdf.h"
 #include "../crypto/hmac.h"
 #include "../crypto/p256.h"
@@ -331,7 +332,7 @@ static int parse_extensions(const uint8_t* ext_data, size_t ext_len,
 int tls13_parse_client_hello(const uint8_t* msg, size_t msg_len,
                              tls13_client_hello_t* out) {
     if (!msg || !out) return -1;
-    secure_zero(out, sizeof(*out));
+    memset(out, 0, sizeof(*out));
     out->raw = msg;
     out->raw_len = msg_len;
 
@@ -798,13 +799,6 @@ static int emsa_pss_encode_sha256(const uint8_t mhash[32],
     return 0;
 }
 
-/* Extract the 32-byte private scalar from a P-256 SEC1 ECPrivateKey or
- * PKCS#8-wrapped ECPrivateKey DER blob. We require the P-256 (prime256v1)
- * named-curve OID 1.2.840.10045.3.1.7 to appear and then locate the
- * 32-byte OCTET STRING (tag 0x04, len 0x20) that holds the scalar. We
- * validate each candidate by deriving a public key (which only succeeds
- * for a scalar in [1, n-1] with valid on-curve output), so an unrelated
- * 0x04 0x20 prefix is rejected. */
 static int ecdsa_p256_private_scalar_from_der(const uint8_t* der, size_t der_len,
                                               uint8_t out_priv[32]) {
     if (!der || !out_priv || der_len < 34) return -1;
@@ -866,6 +860,21 @@ int tls13_build_certificate_verify_ex(uint8_t* out, size_t out_cap,
             secure_zero(mhash, sizeof(mhash));
             secure_zero(em, sizeof(em));
             return -1;
+        }
+
+        /* Self-check: verify sig^65537 mod n == em */
+        {
+            int vrc = pw_rsa_self_check(&rk, em, rk.n_len, sig, rk.n_len);
+            if (vrc != 0) {
+                fprintf(stderr, "RSA-PSS self-check FAILED: rc=%d n_len=%zu\n",
+                        vrc, rk.n_len);
+                secure_zero(&rk, sizeof(rk));
+                secure_zero(signed_data, sizeof(signed_data));
+                secure_zero(mhash, sizeof(mhash));
+                secure_zero(em, sizeof(em));
+                secure_zero(sig, sizeof(sig));
+                return -1;
+            }
         }
 
         size_t sig_len = rk.n_len;

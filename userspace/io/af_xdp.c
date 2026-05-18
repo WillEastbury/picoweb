@@ -3,26 +3,40 @@
 #endif
 
 #include "af_xdp.h"
+#include "../xdp/xdp_loader.h"
 
 #include <errno.h>
 #include <net/if.h>
 #include <poll.h>
+#include <stdio.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 
 #if defined(__linux__)
 #include <linux/if_xdp.h>
 #include <linux/if_link.h>
+#include <linux/bpf.h>
 #endif
 
-#define XSK_RX_RING_SZ 256u
-#define XSK_TX_RING_SZ 256u
-#define XSK_FR_RING_SZ 512u
-#define XSK_CR_RING_SZ 512u
+/* Ring sizes: 4x bump (256→1024 RX/TX, 512→2048 FR/CR) so bursts of
+ * parallel SYNs (e.g. browser opening 6+ concurrent sockets to load a
+ * page) can land in the RX ring while the worker is mid-handshake on a
+ * previous connection. With the original 256-entry RX ring, ~17–42% of
+ * fresh handshakes were silently dropped at the XDP layer under typical
+ * browser concurrency. UMEM frame count must be ≥ 2*FR (pre-fill is
+ * FRAME_N/2). 16x bump tested first but kernel returned ENOBUFS on
+ * UMEM_REG (likely cgroup memory accounting); 4x is conservative.
+ *   UMEM = 4096 * 2048 = 8 MiB — well within the 128Mi pod memory limit.
+ */
+#define XSK_RX_RING_SZ 1024u
+#define XSK_TX_RING_SZ 1024u
+#define XSK_FR_RING_SZ 2048u
+#define XSK_CR_RING_SZ 2048u
 #define XSK_FRAME_SZ   2048u
-#define XSK_FRAME_N    1024u
+#define XSK_FRAME_N    4096u
 
 static inline uint32_t load_u32(uint32_t* p) {
     return __atomic_load_n(p, __ATOMIC_ACQUIRE);
@@ -54,8 +68,13 @@ static int ring_init_u64(void* map, const struct xdp_ring_offset* o, uint32_t n,
 }
 
 static void xdp_reap_completions(af_xdp_t* x) {
+    static int comp_log_count = 0;
     uint32_t cons = load_u32(x->cr.consumer);
     uint32_t prod = load_u32(x->cr.producer);
+    if (cons != prod && comp_log_count < 3) {
+        fprintf(stderr, "af_xdp: completion ring: cons=%u prod=%u (completed=%u)\n", cons, prod, prod - cons);
+        comp_log_count++;
+    }
     while (cons != prod) {
         uint64_t addr = x->cr.desc[cons & x->cr.mask];
         if (x->tx_free_n < (uint32_t)(sizeof(x->tx_free) / sizeof(x->tx_free[0])))
@@ -82,6 +101,7 @@ int af_xdp_open(af_xdp_t* x, const char* ifname, uint32_t queue_id,
 #else
     memset(x, 0, sizeof(*x));
     x->fd = -1;
+    x->xdp_map_fd = -1;
     x->ifindex = if_nametoindex(ifname);
     if (x->ifindex == 0) return -1;
     x->queue_id = queue_id;
@@ -105,11 +125,27 @@ int af_xdp_open(af_xdp_t* x, const char* ifname, uint32_t queue_id,
         .headroom = 0,
         .flags = 0,
     };
-    if (setsockopt(x->fd, SOL_XDP, XDP_UMEM_REG, &um, sizeof(um)) != 0) goto fail;
-    if (setsockopt(x->fd, SOL_XDP, XDP_UMEM_FILL_RING, &(uint32_t){XSK_FR_RING_SZ}, sizeof(uint32_t)) != 0) goto fail;
-    if (setsockopt(x->fd, SOL_XDP, XDP_UMEM_COMPLETION_RING, &(uint32_t){XSK_CR_RING_SZ}, sizeof(uint32_t)) != 0) goto fail;
-    if (setsockopt(x->fd, SOL_XDP, XDP_RX_RING, &(uint32_t){XSK_RX_RING_SZ}, sizeof(uint32_t)) != 0) goto fail;
-    if (setsockopt(x->fd, SOL_XDP, XDP_TX_RING, &(uint32_t){XSK_TX_RING_SZ}, sizeof(uint32_t)) != 0) goto fail;
+    if (setsockopt(x->fd, SOL_XDP, XDP_UMEM_REG, &um, sizeof(um)) != 0) {
+        fprintf(stderr, "af_xdp_open: XDP_UMEM_REG (umem=%zuB frame=%u nframes=%u): %s\n",
+                x->umem_len, x->frame_size, x->frame_count, strerror(errno));
+        goto fail;
+    }
+    if (setsockopt(x->fd, SOL_XDP, XDP_UMEM_FILL_RING, &(uint32_t){XSK_FR_RING_SZ}, sizeof(uint32_t)) != 0) {
+        fprintf(stderr, "af_xdp_open: XDP_UMEM_FILL_RING (sz=%u): %s\n", XSK_FR_RING_SZ, strerror(errno));
+        goto fail;
+    }
+    if (setsockopt(x->fd, SOL_XDP, XDP_UMEM_COMPLETION_RING, &(uint32_t){XSK_CR_RING_SZ}, sizeof(uint32_t)) != 0) {
+        fprintf(stderr, "af_xdp_open: XDP_UMEM_COMPLETION_RING (sz=%u): %s\n", XSK_CR_RING_SZ, strerror(errno));
+        goto fail;
+    }
+    if (setsockopt(x->fd, SOL_XDP, XDP_RX_RING, &(uint32_t){XSK_RX_RING_SZ}, sizeof(uint32_t)) != 0) {
+        fprintf(stderr, "af_xdp_open: XDP_RX_RING (sz=%u): %s\n", XSK_RX_RING_SZ, strerror(errno));
+        goto fail;
+    }
+    if (setsockopt(x->fd, SOL_XDP, XDP_TX_RING, &(uint32_t){XSK_TX_RING_SZ}, sizeof(uint32_t)) != 0) {
+        fprintf(stderr, "af_xdp_open: XDP_TX_RING (sz=%u): %s\n", XSK_TX_RING_SZ, strerror(errno));
+        goto fail;
+    }
 
     struct xdp_mmap_offsets off;
     socklen_t olen = sizeof(off);
@@ -136,13 +172,37 @@ int af_xdp_open(af_xdp_t* x, const char* ifname, uint32_t queue_id,
     x->fr.mask = XSK_FR_RING_SZ - 1;
     x->cr.mask = XSK_CR_RING_SZ - 1;
 
+    /* Load XDP redirect program BEFORE bind so the kernel knows packets
+     * will be delivered via redirect (not copy mode). */
+    x->xdp_map_fd = xdp_load_redirect(x->ifindex, 443);
+    fprintf(stderr, "af_xdp: xdp_load_redirect(ifindex=%d, port=443) = %d (errno=%d)\n",
+            x->ifindex, x->xdp_map_fd, x->xdp_map_fd < 0 ? errno : 0);
+
     struct sockaddr_xdp sxdp;
     memset(&sxdp, 0, sizeof(sxdp));
     sxdp.sxdp_family = AF_XDP;
     sxdp.sxdp_ifindex = (uint32_t)x->ifindex;
     sxdp.sxdp_queue_id = queue_id;
-    sxdp.sxdp_flags = XDP_COPY | XDP_USE_NEED_WAKEUP;
-    if (bind(x->fd, (struct sockaddr*)&sxdp, sizeof(sxdp)) != 0) goto fail;
+    sxdp.sxdp_flags = XDP_COPY;
+    if (bind(x->fd, (struct sockaddr*)&sxdp, sizeof(sxdp)) != 0) {
+        fprintf(stderr, "af_xdp: bind failed: errno=%d\n", errno);
+        goto fail;
+    }
+    fprintf(stderr, "af_xdp: bind ok (fd=%d ifindex=%d queue=%u)\n", x->fd, x->ifindex, queue_id);
+
+    if (x->xdp_map_fd >= 0) {
+        /* Register this AF_XDP socket in the XSKMAP */
+        union bpf_attr map_attr;
+        memset(&map_attr, 0, sizeof(map_attr));
+        map_attr.map_fd = x->xdp_map_fd;
+        map_attr.key    = (uint64_t)(unsigned long)&(uint32_t){queue_id};
+        map_attr.value  = (uint64_t)(unsigned long)&x->fd;
+        map_attr.flags  = 0; /* BPF_ANY */
+        int mr = (int)syscall(__NR_bpf, BPF_MAP_UPDATE_ELEM, &map_attr, sizeof(map_attr));
+        fprintf(stderr, "af_xdp: BPF_MAP_UPDATE_ELEM(map_fd=%d, key=%u, val=xsk_fd=%d) = %d (errno=%d)\n",
+                x->xdp_map_fd, queue_id, x->fd, mr, mr != 0 ? errno : 0);
+        if (mr != 0) goto fail;
+    }
 
     /* Pre-populate fill ring with half the UMEM; reserve the other half for TX. */
     for (uint32_t i = 0; i < x->frame_count / 2; i++) {
@@ -166,11 +226,24 @@ int af_xdp_recv(af_xdp_t* x, uint8_t* buf, size_t buf_cap,
     (void)x; (void)buf; (void)buf_cap; (void)ip_out; (void)ip_len_out;
     return -1;
 #else
+    static int rx_log_count = 0;
     uint32_t cons = load_u32(x->rx.consumer);
     uint32_t prod = load_u32(x->rx.producer);
     if (cons == prod) return -1;
 
     const struct xdp_desc* d = &x->rx.desc[cons & x->rx.mask];
+
+    if (rx_log_count < 20) {
+        char hex[140];
+        int hpos = 0;
+        size_t dumplen = d->len < 66 ? d->len : 66;
+        uint8_t *rxdata = (uint8_t*)x->umem + d->addr;
+        for (size_t i = 0; i < dumplen && hpos < 132; i++)
+            hpos += snprintf(hex + hpos, sizeof(hex) - hpos, "%02x", rxdata[i]);
+        fprintf(stderr, "af_xdp: RX len=%u hex=%s\n", d->len, hex);
+        rx_log_count++;
+    }
+
     if (d->len > buf_cap || d->addr + d->len > x->umem_len) {
         store_u32(x->rx.consumer, cons + 1);
         (void)xdp_push_fill(x, d->addr);
@@ -199,10 +272,14 @@ int af_xdp_send_ipv4(af_xdp_t* x, const uint8_t* ip, size_t ip_len) {
     (void)x; (void)ip; (void)ip_len;
     return -1;
 #else
+    static int tx_log_count = 0;
     if (ip_len + ETH_HDR_LEN > x->frame_size) return -1;
 
     xdp_reap_completions(x);
-    if (x->tx_free_n == 0) return -1;
+    if (x->tx_free_n == 0) {
+        if (tx_log_count < 5) { fprintf(stderr, "af_xdp: TX no free frames\n"); tx_log_count++; }
+        return -1;
+    }
     uint64_t addr = x->tx_free[--x->tx_free_n];
     if (addr + ip_len + ETH_HDR_LEN > x->umem_len) return -1;
     uint8_t* frame = (uint8_t*)x->umem + addr;
@@ -225,7 +302,18 @@ int af_xdp_send_ipv4(af_xdp_t* x, const uint8_t* ip, size_t ip_len) {
     store_u32(x->tx.producer, prod + 1);
 
     /* Kick driver in need_wakeup mode. */
-    (void)sendto(x->fd, NULL, 0, MSG_DONTWAIT, NULL, 0);
+    int sr = (int)sendto(x->fd, NULL, 0, MSG_DONTWAIT, NULL, 0);
+    if (tx_log_count < 3) {
+        char hex[140];
+        int hpos = 0;
+        size_t dumplen = ip_len + ETH_HDR_LEN;
+        if (dumplen > 66) dumplen = 66;
+        for (size_t i = 0; i < dumplen && hpos < 132; i++)
+            hpos += snprintf(hex + hpos, sizeof(hex) - hpos, "%02x", frame[i]);
+        fprintf(stderr, "af_xdp: TX len=%zu sendto=%d hex=%s\n",
+                ip_len + ETH_HDR_LEN, sr, hex);
+        tx_log_count++;
+    }
     return (int)(ETH_HDR_LEN + ip_len);
 #endif
 }
@@ -233,6 +321,7 @@ int af_xdp_send_ipv4(af_xdp_t* x, const uint8_t* ip, size_t ip_len) {
 void af_xdp_close(af_xdp_t* x) {
 #if defined(__linux__)
     if (!x) return;
+    if (x->xdp_map_fd >= 0) xdp_unload(x->ifindex, x->xdp_map_fd);
     if (x->rx_map && x->rx_map != MAP_FAILED) munmap(x->rx_map, x->rx_map_len);
     if (x->tx_map && x->tx_map != MAP_FAILED) munmap(x->tx_map, x->tx_map_len);
     if (x->fr_map && x->fr_map != MAP_FAILED) munmap(x->fr_map, x->fr_map_len);
@@ -241,6 +330,7 @@ void af_xdp_close(af_xdp_t* x) {
     if (x->fd >= 0) close(x->fd);
     memset(x, 0, sizeof(*x));
     x->fd = -1;
+    x->xdp_map_fd = -1;
 #else
     (void)x;
 #endif

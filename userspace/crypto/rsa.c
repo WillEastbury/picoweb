@@ -104,11 +104,13 @@ static int limbs_cmp(const uint64_t* a, const uint64_t* b, size_t n) {
 static uint64_t limbs_sub_inplace(uint64_t* a, const uint64_t* b, size_t n) {
     uint64_t borrow = 0;
     for (size_t i = 0; i < n; i++) {
-        uint64_t bi = b[i] + borrow;
-        uint64_t nb = (bi < b[i]) ? 1u : 0u;
-        borrow = (a[i] < bi) ? 1u : 0u;
-        a[i] = a[i] - bi;
-        if (nb) borrow = 1u;
+        __uint128_t sub = (__uint128_t)b[i] + (__uint128_t)borrow;
+        uint64_t bi = (uint64_t)sub;
+        uint64_t carry_from_add = (uint64_t)(sub >> 64);
+        uint64_t ai = a[i];
+        a[i] = ai - bi;
+        uint64_t borrow_from_sub = (ai < bi) ? 1u : 0u;
+        borrow = (carry_from_add | borrow_from_sub);
     }
     return borrow;
 }
@@ -177,8 +179,12 @@ static void mont_mul(uint64_t* out,
         }
     }
 
+    uint64_t top = t[2 * k];
     memcpy(out, t + k, k * sizeof(uint64_t));
-    if (limbs_cmp(out, n, k) >= 0) (void)limbs_sub_inplace(out, n, k);
+    /* CIOS Montgomery reduction yields a (k+1)-limb candidate. When the
+     * extra top limb is non-zero, one subtraction is still required even if
+     * the low k limbs compare < n. */
+    if (top || limbs_cmp(out, n, k) >= 0) (void)limbs_sub_inplace(out, n, k);
     secure_zero(t, sizeof(t));
 }
 
@@ -292,4 +298,69 @@ int pw_rsa_rsasp1(const pw_rsa_private_key_t* key,
     secure_zero(acc, sizeof(acc));
     secure_zero(tmp, sizeof(tmp));
     return 0;
+}
+
+int pw_rsa_self_check(const pw_rsa_private_key_t* key,
+                      const uint8_t* em, size_t em_len,
+                      const uint8_t* sig, size_t sig_len) {
+    /* Verify sig^65537 mod n == em using Montgomery. */
+    if (!key || !em || !sig) return -1;
+    size_t k = key->n_limbs;
+    if (k == 0 || em_len != key->n_len || sig_len != key->n_len) return -1;
+
+    uint64_t s[PW_RSA_MAX_LIMBS], one[PW_RSA_MAX_LIMBS];
+    uint64_t base_m[PW_RSA_MAX_LIMBS], acc[PW_RSA_MAX_LIMBS], tmp[PW_RSA_MAX_LIMBS];
+    memset(s, 0, sizeof(s));
+    memset(one, 0, sizeof(one));
+    memset(base_m, 0, sizeof(base_m));
+    memset(acc, 0, sizeof(acc));
+    memset(tmp, 0, sizeof(tmp));
+
+    be_to_limbs(sig, sig_len, s, k);
+    if (limbs_cmp(s, key->n, k) >= 0) return -2;
+    one[0] = 1;
+
+    /* acc = 1*R mod n, base_m = sig*R mod n */
+    mont_mul(base_m, s, key->r2, key->n, key->n0_inv, k);
+    mont_mul(acc, one, key->r2, key->n, key->n0_inv, k);
+
+    /* e = 65537 = 2^16 + 1 (binary: 1_0000_0000_0000_0001)
+     * bit 16 (MSB): multiply by base */
+    mont_mul(tmp, acc, base_m, key->n, key->n0_inv, k);
+    memcpy(acc, tmp, k * sizeof(uint64_t));
+    /* bits 15..0: square 16 times */
+    for (int i = 0; i < 16; i++) {
+        mont_mul(tmp, acc, acc, key->n, key->n0_inv, k);
+        memcpy(acc, tmp, k * sizeof(uint64_t));
+    }
+    /* bit 0 is 1: multiply by base */
+    mont_mul(tmp, acc, base_m, key->n, key->n0_inv, k);
+    memcpy(acc, tmp, k * sizeof(uint64_t));
+
+    /* out of Montgomery domain */
+    mont_mul(tmp, acc, one, key->n, key->n0_inv, k);
+
+    /* Convert back to big-endian and compare */
+    uint8_t check[PW_RSA_MAX_BITS / 8];
+    limbs_to_be(tmp, key->n_len, check);
+    if (memcmp(check, em, em_len) != 0) {
+        secure_zero(s, sizeof(s));
+        secure_zero(one, sizeof(one));
+        secure_zero(base_m, sizeof(base_m));
+        secure_zero(acc, sizeof(acc));
+        secure_zero(tmp, sizeof(tmp));
+        secure_zero(check, sizeof(check));
+        return -3;
+    }
+    secure_zero(s, sizeof(s));
+    secure_zero(one, sizeof(one));
+    secure_zero(base_m, sizeof(base_m));
+    secure_zero(acc, sizeof(acc));
+    secure_zero(tmp, sizeof(tmp));
+    secure_zero(check, sizeof(check));
+    return 0;
+}
+
+void limbs_to_be_diag(const uint64_t* limbs, size_t n_len, uint8_t* out) {
+    limbs_to_be(limbs, n_len, out);
 }

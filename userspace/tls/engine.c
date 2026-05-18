@@ -178,7 +178,7 @@ int pw_tls_engine_emit_session_ticket(pw_tls_engine_t* eng,
     if (nst_len <= 0) { secure_zero(out_psk, 32); return -1; }
 
     size_t need = TLS13_RECORD_HEADER_LEN + (size_t)nst_len + 1 + TLS13_AEAD_TAG_LEN;
-    if (need > PW_TLS_BUF_CAP - eng->tx_len) {
+    if (need > PW_TLS_TX_BUF_CAP - eng->tx_len) {
         secure_zero(out_psk, 32);
         secure_zero(nst,     sizeof(nst));
         return -1;
@@ -189,7 +189,7 @@ int pw_tls_engine_emit_session_ticket(pw_tls_engine_t* eng,
                                      TLS_CT_APPLICATION_DATA,
                                      nst, (size_t)nst_len,
                                      eng->tx_buf + eng->tx_len,
-                                     PW_TLS_BUF_CAP - eng->tx_len);
+                                     PW_TLS_TX_BUF_CAP - eng->tx_len);
     secure_zero(nst, sizeof(nst));
     if (wrote == 0) { secure_zero(out_psk, 32); return -1; }
     eng->tx_len += wrote;
@@ -312,21 +312,69 @@ int pw_tls_app_seal_iov(pw_tls_engine_t* eng,
     if (eng->state != PW_TLS_ST_APP) return -1;
 
     size_t total = 0;
-    for (unsigned i = 0; i < n; i++) total += iov[i].len;
-    if (total > TLS13_MAX_PLAINTEXT) return -1;
+    for (unsigned i = 0; i < n; i++) {
+        if (SIZE_MAX - total < iov[i].len) return -1;
+        total += iov[i].len;
+    }
 
-    size_t need = TLS13_RECORD_HEADER_LEN + total + 1 + TLS13_AEAD_TAG_LEN;
-    if (need > PW_TLS_BUF_CAP - eng->tx_len) return -1;
+    const size_t rec_overhead = TLS13_RECORD_HEADER_LEN + 1u + TLS13_AEAD_TAG_LEN;
+    size_t records = (total == 0) ? 1u
+                                  : ((total + TLS13_MAX_PLAINTEXT - 1u) / TLS13_MAX_PLAINTEXT);
+    if (records != 0 && (SIZE_MAX - total) / rec_overhead < records) return -1;
+    size_t need = total + records * rec_overhead;
+    if (need > PW_TLS_TX_BUF_CAP - eng->tx_len) return -1;
 
-    size_t wrote = tls13_seal_record_iov(&eng->write,
-                                         TLS_CT_APPLICATION_DATA,
-                                         TLS_CT_APPLICATION_DATA,
-                                         iov, n, total,
-                                         eng->tx_buf + eng->tx_len,
-                                         PW_TLS_BUF_CAP - eng->tx_len);
-    if (wrote == 0) return -1;
-    eng->tx_len += wrote;
-    eng->records_out++;
+    if (total == 0) {
+        size_t wrote = tls13_seal_record_iov(&eng->write,
+                                             TLS_CT_APPLICATION_DATA,
+                                             TLS_CT_APPLICATION_DATA,
+                                             iov, 0, 0,
+                                             eng->tx_buf + eng->tx_len,
+                                             PW_TLS_TX_BUF_CAP - eng->tx_len);
+        if (wrote == 0) return -1;
+        eng->tx_len += wrote;
+        eng->records_out++;
+        return 0;
+    }
+
+    size_t seg_i = 0;
+    size_t seg_off = 0;
+    size_t remaining = total;
+    while (remaining > 0) {
+        size_t chunk = remaining > TLS13_MAX_PLAINTEXT ? TLS13_MAX_PLAINTEXT : remaining;
+        pw_iov_t chunk_iov[PW_IOV_MAX_FRAGS];
+        unsigned chunk_n = 0;
+        size_t chunk_left = chunk;
+
+        while (chunk_left > 0 && seg_i < n) {
+            size_t avail = iov[seg_i].len - seg_off;
+            size_t take = (avail < chunk_left) ? avail : chunk_left;
+            if (take > 0) {
+                if (chunk_n >= PW_IOV_MAX_FRAGS) return -1;
+                chunk_iov[chunk_n].base = iov[seg_i].base + seg_off;
+                chunk_iov[chunk_n].len = take;
+                chunk_n++;
+                chunk_left -= take;
+                seg_off += take;
+            }
+            if (seg_off == iov[seg_i].len) {
+                seg_i++;
+                seg_off = 0;
+            }
+        }
+        if (chunk_left != 0) return -1;
+
+        size_t wrote = tls13_seal_record_iov(&eng->write,
+                                             TLS_CT_APPLICATION_DATA,
+                                             TLS_CT_APPLICATION_DATA,
+                                             chunk_iov, chunk_n, chunk,
+                                             eng->tx_buf + eng->tx_len,
+                                             PW_TLS_TX_BUF_CAP - eng->tx_len);
+        if (wrote == 0) return -1;
+        eng->tx_len += wrote;
+        eng->records_out++;
+        remaining -= chunk;
+    }
     return 0;
 }
 
@@ -409,14 +457,14 @@ static int try_seal_one(pw_tls_engine_t* eng) {
     if (pt_len > TLS13_MAX_PLAINTEXT) pt_len = TLS13_MAX_PLAINTEXT;
 
     size_t need = TLS13_RECORD_HEADER_LEN + pt_len + 1 + TLS13_AEAD_TAG_LEN;
-    if (need > PW_TLS_BUF_CAP - eng->tx_len) return 0;
+    if (need > PW_TLS_TX_BUF_CAP - eng->tx_len) return 0;
 
     size_t wrote = tls13_seal_record(&eng->write,
                                      TLS_CT_APPLICATION_DATA,
                                      TLS_CT_APPLICATION_DATA,
                                      eng->app_out_buf, pt_len,
                                      eng->tx_buf + eng->tx_len,
-                                     PW_TLS_BUF_CAP - eng->tx_len);
+                                     PW_TLS_TX_BUF_CAP - eng->tx_len);
     if (wrote == 0) return -1;
 
     /* tls13_seal_record already advances eng->write.seq on success
@@ -665,7 +713,7 @@ static int try_drive_handshake_server(pw_tls_engine_t* eng) {
     /* Bounds-check TX before any state mutation. SH wire size is
      * 5 (record header) + sh_len (handshake msg). */
     size_t need = TLS13_RECORD_HEADER_LEN + (size_t)sh_len;
-    if (need > PW_TLS_BUF_CAP - eng->tx_len) {
+    if (need > PW_TLS_TX_BUF_CAP - eng->tx_len) {
         secure_zero(shared, sizeof(shared));
         secure_zero(eng->eph_priv, sizeof(eng->eph_priv));
         return -1;
@@ -798,7 +846,7 @@ static int try_drive_handshake_server(pw_tls_engine_t* eng) {
 static int seal_one_handshake_msg(pw_tls_engine_t* eng,
                                   const uint8_t* msg, size_t msg_len) {
     size_t need = TLS13_RECORD_HEADER_LEN + msg_len + 1 + TLS13_AEAD_TAG_LEN;
-    if (need > PW_TLS_BUF_CAP - eng->tx_len) return -1;
+    if (need > PW_TLS_TX_BUF_CAP - eng->tx_len) return -1;
 
     tls13_transcript_update(&eng->transcript, msg, msg_len);
 
@@ -807,7 +855,7 @@ static int seal_one_handshake_msg(pw_tls_engine_t* eng,
                                      TLS_CT_APPLICATION_DATA,
                                      msg, msg_len,
                                      eng->tx_buf + eng->tx_len,
-                                     PW_TLS_BUF_CAP - eng->tx_len);
+                                     PW_TLS_TX_BUF_CAP - eng->tx_len);
     if (wrote == 0) return -1;
     eng->tx_len += wrote;
     eng->records_out++;
@@ -1138,26 +1186,24 @@ int pw_tls_step(pw_tls_engine_t* eng) {
 
             rc = try_recv_client_finished(eng);
             if (rc < 0) goto fail;
-            if (rc > 0) continue;
+            if (rc > 0) {
+                /* cFin success promotes state to APP. Break out of the
+                 * handshake spin so the APP drain below can consume any
+                 * application_data record the client coalesced into the
+                 * same TCP segment as the Finished — otherwise the
+                 * first GET would stall for one RTT until the next
+                 * inbound packet woke us. */
+                if (eng->state == PW_TLS_ST_APP) break;
+                continue;
+            }
 
             /* No phase made progress this round — wait for more I/O. */
             break;
         }
-        return (int)pw_tls_want(eng);
-
-      fail:
-        /* On any fatal handshake failure: wipe ALL key material AND
-         * drop any partially-emitted bytes from TX. The engine MUST
-         * NOT expose half-emitted handshake records to a caller that
-         * reads pw_tls_tx_buf after we go FAILED. (Rubber-duck blocker
-         * #1 from the Commit B critique.) */
-        wipe_all_key_material(eng);
-        eng->tx_len     = 0;
-        eng->app_in_len = 0;
-        eng->state      = PW_TLS_ST_FAILED;
-        if (eng->last_err == PW_TLS_ERR_NONE)
-            eng->last_err = PW_TLS_ERR_PROTOCOL;
-        return -1;
+        /* Still handshaking — nothing more to do this call. */
+        if (eng->state != PW_TLS_ST_APP) return (int)pw_tls_want(eng);
+        /* Fall through into APP drain so a cFin+GET coalesced segment
+         * gets the GET processed in this same step() call. */
     }
 
     /* Drain RX -> APP_IN, AT MOST ONE record per step in APP state.
@@ -1190,4 +1236,17 @@ int pw_tls_step(pw_tls_engine_t* eng) {
     } while (rc == 1);
 
     return (int)pw_tls_want(eng);
+
+  fail:
+    /* On any fatal handshake failure: wipe ALL key material AND
+     * drop any partially-emitted bytes from TX. The engine MUST
+     * NOT expose half-emitted handshake records to a caller that
+     * reads pw_tls_tx_buf after we go FAILED. */
+    wipe_all_key_material(eng);
+    eng->tx_len     = 0;
+    eng->app_in_len = 0;
+    eng->state      = PW_TLS_ST_FAILED;
+    if (eng->last_err == PW_TLS_ERR_NONE)
+        eng->last_err = PW_TLS_ERR_PROTOCOL;
+    return -1;
 }

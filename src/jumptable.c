@@ -22,6 +22,20 @@
 #define DEFAULT_HOST "_default"
 #define DEFAULT_HOST_LEN 8
 
+/* Read PICOWEB_NO_GZIP once. When set (=1/true/yes), gzip variants are
+ * not built; only Brotli + identity remain. Every browser shipped
+ * since ~2017 supports `br`, so on a modern audience this is a free
+ * 10-15% of arena RAM. */
+static bool no_gzip_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char* v = getenv("PICOWEB_NO_GZIP");
+        cached = (v && (v[0] == '1' || v[0] == 't' || v[0] == 'T'
+                         || v[0] == 'y' || v[0] == 'Y')) ? 1 : 0;
+    }
+    return cached != 0;
+}
+
 /* ============================================================== */
 /* Flat hash table (single tier).                                 */
 /* The key is logically (host || '|' || path). Hash is computed   */
@@ -984,8 +998,10 @@ bool jumptable_build(jumptable_t* jt, const char* wwwroot) {
                  * compression doesn't shrink the payload. Computed
                  * once at startup; never mutated on the hot path. */
                 if (compressible) {
-                    attach_compressed_variant(&jt->arena, r,
-                                              "HTTP/1.1 200 OK", mime);
+                    if (!no_gzip_enabled()) {
+                        attach_compressed_variant(&jt->arena, r,
+                                                  "HTTP/1.1 200 OK", mime);
+                    }
                     attach_brotli_variant(&jt->arena, r,
                                           "HTTP/1.1 200 OK", mime, cache_hdr);
                 }
@@ -1169,12 +1185,23 @@ bool jumptable_build(jumptable_t* jt, const char* wwwroot) {
 
     build_free(hosts);
 
+    /* Release the unused tail of the arena back to the kernel BEFORE
+     * we PROT_READ-freeze the rest. Typical sites save 25-30% of the
+     * worst-case-bounded arena this way. */
+    size_t cap_before_shrink = jt->arena.cap;
+    if (!arena_shrink_to_fit(&jt->arena)) {
+        metal_log("warn: arena_shrink_to_fit failed (continuing)");
+    }
+
     if (!arena_freeze(&jt->arena)) {
         metal_log("warn: arena_freeze failed (continuing without PROT_READ)");
     }
 
-    metal_log("picoweb: arena used %zu / %zu B; %zu / %zu slots filled",
-              arena_used(&jt->arena), jt->arena.cap, jt->size, jt->cap);
+    metal_log("picoweb: arena used %zu / %zu B (released %zu); %zu / %zu slots filled%s",
+              arena_used(&jt->arena), jt->arena.cap,
+              cap_before_shrink - jt->arena.cap,
+              jt->size, jt->cap,
+              no_gzip_enabled() ? " [no-gzip]" : "");
     return true;
 }
 

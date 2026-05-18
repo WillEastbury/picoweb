@@ -1,6 +1,12 @@
 #include "ecdsa.h"
 
+#include <errno.h>
+#include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
+#include <stdatomic.h>
+#include <sys/random.h>
+#include <sched.h>
 
 #include "hmac.h"
 #include "p256.h"
@@ -180,6 +186,279 @@ static int rfc6979_generate_k(uint8_t K[32], uint8_t V[32], uint8_t out_k[32]) {
     return -1;
 }
 
+/* ============================================================== *
+ *  ECDSA-P256 precompute pool + producer thread
+ * ============================================================== *
+ * See ecdsa.h for the rationale. All state is process-singleton.
+ * The producer thread is the only writer; sign() is the only reader.
+ * A single pthread_mutex protects the ring; condvars handle the
+ * not-empty / not-full edges. Counters are atomic so observers
+ * (stats endpoints) can read them without taking the ring mutex.
+ */
+
+typedef struct {
+    uint8_t r[32];
+    uint8_t kinv[32];
+} ecdsa_precomp_slot_t;
+
+typedef struct {
+    ecdsa_precomp_slot_t* slots;
+    uint32_t cap;
+    uint32_t head;            /* consumer pops here */
+    uint32_t tail;            /* producer pushes here */
+    uint32_t depth;
+    pthread_mutex_t mtx;
+    pthread_cond_t  not_full;
+    pthread_cond_t  not_empty;
+    pthread_t       producer_tid;
+    int             producer_started;
+    int             shutdown;
+
+    /* Counters (atomic for lock-free reads from stats path) */
+    _Atomic uint32_t high_water;
+    _Atomic uint64_t hits;
+    _Atomic uint64_t misses;
+    _Atomic uint64_t produced;
+    _Atomic uint64_t producer_errors;
+    _Atomic uint64_t s_zero_fallbacks;
+} ecdsa_precomp_pool_t;
+
+static ecdsa_precomp_pool_t g_precomp;
+static pthread_once_t g_precomp_once = PTHREAD_ONCE_INIT;
+
+static void ecdsa_precomp_global_static_init(void) {
+    /* PTHREAD_*_INITIALIZER would be nicer but the struct is BSS so
+     * we initialise the mutex/conds explicitly the first time someone
+     * touches the pool. Done once-and-only-once via pthread_once. */
+    pthread_mutex_init(&g_precomp.mtx, NULL);
+    pthread_cond_init(&g_precomp.not_full, NULL);
+    pthread_cond_init(&g_precomp.not_empty, NULL);
+}
+
+/* Fill exactly `n` bytes from getrandom(), retrying short reads and
+ * EINTR. Returns 0 on success, -1 on any unrecoverable error. */
+static int ecdsa_precomp_getrandom_full(uint8_t* buf, size_t n) {
+    size_t got = 0;
+    while (got < n) {
+        ssize_t r = getrandom(buf + got, n - got, 0);
+        if (r > 0) { got += (size_t)r; continue; }
+        if (r < 0 && errno == EINTR) continue;
+        return -1;
+    }
+    return 0;
+}
+
+/* Generate one (r, kinv) tuple using rejection sampling for k.
+ * Never reduces random bytes modulo n (which would introduce bias).
+ * Returns 0 on success, -1 on unrecoverable failure. */
+static int ecdsa_precomp_generate_tuple(uint8_t out_r[32], uint8_t out_kinv[32]) {
+    for (unsigned tries = 0; tries < 64; tries++) {
+        uint8_t kbytes[32];
+        if (ecdsa_precomp_getrandom_full(kbytes, sizeof(kbytes)) != 0) {
+            secure_zero(kbytes, sizeof(kbytes));
+            return -1;
+        }
+        u256 k;
+        if (scalar_from_be_checked(&k, kbytes) != 0) {
+            /* k == 0 or k >= n. Resample. */
+            secure_zero(kbytes, sizeof(kbytes));
+            continue;
+        }
+        uint8_t xy[64];
+        if (p256_scalar_mul_base(kbytes, xy) != 0) {
+            secure_zero(kbytes, sizeof(kbytes));
+            secure_zero(&k, sizeof(k));
+            continue;
+        }
+        u256 r;
+        u256_from_be(&r, xy);
+        scalar_reduce_once(&r);
+        if (u256_is_zero(&r)) {
+            secure_zero(kbytes, sizeof(kbytes));
+            secure_zero(&k, sizeof(k));
+            secure_zero(xy, sizeof(xy));
+            continue;
+        }
+        u256 kinv;
+        scalar_inv(&kinv, &k);
+        u256_to_be(&r, out_r);
+        u256_to_be(&kinv, out_kinv);
+        secure_zero(kbytes, sizeof(kbytes));
+        secure_zero(&k, sizeof(k));
+        secure_zero(&kinv, sizeof(kinv));
+        secure_zero(xy, sizeof(xy));
+        return 0;
+    }
+    return -1;
+}
+
+/* Non-blocking try-pop. Returns 0 if a tuple was popped, -1 on
+ * empty / not-initialised / contended. NEVER blocks the caller. */
+static int ecdsa_precomp_try_pop(uint8_t out_r[32], uint8_t out_kinv[32]) {
+    if (!g_precomp.slots) return -1;
+    if (pthread_mutex_trylock(&g_precomp.mtx) != 0) return -1;
+    if (g_precomp.depth == 0) {
+        pthread_mutex_unlock(&g_precomp.mtx);
+        return -1;
+    }
+    ecdsa_precomp_slot_t* sl = &g_precomp.slots[g_precomp.head];
+    memcpy(out_r, sl->r, 32);
+    memcpy(out_kinv, sl->kinv, 32);
+    secure_zero(sl, sizeof(*sl));
+    g_precomp.head = (g_precomp.head + 1) % g_precomp.cap;
+    g_precomp.depth--;
+    pthread_cond_signal(&g_precomp.not_full);
+    pthread_mutex_unlock(&g_precomp.mtx);
+    return 0;
+}
+
+static void* ecdsa_precomp_producer_main(void* arg) {
+    (void)arg;
+    /* Best-effort pin to CPU 0 so we don't fight the worker
+     * (which is pinned to CPU 1 by main.c). Failure is non-fatal —
+     * the producer still runs, just possibly contended. */
+    cpu_set_t cs;
+    CPU_ZERO(&cs);
+    CPU_SET(0, &cs);
+    (void)pthread_setaffinity_np(pthread_self(), sizeof(cs), &cs);
+
+    for (;;) {
+        /* Wait until there is space in the ring (or shutdown). */
+        pthread_mutex_lock(&g_precomp.mtx);
+        while (!g_precomp.shutdown && g_precomp.depth >= g_precomp.cap) {
+            pthread_cond_wait(&g_precomp.not_full, &g_precomp.mtx);
+        }
+        if (g_precomp.shutdown) {
+            pthread_mutex_unlock(&g_precomp.mtx);
+            return NULL;
+        }
+        pthread_mutex_unlock(&g_precomp.mtx);
+
+        /* Compute the expensive part OUTSIDE the lock so signers can
+         * pop while we're working. */
+        uint8_t r_be[32], kinv_be[32];
+        if (ecdsa_precomp_generate_tuple(r_be, kinv_be) != 0) {
+            atomic_fetch_add(&g_precomp.producer_errors, 1);
+            /* Avoid a tight failure loop. */
+            struct timespec ts = { .tv_sec = 0, .tv_nsec = 10 * 1000 * 1000 };
+            nanosleep(&ts, NULL);
+            continue;
+        }
+
+        pthread_mutex_lock(&g_precomp.mtx);
+        if (g_precomp.shutdown) {
+            secure_zero(r_be, sizeof(r_be));
+            secure_zero(kinv_be, sizeof(kinv_be));
+            pthread_mutex_unlock(&g_precomp.mtx);
+            return NULL;
+        }
+        /* Re-check space (signal could have raced — but only signers
+         * pop, so depth can only have decreased while we were
+         * generating; still safe.) */
+        if (g_precomp.depth < g_precomp.cap) {
+            ecdsa_precomp_slot_t* sl = &g_precomp.slots[g_precomp.tail];
+            memcpy(sl->r, r_be, 32);
+            memcpy(sl->kinv, kinv_be, 32);
+            g_precomp.tail = (g_precomp.tail + 1) % g_precomp.cap;
+            g_precomp.depth++;
+            if (g_precomp.depth > atomic_load(&g_precomp.high_water)) {
+                atomic_store(&g_precomp.high_water, g_precomp.depth);
+            }
+            atomic_fetch_add(&g_precomp.produced, 1);
+            pthread_cond_signal(&g_precomp.not_empty);
+        }
+        secure_zero(r_be, sizeof(r_be));
+        secure_zero(kinv_be, sizeof(kinv_be));
+        pthread_mutex_unlock(&g_precomp.mtx);
+    }
+}
+
+int ecdsa_p256_precomp_init(uint32_t pool_cap) {
+    if (pool_cap == 0) return -1;
+    pthread_once(&g_precomp_once, ecdsa_precomp_global_static_init);
+    pthread_mutex_lock(&g_precomp.mtx);
+    if (g_precomp.slots) {
+        /* Already initialised — idempotent. */
+        pthread_mutex_unlock(&g_precomp.mtx);
+        return 0;
+    }
+    g_precomp.slots = (ecdsa_precomp_slot_t*)calloc(pool_cap, sizeof(ecdsa_precomp_slot_t));
+    if (!g_precomp.slots) {
+        pthread_mutex_unlock(&g_precomp.mtx);
+        return -1;
+    }
+    g_precomp.cap = pool_cap;
+    g_precomp.head = 0;
+    g_precomp.tail = 0;
+    g_precomp.depth = 0;
+    g_precomp.shutdown = 0;
+    pthread_mutex_unlock(&g_precomp.mtx);
+
+    /* Self-test: generate one tuple synchronously to confirm the math
+     * path is sound before we trust the producer thread with TLS
+     * traffic. A failure here means we should NOT enable the fast
+     * path (leave slots non-NULL but never push anything; sign()
+     * still works via fallback). */
+    uint8_t test_r[32], test_kinv[32];
+    if (ecdsa_precomp_generate_tuple(test_r, test_kinv) != 0) {
+        secure_zero(test_r, sizeof(test_r));
+        secure_zero(test_kinv, sizeof(test_kinv));
+        /* Producer thread not started; pool stays empty forever;
+         * sign() will always miss and use inline path. Safe. */
+        return -1;
+    }
+    /* Push the self-test tuple as the first available. */
+    pthread_mutex_lock(&g_precomp.mtx);
+    memcpy(g_precomp.slots[0].r, test_r, 32);
+    memcpy(g_precomp.slots[0].kinv, test_kinv, 32);
+    g_precomp.tail = 1;
+    g_precomp.depth = 1;
+    atomic_store(&g_precomp.high_water, 1);
+    atomic_fetch_add(&g_precomp.produced, 1);
+    pthread_mutex_unlock(&g_precomp.mtx);
+    secure_zero(test_r, sizeof(test_r));
+    secure_zero(test_kinv, sizeof(test_kinv));
+
+    if (pthread_create(&g_precomp.producer_tid, NULL,
+                       ecdsa_precomp_producer_main, NULL) != 0) {
+        /* Pool stays allocated with 1 tuple; sign() will use it once
+         * then miss thereafter. Still safe. */
+        return -1;
+    }
+    g_precomp.producer_started = 1;
+    return 0;
+}
+
+void ecdsa_p256_precomp_shutdown(void) {
+    if (!g_precomp.slots || !g_precomp.producer_started) return;
+    pthread_mutex_lock(&g_precomp.mtx);
+    g_precomp.shutdown = 1;
+    pthread_cond_broadcast(&g_precomp.not_full);
+    pthread_cond_broadcast(&g_precomp.not_empty);
+    pthread_mutex_unlock(&g_precomp.mtx);
+    pthread_join(g_precomp.producer_tid, NULL);
+    g_precomp.producer_started = 0;
+    /* Pool ring itself is intentionally NOT freed — sign() may still
+     * be called and must remain safe. It just stops being refilled. */
+}
+
+void ecdsa_p256_precomp_get_stats(ecdsa_p256_precomp_stats_t* out) {
+    if (!out) return;
+    memset(out, 0, sizeof(*out));
+    if (!g_precomp.slots) return;
+    /* depth/cap read under lock for consistency; counters are atomic. */
+    pthread_mutex_lock(&g_precomp.mtx);
+    out->pool_cap = g_precomp.cap;
+    out->pool_depth = g_precomp.depth;
+    pthread_mutex_unlock(&g_precomp.mtx);
+    out->pool_high_water = atomic_load(&g_precomp.high_water);
+    out->hits = atomic_load(&g_precomp.hits);
+    out->misses = atomic_load(&g_precomp.misses);
+    out->produced = atomic_load(&g_precomp.produced);
+    out->producer_errors = atomic_load(&g_precomp.producer_errors);
+    out->s_zero_fallbacks = atomic_load(&g_precomp.s_zero_fallbacks);
+}
+
 int ecdsa_p256_sha256_sign(const uint8_t priv[32],
                            const uint8_t* msg, size_t msg_n,
                            uint8_t out_r[32], uint8_t out_s[32]) {
@@ -190,6 +469,45 @@ int ecdsa_p256_sha256_sign(const uint8_t priv[32],
     uint8_t h1[32], h1oct[32];
     sha256(msg, msg_n, h1);
     bits2octets(h1, h1oct);
+
+    /* Fast path: consume one precomputed (r, kinv) tuple if available.
+     * Falls through to inline RFC 6979 path on miss, contention, or
+     * the (vanishingly rare) s==0 case. */
+    {
+        uint8_t r_be[32], kinv_be[32];
+        if (ecdsa_precomp_try_pop(r_be, kinv_be) == 0) {
+            u256 r, kinv, z, rd, sum, s;
+            int ok = (scalar_from_be_checked(&r, r_be) == 0) &&
+                     (scalar_from_be_checked(&kinv, kinv_be) == 0);
+            if (ok) {
+                u256_from_be(&z, h1);
+                scalar_reduce_once(&z);
+                mod_mul(&rd, &r, &d);
+                mod_add(&sum, &z, &rd);
+                mod_mul(&s, &kinv, &sum);
+                if (!u256_is_zero(&s)) {
+                    u256_to_be(&r, out_r);
+                    u256_to_be(&s, out_s);
+                    secure_zero(&d, sizeof(d));
+                    secure_zero(&kinv, sizeof(kinv));
+                    secure_zero(&rd, sizeof(rd));
+                    secure_zero(&sum, sizeof(sum));
+                    secure_zero(&s, sizeof(s));
+                    secure_zero(r_be, sizeof(r_be));
+                    secure_zero(kinv_be, sizeof(kinv_be));
+                    atomic_fetch_add(&g_precomp.hits, 1);
+                    return 0;
+                }
+                atomic_fetch_add(&g_precomp.s_zero_fallbacks, 1);
+            }
+            secure_zero(&kinv, sizeof(kinv));
+            secure_zero(r_be, sizeof(r_be));
+            secure_zero(kinv_be, sizeof(kinv_be));
+            /* fall through to inline path */
+        } else {
+            atomic_fetch_add(&g_precomp.misses, 1);
+        }
+    }
 
     uint8_t K[32], V[32], kbytes[32];
     memset(K, 0x00, sizeof(K));

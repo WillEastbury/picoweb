@@ -16,8 +16,8 @@
 #include "../crypto/sha256.h"
 #include "../crypto/sha512.h"
 #include "../crypto/ed25519.h"
-#include "../crypto/ecdsa.h"
 #include "../crypto/p256.h"
+#include "../crypto/ecdsa.h"
 #include "../crypto/hmac.h"
 #include "../crypto/hkdf.h"
 #include "../crypto/chacha20.h"
@@ -2797,11 +2797,7 @@ static void test_tcp_dispatch(void) {
 
     emit_log_t log = {0};
 
-    /* (1) SYN to UNKNOWN port -> silently dropped, no service touched.
-     * Pre-perf: we used to emit a RST per RFC 793; in cluster
-     * environments where the worker sees unrelated traffic on a
-     * shared veth that's a syscall-per-packet tail-latency source
-     * and (worse) RSTs legitimate third parties. Drop instead. */
+    /* (1) SYN to UNKNOWN port -> RST, no service touched. */
     {
         tcp_seg_t syn = {0};
         syn.src_ip=0x0a000001u; syn.dst_ip=0x0a000002u;
@@ -2809,8 +2805,8 @@ static void test_tcp_dispatch(void) {
         syn.seq=100; syn.flags=TCPF_SYN; syn.window=65535;
         log.n = 0;
         tcp_input(&stack, &syn, NULL, NULL, log_emit, &log);
-        if (log.n == 0)
-             { printf("  PASS: unknown port -> silent drop\n"); g_pass++; }
+        if (log.n == 1 && (log.segs[0].flags & TCPF_RST))
+             { printf("  PASS: unknown port -> RST\n"); g_pass++; }
         else { printf("  FAIL: unknown port n=%d flags=0x%02x\n",
                       log.n, log.n?log.segs[0].flags:0); g_fail++; }
         if (svc443.opened == 0 && svc80.opened == 0)
@@ -5550,8 +5546,8 @@ int main(void) {
     test_poly1305();
     test_aead_chacha20_poly1305();
     test_x25519();
-    test_ed25519();
     test_ecdsa_p256();
+    test_ed25519();
     test_tls13_keysched();
     test_tls13_record();
     test_ip_tcp();

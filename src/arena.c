@@ -1,3 +1,7 @@
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE   /* for mremap */
+#endif
+
 #include "arena.h"
 #include "numa.h"
 #include "util.h"
@@ -72,6 +76,25 @@ const char* arena_strdup_n(arena_t* a, const char* s, size_t len, bool include_n
     memcpy(dst, s, len);
     if (include_nul) dst[len] = '\0';
     return dst;
+}
+
+bool arena_shrink_to_fit(arena_t* a) {
+    if (a->frozen) return true;
+    size_t ps = page_size_cached();
+    size_t new_cap = metal_align_up(a->off, ps);
+    if (new_cap == 0) new_cap = ps;
+    if (new_cap >= a->cap) return true;       /* nothing to release */
+    /* Plain mremap (no MREMAP_MAYMOVE): a shrink is always in-place,
+     * so base pointer stays valid and existing pointers into the
+     * arena (chrome_t, slot keys, body bytes, ...) remain live. */
+    void* p = mremap(a->base, a->cap, new_cap, 0);
+    if (p == MAP_FAILED) {
+        metal_log("arena_shrink_to_fit: mremap %zu -> %zu failed: %s",
+                  a->cap, new_cap, strerror(errno));
+        return false;
+    }
+    a->cap = new_cap;
+    return true;
 }
 
 bool arena_freeze(arena_t* a) {
