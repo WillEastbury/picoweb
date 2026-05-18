@@ -26,20 +26,30 @@ static void make_nonce(const uint8_t iv[QUIC_INITIAL_IV_LEN],
 
 /* Apply header protection mask (RFC 9001 §5.4.1). For Initial we
  * always mask the low 4 bits of byte0 (long header). */
-static void hp_apply(const uint8_t hp_key[QUIC_INITIAL_HP_LEN],
-                     const uint8_t sample[QUIC_HP_SAMPLE_LEN],
-                     uint8_t* byte0,
-                     uint8_t* pn_bytes,
-                     unsigned pn_len) {
+static void hp_apply_mask(const uint8_t hp_key[QUIC_INITIAL_HP_LEN],
+                          const uint8_t sample[QUIC_HP_SAMPLE_LEN],
+                          uint8_t* byte0,
+                          uint8_t* pn_bytes,
+                          unsigned pn_len,
+                          uint8_t byte0_mask) {
     aes128_ctx_t aes;
     aes128_init(&aes, hp_key);
     uint8_t mask[16];
     aes128_encrypt_block(&aes, sample, mask);
 
-    *byte0 ^= mask[0] & 0x0f;
+    *byte0 ^= mask[0] & byte0_mask;
     for (unsigned i = 0; i < pn_len; i++) {
         pn_bytes[i] ^= mask[1 + i];
     }
+}
+
+static void hp_apply(const uint8_t hp_key[QUIC_INITIAL_HP_LEN],
+                     const uint8_t sample[QUIC_HP_SAMPLE_LEN],
+                     uint8_t* byte0,
+                     uint8_t* pn_bytes,
+                     unsigned pn_len) {
+    /* Long-header form: low 4 bits of byte0 protected. */
+    hp_apply_mask(hp_key, sample, byte0, pn_bytes, pn_len, 0x0f);
 }
 
 size_t quic_initial_build(uint8_t* out, size_t out_cap,
@@ -447,8 +457,8 @@ size_t quic_short_build(uint8_t* out, size_t out_cap,
     off += QUIC_TAG_LEN;
 
     if (pn_off + 4 + QUIC_HP_SAMPLE_LEN > off) return 0;
-    hp_apply(keys->hp, out + pn_off + 4,
-             &out[0], out + pn_off, pkt->pn_len);
+    hp_apply_mask(keys->hp, out + pn_off + 4,
+                  &out[0], out + pn_off, pkt->pn_len, 0x1f);
 
     return off;
 }

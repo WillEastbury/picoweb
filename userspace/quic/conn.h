@@ -26,7 +26,10 @@
 #include "packet.h"
 #include "crypto_stream.h"
 #include "transport_params.h"
+#include "stream.h"
 #include "../tls/handshake.h"
+
+#define QUIC_CONN_MAX_STREAMS 4u
 
 #define QUIC_CONN_RX_CRYPTO_CAP  4096u   /* per-epoch reassembly buffer */
 
@@ -143,6 +146,11 @@ typedef struct {
     uint8_t master_secret[32];
     uint64_t app_tx_next_pn;
     uint64_t app_pkts_rcvd;
+
+    /* Per-stream rx state (RFC 9000 §2). Slots are claimed lazily by
+     * the first STREAM frame for a given stream_id; QUIC_CONN_MAX_STREAMS
+     * is a fixed upper bound for this phase. */
+    quic_stream_rx_t streams[QUIC_CONN_MAX_STREAMS];
 
     /* Counters (for tests / metrics; not yet used for ack generation). */
     uint64_t initial_pkts_rcvd;

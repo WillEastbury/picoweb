@@ -69,6 +69,7 @@ QUIC_PRIM_SRC := \
     ../quic/special.c            \
     ../quic/transport_params.c   \
     ../quic/crypto_stream.c      \
+    ../quic/stream.c             \
     ../quic/keys.c               \
     ../quic/tls_ext.c            \
     ../quic/conn.c               \
