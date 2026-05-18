@@ -571,3 +571,77 @@ int quic_server_finish_handshake(quic_conn_t* c)
     quic_crypto_rx_advance(&c->rx_handshake, 4 + 32);
     return 0;
 }
+
+/* ---- phase 6a: 1-RTT short-header tx + rx --------------------------- */
+
+uint64_t quic_conn_app_tx_next_pn(const quic_conn_t* c)
+{
+    return c ? c->app_tx_next_pn : 0;
+}
+
+size_t quic_conn_emit_app(quic_conn_t* c,
+                          const uint8_t* payload, size_t payload_len,
+                          uint8_t* out, size_t out_cap)
+{
+    if (!c || !out || (!payload && payload_len > 0)) return 0;
+    if (!c->app_keys_ready) return 0;
+    if (!c->peer_addrs_known) return 0;
+
+    /* Header overhead: byte0(1) + dcid + pn(2) + tag(16). */
+    const size_t hdr = 1 + c->peer_scid_len + 2 + 16u;
+    if (out_cap < hdr + payload_len) return 0;
+
+    quic_short_pkt_t pkt = {0};
+    if (c->peer_scid_len > sizeof pkt.dcid) return 0;
+    memcpy(pkt.dcid, c->peer_scid, c->peer_scid_len);
+    pkt.dcid_len    = c->peer_scid_len;
+    pkt.pn          = c->app_tx_next_pn;
+    pkt.pn_len      = 2;
+    pkt.payload     = payload;
+    pkt.payload_len = payload_len;
+
+    size_t n = quic_short_build(out, out_cap, &pkt, &c->app_tx_keys);
+    if (n == 0) return 0;
+    c->app_tx_next_pn++;
+    return n;
+}
+
+int quic_conn_recv_app(quic_conn_t* c, const uint8_t* datagram, size_t len)
+{
+    if (!c || !datagram) return -1;
+    if (!c->app_keys_ready) return -1;
+    if (len < 1) return -1;
+    /* form bit must be clear (short header), fixed bit must be set. */
+    if ((datagram[0] & 0x80) != 0) return -1;
+    if ((datagram[0] & 0x40) == 0) return -1;
+
+    quic_short_pkt_t pkt;
+    uint8_t scratch[2048];
+    if (quic_short_parse(datagram, len, c->our_scid_len,
+                         &c->app_rx_keys,
+                         &pkt, scratch, sizeof scratch) != 0) {
+        return -1;
+    }
+    /* DCID match check. */
+    if (pkt.dcid_len != c->our_scid_len ||
+        memcmp(pkt.dcid, c->our_scid, c->our_scid_len) != 0) {
+        return -1;
+    }
+    c->app_pkts_rcvd++;
+
+    /* Frame walk — for the spike we accept PADDING/PING/ACK and
+     * STREAM-class frames (0x08..0x0f) without further processing.
+     * Real frame handling lands in subsequent phases. */
+    size_t fo = 0;
+    while (fo < pkt.payload_len) {
+        quic_frame_t f;
+        size_t consumed = quic_frame_decode(pkt.payload + fo,
+                                            pkt.payload_len - fo, &f);
+        if (consumed == 0) break;
+        if (consumed == QUIC_FRAME_DECODE_ERROR) return -1;
+        fo += consumed;
+        /* All frames currently accepted; no per-type rejection in this
+         * phase (RFC 9000 §12.4 enforcement comes in 6b). */
+    }
+    return 0;
+}

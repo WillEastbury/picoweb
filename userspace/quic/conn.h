@@ -141,6 +141,8 @@ typedef struct {
     uint8_t client_application_traffic_secret_0[32];
     uint8_t server_application_traffic_secret_0[32];
     uint8_t master_secret[32];
+    uint64_t app_tx_next_pn;
+    uint64_t app_pkts_rcvd;
 
     /* Counters (for tests / metrics; not yet used for ack generation). */
     uint64_t initial_pkts_rcvd;
@@ -340,5 +342,28 @@ void quic_conn_handshake_rx_advance(quic_conn_t* c, size_t n);
  * Handshake reassembler.
  */
 int quic_server_finish_handshake(quic_conn_t* c);
+
+/* ---- 1-RTT (Application) data plane (wave 5/6 phase 6a) ----------- */
+
+uint64_t quic_conn_app_tx_next_pn(const quic_conn_t* c);
+
+/* Build one protected 1-RTT packet carrying `payload` bytes verbatim
+ * as the encrypted payload (the caller is responsible for framing —
+ * STREAM, MAX_DATA, etc.). Uses app_tx_keys; advances app_tx_next_pn.
+ *
+ * Returns the wire byte count (>0) or 0 if app_keys_ready==0,
+ * peer_addrs_known==0, or out_cap is too small.
+ */
+size_t quic_conn_emit_app(quic_conn_t* c,
+                          const uint8_t* payload, size_t payload_len,
+                          uint8_t* out, size_t out_cap);
+
+/* Process one received 1-RTT datagram. Decrypts using app_rx_keys,
+ * walks the frames as PADDING/PING/ACK/STREAM-class for now (other
+ * frame handling follows in later phases). Returns 0 on success,
+ * -1 on any failure. The DCID length is taken from c->our_scid_len —
+ * this is the CID the peer was told to address us by. */
+int quic_conn_recv_app(quic_conn_t* c,
+                       const uint8_t* datagram, size_t len);
 
 #endif
