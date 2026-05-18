@@ -58,9 +58,11 @@ int pw_tls_engine_configure_server(pw_tls_engine_t* eng,
     if (eng->state != PW_TLS_ST_HANDSHAKE) return -1;
     if (eng->hs_phase != PW_TLS_HS_WAIT_CH) return -1;
     if (cert_sig_scheme != TLS13_SIG_SCHEME_ED25519 &&
-        cert_sig_scheme != TLS13_SIG_SCHEME_RSA_PSS_RSAE_SHA256) return -1;
+        cert_sig_scheme != TLS13_SIG_SCHEME_RSA_PSS_RSAE_SHA256 &&
+        cert_sig_scheme != TLS13_SIG_SCHEME_ECDSA_SECP256R1_SHA256) return -1;
     if (cert_sig_scheme == TLS13_SIG_SCHEME_ED25519 && !seed_ed25519) return -1;
-    if (cert_sig_scheme == TLS13_SIG_SCHEME_RSA_PSS_RSAE_SHA256 &&
+    if ((cert_sig_scheme == TLS13_SIG_SCHEME_RSA_PSS_RSAE_SHA256 ||
+         cert_sig_scheme == TLS13_SIG_SCHEME_ECDSA_SECP256R1_SHA256) &&
         (!cert_key_der || cert_key_der_len == 0)) return -1;
 
     /* Validate cert chain fits in the per-message stack scratch the
@@ -609,6 +611,8 @@ static int try_drive_handshake_server(pw_tls_engine_t* eng) {
             !ch.offers_ed25519) return -1;
         if (eng->cert_sig_scheme == TLS13_SIG_SCHEME_RSA_PSS_RSAE_SHA256 &&
             !ch.offers_rsa_pss_rsae_sha256) return -1;
+        if (eng->cert_sig_scheme == TLS13_SIG_SCHEME_ECDSA_SECP256R1_SHA256 &&
+            !ch.offers_ecdsa_secp256r1_sha256) return -1;
     }
 
     /* Generate server randomness and X25519 ephemeral keypair. */

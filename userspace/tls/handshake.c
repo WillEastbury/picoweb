@@ -12,9 +12,11 @@
 #include "handshake.h"
 
 #include <string.h>
+#include "../crypto/ecdsa.h"
 #include "../crypto/ed25519.h"
 #include "../crypto/hkdf.h"
 #include "../crypto/hmac.h"
+#include "../crypto/p256.h"
 #include "../crypto/rsa.h"
 #include "../crypto/sha256.h"
 #include "../crypto/util.h"
@@ -796,6 +798,31 @@ static int emsa_pss_encode_sha256(const uint8_t mhash[32],
     return 0;
 }
 
+/* Extract the 32-byte private scalar from a P-256 SEC1 ECPrivateKey or
+ * PKCS#8-wrapped ECPrivateKey DER blob. We require the P-256 (prime256v1)
+ * named-curve OID 1.2.840.10045.3.1.7 to appear and then locate the
+ * 32-byte OCTET STRING (tag 0x04, len 0x20) that holds the scalar. We
+ * validate each candidate by deriving a public key (which only succeeds
+ * for a scalar in [1, n-1] with valid on-curve output), so an unrelated
+ * 0x04 0x20 prefix is rejected. */
+static int ecdsa_p256_private_scalar_from_der(const uint8_t* der, size_t der_len,
+                                              uint8_t out_priv[32]) {
+    if (!der || !out_priv || der_len < 34) return -1;
+    static const uint8_t p256_oid[] = {
+        0x06,0x08,0x2a,0x86,0x48,0xce,0x3d,0x03,0x01,0x07
+    };
+    if (!memmem(der, der_len, p256_oid, sizeof(p256_oid))) return -1;
+    for (size_t i = 0; i + 34 <= der_len; i++) {
+        if (der[i] == 0x04 && der[i + 1] == 0x20) {
+            memcpy(out_priv, der + i + 2, 32);
+            uint8_t pub[65];
+            if (p256_derive_pubkey(out_priv, pub) == 0) return 0;
+        }
+    }
+    secure_zero(out_priv, 32);
+    return -1;
+}
+
 int tls13_build_certificate_verify_ex(uint8_t* out, size_t out_cap,
                                       const uint8_t transcript_hash[32],
                                       uint16_t sig_scheme,
@@ -868,6 +895,60 @@ int tls13_build_certificate_verify_ex(uint8_t* out, size_t out_cap,
         secure_zero(mhash, sizeof(mhash));
         secure_zero(em, sizeof(em));
         secure_zero(sig, sizeof(sig));
+        return (int)(p - out);
+    }
+    if (sig_scheme == TLS13_SIG_SCHEME_ECDSA_SECP256R1_SHA256) {
+        if (!out || !transcript_hash || !key_der || key_der_len == 0) return -1;
+        uint8_t priv[32];
+        if (ecdsa_p256_private_scalar_from_der(key_der, key_der_len, priv) != 0) return -1;
+
+        uint8_t signed_data[TLS13_CV_SIGNED_LEN];
+        if (tls13_build_certificate_verify_signed_data(signed_data, transcript_hash, 1) != 0) {
+            secure_zero(priv, sizeof(priv));
+            return -1;
+        }
+
+        uint8_t r[32], s[32], der[72];
+        if (ecdsa_p256_sha256_sign(priv, signed_data, sizeof(signed_data), r, s) != 0) {
+            secure_zero(priv, sizeof(priv));
+            secure_zero(signed_data, sizeof(signed_data));
+            return -1;
+        }
+        int der_len_i = ecdsa_p256_encode_der(r, s, der, sizeof(der));
+        if (der_len_i <= 0) {
+            secure_zero(priv, sizeof(priv));
+            secure_zero(signed_data, sizeof(signed_data));
+            secure_zero(r, sizeof(r));
+            secure_zero(s, sizeof(s));
+            return -1;
+        }
+        size_t sig_len = (size_t)der_len_i;
+        size_t wire_len = 4u + 2u + 2u + sig_len;
+        if (wire_len > out_cap) {
+            secure_zero(priv, sizeof(priv));
+            secure_zero(signed_data, sizeof(signed_data));
+            secure_zero(r, sizeof(r));
+            secure_zero(s, sizeof(s));
+            secure_zero(der, sizeof(der));
+            return -1;
+        }
+        uint8_t* p = out;
+        *p++ = 0x0f;
+        uint32_t body_len = (uint32_t)(2u + 2u + sig_len);
+        *p++ = (uint8_t)(body_len >> 16);
+        *p++ = (uint8_t)(body_len >> 8);
+        *p++ = (uint8_t)(body_len);
+        *p++ = (uint8_t)(sig_scheme >> 8);
+        *p++ = (uint8_t)(sig_scheme & 0xff);
+        *p++ = (uint8_t)(sig_len >> 8);
+        *p++ = (uint8_t)(sig_len);
+        memcpy(p, der, sig_len);
+        p += sig_len;
+        secure_zero(priv, sizeof(priv));
+        secure_zero(signed_data, sizeof(signed_data));
+        secure_zero(r, sizeof(r));
+        secure_zero(s, sizeof(s));
+        secure_zero(der, sizeof(der));
         return (int)(p - out);
     }
     return -1;
