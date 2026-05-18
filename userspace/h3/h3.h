@@ -98,4 +98,28 @@ int h3_settings_next(const uint8_t* payload, size_t payload_len,
 #define H3_SETTINGS_MAX_FIELD_SECTION_SIZE    0x06
 #define H3_SETTINGS_QPACK_BLOCKED_STREAMS     0x07
 
+/* ---- High-level response builder (RFC 9114 + RFC 9204) ------- */
+
+/* Build a complete h3 server response on a single buffer:
+ *
+ *   [HEADERS frame] [DATA frame]
+ *
+ * The HEADERS payload is a QPACK-encoded field section with:
+ *   :status         <status_code> (indexed-static when in {103, 200,
+ *                    204, 206, 304, 400, 403, 404, 421, 425, 500},
+ *                    else literal-with-static-name idx 24 + value)
+ *   content-type    static-table indexed where possible, else
+ *                    literal-with-static-name idx 53 + Huffman value
+ *   content-length  literal-with-static-name idx 4 + Huffman value
+ *
+ * If `ctype` is NULL or empty, the content-type field is omitted.
+ * If `body` is NULL, the DATA frame is omitted (HEADERS-only response,
+ * e.g. 304 Not Modified).
+ *
+ * Returns total bytes written, or 0 on overflow / unsupported status. */
+size_t h3_build_response(uint8_t* out, size_t cap,
+                         unsigned status_code,
+                         const char* ctype, size_t ctype_len,
+                         const uint8_t* body, size_t body_len);
+
 #endif

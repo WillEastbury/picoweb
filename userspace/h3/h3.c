@@ -1,6 +1,7 @@
 /* HTTP/3 frame layer — see h3.h. */
 #include "h3.h"
 #include "../quic/varint.h"
+#include "../qpack/qpack.h"
 
 #include <string.h>
 
@@ -119,4 +120,139 @@ int h3_settings_next(const uint8_t* payload, size_t payload_len,
     *out_id  = id;
     *out_val = val;
     return 1;
+}
+
+/* ---- High-level response builder ---------------------------- */
+
+static int h3_status_static_index(unsigned code, uint64_t* idx)
+{
+    switch (code) {
+    case 103: *idx = 24; return 1;
+    case 200: *idx = 25; return 1;
+    case 304: *idx = 26; return 1;
+    case 404: *idx = 27; return 1;
+    case 503: *idx = 28; return 1;
+    case 100: *idx = 63; return 1;
+    case 204: *idx = 64; return 1;
+    case 206: *idx = 65; return 1;
+    case 302: *idx = 66; return 1;
+    case 400: *idx = 67; return 1;
+    case 403: *idx = 68; return 1;
+    case 421: *idx = 69; return 1;
+    case 425: *idx = 70; return 1;
+    case 500: *idx = 71; return 1;
+    default:  return 0;
+    }
+}
+
+/* Lookup an indexed content-type for common values. Returns 1 + sets
+ * *idx if the static table has it pre-bound; 0 otherwise. */
+static int h3_ctype_static_index(const char* ct, size_t ct_len, uint64_t* idx)
+{
+    struct { const char* v; size_t l; uint64_t i; } map[] = {
+        {"application/dns-message",        23, 44},
+        {"application/javascript",         22, 45},
+        {"application/json",               16, 46},
+        {"application/x-www-form-urlencoded", 33, 47},
+        {"image/gif",                       9, 48},
+        {"image/jpeg",                     10, 49},
+        {"image/png",                       9, 50},
+        {"text/css",                        8, 51},
+        {"text/html; charset=utf-8",       24, 52},
+        {"text/plain",                     10, 53},
+        {"text/plain;charset=utf-8",       24, 54},
+    };
+    for (size_t k = 0; k < sizeof map / sizeof map[0]; ++k) {
+        if (map[k].l == ct_len && memcmp(map[k].v, ct, ct_len) == 0) {
+            *idx = map[k].i;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+size_t h3_build_response(uint8_t* out, size_t cap,
+                         unsigned status_code,
+                         const char* ctype, size_t ctype_len,
+                         const uint8_t* body, size_t body_len)
+{
+    if (!out) return 0;
+
+    /* Build field section into a scratch buffer first so we know its
+     * length (required to emit the HEADERS frame header). */
+    uint8_t fs[512];
+    size_t  fo = 0;
+    size_t  n  = qpack_encode_prefix_empty(fs + fo, sizeof fs - fo);
+    if (n == 0) return 0;
+    fo += n;
+
+    /* :status */
+    uint64_t idx;
+    if (h3_status_static_index(status_code, &idx)) {
+        n = qpack_encode_indexed_static(fs + fo, sizeof fs - fo, idx);
+        if (n == 0) return 0;
+        fo += n;
+    } else {
+        char buf[8];
+        if (status_code > 999) return 0;
+        int  bl = 0;
+        unsigned s = status_code ? status_code : 0;
+        if (s == 0) { buf[bl++] = '0'; }
+        else {
+            char tmp[8]; int tl = 0;
+            while (s) { tmp[tl++] = (char)('0' + s % 10); s /= 10; }
+            while (tl) buf[bl++] = tmp[--tl];
+        }
+        /* idx 24 = ":status" with value "103"; we override with literal. */
+        n = qpack_encode_literal_static_name(fs + fo, sizeof fs - fo,
+                                             24, (const uint8_t*)buf, (size_t)bl);
+        if (n == 0) return 0;
+        fo += n;
+    }
+
+    /* content-type (optional) */
+    if (ctype && ctype_len) {
+        if (h3_ctype_static_index(ctype, ctype_len, &idx)) {
+            n = qpack_encode_indexed_static(fs + fo, sizeof fs - fo, idx);
+        } else {
+            /* idx 53 = "content-type: text/plain"; override value Huffman'd. */
+            n = qpack_encode_literal_static_name_huff(fs + fo, sizeof fs - fo,
+                                                      53,
+                                                      (const uint8_t*)ctype,
+                                                      ctype_len);
+        }
+        if (n == 0) return 0;
+        fo += n;
+    }
+
+    /* content-length */
+    if (body) {
+        char     clbuf[24];
+        int      cl = 0;
+        size_t   bl = body_len;
+        if (bl == 0) { clbuf[cl++] = '0'; }
+        else {
+            char tmp[24]; int tl = 0;
+            while (bl) { tmp[tl++] = (char)('0' + bl % 10); bl /= 10; }
+            while (tl) clbuf[cl++] = tmp[--tl];
+        }
+        /* idx 4 = "content-length: 0"; override value with our number. */
+        n = qpack_encode_literal_static_name(fs + fo, sizeof fs - fo,
+                                              4, (const uint8_t*)clbuf, (size_t)cl);
+        if (n == 0) return 0;
+        fo += n;
+    }
+
+    /* Now emit HEADERS frame: type=1, len=fo, then payload. */
+    size_t off = 0;
+    n = h3_frame_encode(out + off, cap - off, H3_FT_HEADERS, fs, fo);
+    if (n == 0) return 0;
+    off += n;
+
+    if (body) {
+        n = h3_frame_encode(out + off, cap - off, H3_FT_DATA, body, body_len);
+        if (n == 0) return 0;
+        off += n;
+    }
+    return off;
 }

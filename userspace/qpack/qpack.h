@@ -82,6 +82,20 @@ size_t qpack_encode_literal(uint8_t* out, size_t cap,
                             const uint8_t* name, size_t name_len,
                             const uint8_t* value, size_t value_len);
 
+/* Encode a Literal Field Line With Name Reference (T=01, S=1, N=1)
+ * with a Huffman-encoded value. Returns bytes written, 0 on overflow
+ * / OOR. */
+size_t qpack_encode_literal_static_name_huff(uint8_t* out, size_t cap,
+                                             uint64_t name_index,
+                                             const uint8_t* value, size_t value_len);
+
+/* Encode a Literal Field Line With Literal Name (T=001, N=1) with
+ * both name and value Huffman-encoded. Returns bytes written, 0 on
+ * overflow. */
+size_t qpack_encode_literal_huff(uint8_t* out, size_t cap,
+                                 const uint8_t* name, size_t name_len,
+                                 const uint8_t* value, size_t value_len);
+
 /* Encode the empty (static-only) field-section prefix: two zero
  * varints. Always 2 bytes; returns 2 or 0 on overflow. */
 size_t qpack_encode_prefix_empty(uint8_t* out, size_t cap);
