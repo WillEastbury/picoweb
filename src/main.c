@@ -6,8 +6,10 @@
 #include <unistd.h>
 #include <errno.h>
 #include <limits.h>
+#include <stdint.h>
 
 #include "jumptable.h"
+#include "api.h"
 #include "metrics.h"
 #include "server.h"
 #include "simd.h"
@@ -17,7 +19,7 @@
 
 static void usage(const char* argv0) {
     fprintf(stderr,
-        "usage: %s [--io_uring | --dpdk | --tls] [--sqpoll [--sqpoll-cpu=N]] [--tls-cert=PATH --tls-key=PATH --tls-ifname=IFACE [--tls-peer-mac=MAC] [--tls-xdp [--tls-xdp-queue=N]]] [PORT] [WWWROOT] [WORKERS] [MAXREQS] [ZC_MIN] [POOL_CAP]\n"
+        "usage: %s [--io_uring | --dpdk | --tls] [--sqpoll [--sqpoll-cpu=N]] [--api-root=DIR [--api-prefix=/api/]] [--picowal-device=PATH [--picowal-prefix=/wal/] [--picowal-bytes=N] [--picowal-format] [--oidc-cookie-auth --oidc-cookie-ttl-sec=N --oidc-google-client-id=ID --oidc-entra-client-id=ID [--oidc-entra-tenant=TENANT]]] [--tls-cert=PATH --tls-key=PATH --tls-ifname=IFACE [--tls-peer-mac=MAC] [--tls-xdp [--tls-xdp-queue=N]]] [PORT] [WWWROOT] [WORKERS] [MAXREQS] [ZC_MIN] [POOL_CAP]\n"
         "\n"
         "  --io_uring   use the io_uring worker backend (Linux 5.6+, no liburing)\n"
         "  --dpdk       use the DPDK userspace backend (NOT BUILT — see\n"
@@ -35,6 +37,17 @@ static void usage(const char* argv0) {
         "  --tls-xdp-queue=N   AF_XDP queue id (default 0)\n"
         "  --http-early-hints  enable HTTP/1.1 103 Early Hints with auto-derived\n"
         "                      Link: rel=preload headers (off by default)\n"
+        "  --api-root=DIR      enable JSON CRUD API and store objects under DIR\n"
+        "  --api-prefix=/p/    API route prefix (default /api/; must start/end '/')\n"
+        "  --picowal-device=PATH  enable raw-volume picowal backend\n"
+        "  --picowal-prefix=/p/   route prefix for picowal API (default /wal/)\n"
+        "  --picowal-bytes=N      raw-volume size in bytes (default 1073741824)\n"
+        "  --picowal-format       initialize/format picowal volume when missing\n"
+        "  --oidc-cookie-auth     require OIDC-backed short-lived cookie auth for /wal/ routes\n"
+        "  --oidc-cookie-ttl-sec=N session cookie ttl in seconds (default 900)\n"
+        "  --oidc-google-client-id=ID expected Google OAuth client id (aud)\n"
+        "  --oidc-entra-client-id=ID expected Entra app client id (appid/aud)\n"
+        "  --oidc-entra-tenant=T  optional Entra tenant id pin (tid)\n"
         "  --sqpoll     enable IORING_SETUP_SQPOLL: kernel polls our SQ,\n"
         "               eliminating io_uring_enter() syscalls on the submit\n"
         "               path. Costs one kernel thread per worker. Requires\n"
@@ -73,6 +86,19 @@ int main(int argc, char** argv) {
     bool tls_use_xdp = false;
     uint32_t tls_xdp_queue = 0;
     bool http_early_hints = false;
+    const char* api_root_cli = NULL;
+    const char* api_prefix_cli = "/api/";
+    bool api_prefix_set = false;
+    const char* picowal_device_cli = NULL;
+    const char* picowal_prefix_cli = "/wal/";
+    bool picowal_prefix_set = false;
+    unsigned long long picowal_bytes = 1073741824ULL;
+    bool picowal_format = false;
+    bool oidc_cookie_auth = false;
+    uint32_t oidc_cookie_ttl_sec = 900;
+    const char* oidc_google_client_id = NULL;
+    const char* oidc_entra_client_id = NULL;
+    const char* oidc_entra_tenant = NULL;
 
     /* Two-pass parse: lift flags out of argv first, then handle the
      * remaining positional args exactly as before. This keeps the
@@ -163,6 +189,92 @@ int main(int argc, char** argv) {
             http_early_hints = true;
             continue;
         }
+        if (strncmp(argv[i], "--api-root=", 11) == 0) {
+            api_root_cli = argv[i] + 11;
+            if (!api_root_cli[0]) {
+                fprintf(stderr, "picoweb: --api-root requires a non-empty path\n");
+                return 1;
+            }
+            continue;
+        }
+        if (strncmp(argv[i], "--api-prefix=", 13) == 0) {
+            api_prefix_cli = argv[i] + 13;
+            api_prefix_set = true;
+            if (!api_prefix_cli[0]) {
+                fprintf(stderr, "picoweb: --api-prefix requires a non-empty prefix\n");
+                return 1;
+            }
+            continue;
+        }
+        if (strncmp(argv[i], "--picowal-device=", 17) == 0) {
+            picowal_device_cli = argv[i] + 17;
+            if (!picowal_device_cli[0]) {
+                fprintf(stderr, "picoweb: --picowal-device requires a non-empty path\n");
+                return 1;
+            }
+            continue;
+        }
+        if (strncmp(argv[i], "--picowal-prefix=", 17) == 0) {
+            picowal_prefix_cli = argv[i] + 17;
+            picowal_prefix_set = true;
+            if (!picowal_prefix_cli[0]) {
+                fprintf(stderr, "picoweb: --picowal-prefix requires a non-empty prefix\n");
+                return 1;
+            }
+            continue;
+        }
+        if (strncmp(argv[i], "--picowal-bytes=", 16) == 0) {
+            char* end = NULL;
+            unsigned long long v = strtoull(argv[i] + 16, &end, 10);
+            if (end == argv[i] + 16 || *end != '\0' || v < 4096ULL) {
+                fprintf(stderr, "picoweb: invalid --picowal-bytes value\n");
+                return 1;
+            }
+            picowal_bytes = v;
+            continue;
+        }
+        if (strcmp(argv[i], "--picowal-format") == 0) {
+            picowal_format = true;
+            continue;
+        }
+        if (strcmp(argv[i], "--oidc-cookie-auth") == 0) {
+            oidc_cookie_auth = true;
+            continue;
+        }
+        if (strncmp(argv[i], "--oidc-cookie-ttl-sec=", 22) == 0) {
+            char* end = NULL;
+            unsigned long v = strtoul(argv[i] + 22, &end, 10);
+            if (end == argv[i] + 22 || *end != '\0' || v == 0 || v > 86400UL) {
+                fprintf(stderr, "picoweb: invalid --oidc-cookie-ttl-sec value\n");
+                return 1;
+            }
+            oidc_cookie_ttl_sec = (uint32_t)v;
+            continue;
+        }
+        if (strncmp(argv[i], "--oidc-google-client-id=", 24) == 0) {
+            oidc_google_client_id = argv[i] + 24;
+            if (!oidc_google_client_id[0]) {
+                fprintf(stderr, "picoweb: --oidc-google-client-id requires a non-empty value\n");
+                return 1;
+            }
+            continue;
+        }
+        if (strncmp(argv[i], "--oidc-entra-client-id=", 23) == 0) {
+            oidc_entra_client_id = argv[i] + 23;
+            if (!oidc_entra_client_id[0]) {
+                fprintf(stderr, "picoweb: --oidc-entra-client-id requires a non-empty value\n");
+                return 1;
+            }
+            continue;
+        }
+        if (strncmp(argv[i], "--oidc-entra-tenant=", 20) == 0) {
+            oidc_entra_tenant = argv[i] + 20;
+            if (!oidc_entra_tenant[0]) {
+                fprintf(stderr, "picoweb: --oidc-entra-tenant requires a non-empty value\n");
+                return 1;
+            }
+            continue;
+        }
         if (strncmp(argv[i], "--tls-xdp-queue=", 16) == 0) {
             char* end = NULL;
             unsigned long q = strtoul(argv[i] + 16, &end, 10);
@@ -233,6 +345,27 @@ int main(int argc, char** argv) {
         fprintf(stderr, "picoweb: --tls-* flags require --tls\n");
         return 1;
     }
+    if (api_prefix_set && !api_root_cli) {
+        fprintf(stderr, "picoweb: --api-prefix requires --api-root\n");
+        return 1;
+    }
+    if (picowal_prefix_set && !picowal_device_cli) {
+        fprintf(stderr, "picoweb: --picowal-prefix requires --picowal-device\n");
+        return 1;
+    }
+    if (picowal_format && !picowal_device_cli) {
+        fprintf(stderr, "picoweb: --picowal-format requires --picowal-device\n");
+        return 1;
+    }
+    if (oidc_cookie_auth && !picowal_device_cli) {
+        fprintf(stderr, "picoweb: --oidc-cookie-auth requires --picowal-device\n");
+        return 1;
+    }
+    if (!oidc_cookie_auth &&
+        (oidc_google_client_id || oidc_entra_client_id || oidc_entra_tenant)) {
+        fprintf(stderr, "picoweb: --oidc-* provider flags require --oidc-cookie-auth\n");
+        return 1;
+    }
 
     /* Reject --dpdk early — before spawning workers and binding ports
      * — so operators get a clean error instead of partially-started
@@ -244,6 +377,31 @@ int main(int argc, char** argv) {
             "         The flag is reserved; running with it now is a\n"
             "         hard fail rather than a silent fallback.\n");
         return 2;
+    }
+
+    if (api_root_cli) {
+        api_init(api_root_cli, api_prefix_cli);
+        if (!api_enabled()) {
+            fprintf(stderr, "picoweb: failed to enable API (root='%s', prefix='%s')\n",
+                    api_root_cli, api_prefix_cli);
+            return 1;
+        }
+    }
+    if (picowal_device_cli) {
+        if (!api_picowal_init(picowal_device_cli, (uint64_t)picowal_bytes,
+                              picowal_prefix_cli, picowal_format)) {
+            return 1;
+        }
+    }
+    if (oidc_cookie_auth) {
+        if (!api_oidc_init(true, oidc_cookie_ttl_sec,
+                           oidc_google_client_id,
+                           oidc_entra_client_id,
+                           oidc_entra_tenant)) {
+            return 1;
+        }
+    } else {
+        (void)api_oidc_init(false, oidc_cookie_ttl_sec, NULL, NULL, NULL);
     }
 
     char tls_cert_path[PATH_MAX];
@@ -398,6 +556,17 @@ int main(int argc, char** argv) {
               zc_min > 0 ? "on" : "off", metal_simd_describe());
     if (zc_min > 0) {
         metal_log("picoweb: MSG_ZEROCOPY threshold = %ld bytes", zc_min);
+    }
+    if (api_enabled()) {
+        metal_log("picoweb: API enabled (root=%s, prefix=%s)", api_root_cli, api_prefix_cli);
+    }
+    if (api_picowal_enabled()) {
+        metal_log("picoweb: picowal enabled (device=%s, prefix=%s, bytes=%llu)",
+                  picowal_device_cli, picowal_prefix_cli, picowal_bytes);
+    }
+    if (oidc_cookie_auth) {
+        metal_log("picoweb: OIDC cookie auth enabled (ttl=%us, providers=google+entra)",
+                  oidc_cookie_ttl_sec);
     }
 
     for (long i = 0; i < workers; i++) {

@@ -232,6 +232,13 @@ static void try_accept(int listen_fd, int ep, pool_t* pool, int64_t batch_now_ms
         conn->api_method = M_UNKNOWN;
         conn->api_headers_len = 0;
         conn->api_body_needed = 0;
+        conn->api_cookie_len = 0;
+        conn->api_host_len = 0;
+        conn->api_origin_len = 0;
+        conn->api_acr_headers_len = 0;
+        conn->api_principal_len = 0;
+        conn->api_tenant_len = 0;
+        conn->api_has_pw_auth = false;
         conn->api_path_len = 0;
         conn->last_active_ms = batch_now_ms;
 
@@ -347,6 +354,64 @@ static void api_finalise(conn_t* c, bool head_only, bool close_after) {
     c->state       = ST_WRITING;
 }
 
+static bool is_ctx_token_char(char c) {
+    return (c >= 'a' && c <= 'z') ||
+           (c >= 'A' && c <= 'Z') ||
+           (c >= '0' && c <= '9') ||
+           c == '-' || c == '_';
+}
+
+static void resolve_api_request_context(const conn_t* c, api_request_context_t* ctx) {
+    memset(ctx, 0, sizeof(*ctx));
+    memcpy(ctx->tenant_system, "prod", 5);
+    memcpy(ctx->tenant_id, "default", 8);
+    memcpy(ctx->principal_id, "anonymous", 10);
+
+    (void)api_principal_from_cookie(c->api_cookie, c->api_cookie_len,
+                                    ctx->principal_id, sizeof(ctx->principal_id));
+
+    if (c->api_host_len > 0) {
+        const char* h = c->api_host;
+        size_t n = c->api_host_len;
+        size_t dot1 = 0;
+        while (dot1 < n && h[dot1] != '.') dot1++;
+        if (dot1 > 0) {
+            size_t o = 0;
+            for (size_t i = 0; i < dot1 && o + 1 < sizeof(ctx->tenant_id); i++) {
+                char ch = h[i];
+                if (!is_ctx_token_char(ch)) continue;
+                ctx->tenant_id[o++] = ch;
+            }
+            if (o > 0) ctx->tenant_id[o] = '\0';
+        }
+        if (dot1 + 1 < n) {
+            size_t s2 = dot1 + 1;
+            size_t e2 = s2;
+            while (e2 < n && h[e2] != '.') e2++;
+            size_t l2 = e2 - s2;
+            if ((l2 == 3 && memcmp(h + s2, "dev", 3) == 0) ||
+                (l2 == 2 && memcmp(h + s2, "qa", 2) == 0) ||
+                (l2 == 4 && memcmp(h + s2, "prod", 4) == 0)) {
+                snprintf(ctx->tenant_system, sizeof(ctx->tenant_system), "%.*s", (int)l2, h + s2);
+            }
+        }
+    }
+}
+
+static void api_apply_request_context_headers(api_resp_t* resp, const api_request_context_t* ctx) {
+    if (!resp || !ctx) return;
+    size_t rem = (resp->head_len < sizeof(resp->head)) ? (sizeof(resp->head) - resp->head_len) : 0;
+    if (rem < 8) return;
+    int n = snprintf(resp->head + resp->head_len, rem,
+                     "X-PW-Principal-Id: %s\r\n"
+                     "X-PW-Tenant-Id: %s\r\n"
+                     "X-PW-Tenant-System: %s\r\n",
+                     ctx->principal_id,
+                     ctx->tenant_id,
+                     ctx->tenant_system);
+    if (n > 0 && (size_t)n < rem) resp->head_len += (size_t)n;
+}
+
 /* Run api_dispatch for the body now sitting in c->read_buf and prime
  * the response. Always sets close_after=true (any request that declared
  * a body forces close per http_parse anyway, and matching that for the
@@ -354,8 +419,18 @@ static void api_finalise(conn_t* c, bool head_only, bool close_after) {
 static void api_run(conn_t* c) {
     const char* body = c->read_buf + c->api_headers_len;
     size_t body_len = c->api_body_needed;
+    api_request_context_t req_ctx;
+    resolve_api_request_context(c, &req_ctx);
     api_dispatch(c->api_method, c->api_path, c->api_path_len,
-                 body, body_len, &c->api_resp);
+                 body, body_len,
+                 c->api_cookie, c->api_cookie_len,
+                 c->api_has_pw_auth,
+                 &req_ctx,
+                 &c->api_resp);
+    api_apply_request_context_headers(&c->api_resp, &req_ctx);
+    api_apply_cors(&c->api_resp,
+                   c->api_origin, c->api_origin_len,
+                   c->api_acr_headers, c->api_acr_headers_len);
     c->api_pending = true;
     api_finalise(c, /*head_only*/ c->api_method == M_HEAD,
                  /*close_after*/ true);
@@ -417,8 +492,69 @@ static __attribute__((hot)) int dispatch_one(conn_t* c, const jumptable_t* jt, u
         c->api_method       = req.method;
         c->api_headers_len  = (uint16_t)req.consumed;
         c->api_body_needed  = (uint16_t)req.content_length;
+        c->api_has_pw_auth  = req.pw_auth_header;
+        c->api_cookie_len   = 0;
+        c->api_host_len = 0;
+        c->api_origin_len = 0;
+        c->api_acr_headers_len = 0;
+        c->api_principal_len = 0;
+        c->api_tenant_len = 0;
         c->api_path_len     = (uint8_t)req.path_len;
         memcpy(c->api_path, req.path, req.path_len);
+        if (req.cookie && req.cookie_len > 0) {
+            if (req.cookie_len >= sizeof(c->api_cookie)) {
+                pr = HTTP_ERR_400;
+                goto fallback_static;
+            }
+            memcpy(c->api_cookie, req.cookie, req.cookie_len);
+            c->api_cookie[req.cookie_len] = '\0';
+            c->api_cookie_len = (uint16_t)req.cookie_len;
+        }
+        if (req.host && req.host_len > 0) {
+            if (req.host_len >= sizeof(c->api_host)) {
+                pr = HTTP_ERR_400;
+                goto fallback_static;
+            }
+            memcpy(c->api_host, req.host, req.host_len);
+            c->api_host[req.host_len] = '\0';
+            c->api_host_len = (uint16_t)req.host_len;
+        }
+        if (req.origin && req.origin_len > 0) {
+            if (req.origin_len >= sizeof(c->api_origin)) {
+                pr = HTTP_ERR_400;
+                goto fallback_static;
+            }
+            memcpy(c->api_origin, req.origin, req.origin_len);
+            c->api_origin[req.origin_len] = '\0';
+            c->api_origin_len = (uint16_t)req.origin_len;
+        }
+        if (req.acr_headers && req.acr_headers_len > 0) {
+            if (req.acr_headers_len >= sizeof(c->api_acr_headers)) {
+                pr = HTTP_ERR_400;
+                goto fallback_static;
+            }
+            memcpy(c->api_acr_headers, req.acr_headers, req.acr_headers_len);
+            c->api_acr_headers[req.acr_headers_len] = '\0';
+            c->api_acr_headers_len = (uint16_t)req.acr_headers_len;
+        }
+        if (req.pw_principal && req.pw_principal_len > 0) {
+            if (req.pw_principal_len >= sizeof(c->api_principal)) {
+                pr = HTTP_ERR_400;
+                goto fallback_static;
+            }
+            memcpy(c->api_principal, req.pw_principal, req.pw_principal_len);
+            c->api_principal[req.pw_principal_len] = '\0';
+            c->api_principal_len = (uint16_t)req.pw_principal_len;
+        }
+        if (req.pw_tenant && req.pw_tenant_len > 0) {
+            if (req.pw_tenant_len >= sizeof(c->api_tenant)) {
+                pr = HTTP_ERR_400;
+                goto fallback_static;
+            }
+            memcpy(c->api_tenant, req.pw_tenant, req.pw_tenant_len);
+            c->api_tenant[req.pw_tenant_len] = '\0';
+            c->api_tenant_len = (uint16_t)req.pw_tenant_len;
+        }
 
         /* Required header+body footprint must fit in read_buf so that
          * we can hold the full body in place without reallocation. */

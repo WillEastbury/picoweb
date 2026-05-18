@@ -18,7 +18,7 @@ typedef enum {
 } http_result_t;
 
 typedef enum {
-    M_GET = 0, M_HEAD, M_POST, M_PUT, M_DELETE, M_UNKNOWN
+    M_GET = 0, M_HEAD, M_POST, M_PUT, M_DELETE, M_OPTIONS, M_UNKNOWN
 } http_method_t;
 
 typedef struct {
@@ -34,6 +34,17 @@ typedef struct {
     size_t consumed;      /* total bytes consumed from buf */
     const char* if_none_match;   /* raw If-None-Match value (points into buf) */
     size_t if_none_match_len;
+    const char* cookie;          /* raw Cookie header value (points into buf) */
+    size_t cookie_len;
+    bool   pw_auth_header;       /* X-PW-Auth: 1 */
+    const char* origin;          /* raw Origin header value (points into buf) */
+    size_t origin_len;
+    const char* acr_headers;     /* Access-Control-Request-Headers value */
+    size_t acr_headers_len;
+    const char* pw_principal;    /* X-PW-Principal / X-Principal-Id value */
+    size_t pw_principal_len;
+    const char* pw_tenant;       /* X-PW-Tenant value */
+    size_t pw_tenant_len;
     /* Content-Length value, parsed from header. 0 if header absent or
      * value was "0". On a valid request, body bytes (if any) live in the
      * caller buffer at offset `consumed` and have length `content_length`.

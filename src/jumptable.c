@@ -729,6 +729,18 @@ static void compute_etag(char* out, size_t outsz,
              body_len, (unsigned long long)h);
 }
 
+static void compute_etag_parts(char* out, size_t outsz,
+                               const void* p1, size_t l1,
+                               const void* p2, size_t l2,
+                               const void* p3, size_t l3) {
+    uint64_t h = metal_fnv1a_init();
+    if (l1) h = metal_fnv1a_step(h, p1, l1);
+    if (l2) h = metal_fnv1a_step(h, p2, l2);
+    if (l3) h = metal_fnv1a_step(h, p3, l3);
+    snprintf(out, outsz, "W/\"%zx-%016llx\"",
+             l1 + l2 + l3, (unsigned long long)h);
+}
+
 /* ============================================================== */
 /* 304 Not Modified wire buffers.                                 */
 /* ============================================================== */
@@ -914,20 +926,15 @@ bool jumptable_build(jumptable_t* jt, const char* wwwroot) {
                 {
                     size_t payload_len = got;
                     const void* payload_ptr = body;
-                    /* For chromed resources, the wire payload includes chrome. */
-                    uint8_t* payload_buf = NULL;
                     if (is_html && host_chrome) {
+                        compute_etag_parts(r->etag, sizeof(r->etag),
+                                           host_chrome->hdr, host_chrome->hdr_len,
+                                           body, got,
+                                           host_chrome->ftr, host_chrome->ftr_len);
                         payload_len = got + host_chrome->hdr_len + host_chrome->ftr_len;
-                        payload_buf = (uint8_t*)malloc(payload_len);
-                        if (!payload_buf) { free(body); continue; }
-                        size_t p = 0;
-                        if (host_chrome->hdr_len) { memcpy(payload_buf + p, host_chrome->hdr, host_chrome->hdr_len); p += host_chrome->hdr_len; }
-                        memcpy(payload_buf + p, body, got); p += got;
-                        if (host_chrome->ftr_len) { memcpy(payload_buf + p, host_chrome->ftr, host_chrome->ftr_len); }
-                        payload_ptr = payload_buf;
+                    } else {
+                        compute_etag(r->etag, sizeof(r->etag), payload_ptr, payload_len);
                     }
-                    compute_etag(r->etag, sizeof(r->etag), payload_ptr, payload_len);
-                    if (payload_buf) free(payload_buf);
 
                     /* Rebuild heads with ETag included. */
                     char etag_extra[384];

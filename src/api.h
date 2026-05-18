@@ -18,11 +18,14 @@
  *   - No JSON syntax validation: bytes are stored verbatim
  *   - No If-Match / ETag concurrency control
  *   - Each worker writes via tempfile + rename for atomic replace
+ *   - Filesystem ops are dirfd-anchored with openat()/renameat()/unlinkat()
+ *     and O_NOFOLLOW on opened components to avoid symlink traversal
  *   - POST with explicit id uses O_CREAT|O_EXCL for race-safe "create-only"
  */
 
 #include <stddef.h>
 #include <stdbool.h>
+#include <stdint.h>
 
 #include "http.h"  /* http_method_t */
 
@@ -32,7 +35,7 @@
  * deferred). */
 #define API_REQ_BODY_CAP   6144
 #define API_RESP_BODY_CAP  (1u << 20)  /* 1 MiB read cap on GET */
-#define API_HEAD_CAP       384
+#define API_HEAD_CAP       1024
 #define API_NAME_CAP       64
 
 /* Response built by api_dispatch. body is heap-owned iff body_owned is
@@ -47,6 +50,12 @@ typedef struct {
     bool   body_owned;            /* true => api_resp_release frees(body) */
 } api_resp_t;
 
+typedef struct {
+    char principal_id[128];  /* request principal id resolved from session cookie */
+    char tenant_id[64];      /* tenant id from first host component */
+    char tenant_system[8];   /* dev / qa / prod from second host component */
+} api_request_context_t;
+
 /* Configure once on the main thread before workers spawn. Creates root
  * dir if missing. Both arguments are duplicated. Passing NULL/empty for
  * root disables the API entirely (api_path_matches will always return
@@ -60,10 +69,37 @@ bool api_path_matches(const char* path, size_t path_len);
 
 /* True iff the API is enabled (root configured). */
 bool api_enabled(void);
+bool api_picowal_enabled(void);
 
 /* Largest request body the API will accept. Useful for the dispatcher
  * to short-circuit oversize uploads before reading them. */
 size_t api_max_request_body(void);
+
+/* Optional raw-volume picowal backend mounted under a dedicated prefix
+ * (default "/wal/"). This can be enabled alongside the JSON file backend. */
+bool api_picowal_init(const char* device_path, uint64_t volume_bytes,
+                      const char* prefix, bool format);
+
+/* Optional OIDC-backed cookie auth for picowal routes. When enabled,
+ * non-auth picowal endpoints require an authenticated session cookie.
+ * `cookie_ttl_sec` controls short-lived session duration.
+ * `google_client_id` / `entra_client_id` are used to validate provider tokens.
+ * `entra_tenant` is optional (NULL/empty disables tenant pinning). */
+bool api_oidc_init(bool cookie_auth_enabled, uint32_t cookie_ttl_sec,
+                   const char* google_client_id,
+                   const char* entra_client_id,
+                   const char* entra_tenant);
+
+/* Resolve principal id from the pw_session cookie. Returns true on
+ * success and writes a NUL-terminated principal id into out_principal. */
+bool api_principal_from_cookie(const char* cookie, size_t cookie_len,
+                               char* out_principal, size_t out_cap);
+
+/* Apply CORS headers to an API response for a given request origin.
+ * No-op when origin is absent/invalid. */
+void api_apply_cors(api_resp_t* resp,
+                    const char* origin, size_t origin_len,
+                    const char* acr_headers, size_t acr_headers_len);
 
 /* Perform the request and populate *resp. Always succeeds (errors land
  * as 4xx/5xx in resp->status). The caller must initialise resp to all
@@ -72,6 +108,9 @@ size_t api_max_request_body(void);
 void api_dispatch(http_method_t method,
                   const char* path, size_t path_len,
                   const char* body, size_t body_len,
+                  const char* cookie, size_t cookie_len,
+                  bool has_pw_auth_header,
+                  const api_request_context_t* req_ctx,
                   api_resp_t* resp);
 
 /* Release any heap memory owned by resp. Safe to call multiple times;
