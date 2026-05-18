@@ -1,5 +1,6 @@
 #include "conn.h"
 #include "frames.h"
+#include "tls_ext.h"
 
 #include <string.h>
 
@@ -151,4 +152,79 @@ const uint8_t* quic_conn_initial_rx_peek(const quic_conn_t* c, size_t* out_len)
 void quic_conn_initial_rx_advance(quic_conn_t* c, size_t n)
 {
     quic_crypto_rx_advance(&c->rx_initial, n);
+}
+
+/* ---- phase 5e2: ClientHello + QUIC TP extraction --------------------
+ *
+ * Re-walks the CH header bytes (after parsing) to locate the
+ * extensions block, then defers to quic_tls_ext_find_tp + quic_tp_decode.
+ * The walk mirrors tls13_parse_client_hello so the offsets are exact.
+ */
+static int locate_ch_extensions_block(const uint8_t* msg, size_t msg_len,
+                                      const uint8_t** ext_block,
+                                      size_t* ext_block_len)
+{
+    /* hs_hdr(4) + legacy_version(2) + random(32) = 38 */
+    if (msg_len < 38 + 1) return -1;
+    size_t off = 38;
+
+    uint8_t sid_len = msg[off++];
+    if (sid_len > 32 || (size_t)sid_len > msg_len - off) return -1;
+    off += sid_len;
+
+    if (off + 2 > msg_len) return -1;
+    uint16_t cs_len = ((uint16_t)msg[off] << 8) | msg[off + 1];
+    off += 2;
+    if ((cs_len & 1u) || (size_t)cs_len > msg_len - off) return -1;
+    off += cs_len;
+
+    if (off + 1 > msg_len) return -1;
+    uint8_t cm_len = msg[off++];
+    if (cm_len < 1 || (size_t)cm_len > msg_len - off) return -1;
+    off += cm_len;
+
+    if (off + 2 > msg_len) return -1;
+    uint16_t ext_total = ((uint16_t)msg[off] << 8) | msg[off + 1];
+    off += 2;
+    if ((size_t)ext_total != msg_len - off) return -1;
+
+    *ext_block     = msg + off;
+    *ext_block_len = ext_total;
+    return 0;
+}
+
+int quic_conn_initial_extract_client_hello(const quic_conn_t* c,
+                                           tls13_client_hello_t* parsed_out,
+                                           quic_transport_params_t* peer_tp_out)
+{
+    if (!c || !parsed_out || !peer_tp_out) return -1;
+
+    size_t buf_len = 0;
+    const uint8_t* buf = quic_crypto_rx_peek(&c->rx_initial, &buf_len);
+    if (buf == NULL || buf_len < 4) return 0;
+
+    /* Handshake header: type(1) + length(u24). RFC 8446 §4. */
+    if (buf[0] != 0x01) return -1;                  /* must be client_hello */
+    uint32_t hs_body_len = ((uint32_t)buf[1] << 16) |
+                           ((uint32_t)buf[2] << 8)  |
+                            (uint32_t)buf[3];
+    size_t need = (size_t)hs_body_len + 4;
+    if (buf_len < need) return 0;                   /* not enough yet */
+
+    if (tls13_parse_client_hello(buf, need, parsed_out) != 0) return -1;
+
+    const uint8_t* ext_block = NULL;
+    size_t         ext_block_len = 0;
+    if (locate_ch_extensions_block(buf, need, &ext_block, &ext_block_len) != 0)
+        return -1;
+
+    const uint8_t* tp_body = NULL;
+    size_t         tp_body_len = 0;
+    int rc = quic_tls_ext_find_tp(ext_block, ext_block_len,
+                                  &tp_body, &tp_body_len);
+    if (rc != 1) return -1;                         /* missing or malformed */
+
+    if (quic_tp_decode(tp_body, tp_body_len, peer_tp_out) != 1) return -1;
+
+    return 1;
 }
