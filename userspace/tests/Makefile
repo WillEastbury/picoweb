@@ -63,7 +63,8 @@ QUIC_PRIM_SRC := \
     ../quic/cc.c                 \
     ../quic/flow.c               \
     ../quic/special.c            \
-    ../quic/transport_params.c
+    ../quic/transport_params.c   \
+    ../quic/crypto_stream.c
 
 .PHONY: all clean test
 

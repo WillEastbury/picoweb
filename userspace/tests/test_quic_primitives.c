@@ -26,6 +26,7 @@
 #include "../quic/flow.h"
 #include "../quic/special.h"
 #include "../quic/transport_params.h"
+#include "../quic/crypto_stream.h"
 
 static int g_pass = 0;
 static int g_fail = 0;
@@ -1547,6 +1548,164 @@ static void test_tp_encode_buffer_overflow(void) {
 }
 
 /* ============================================================== */
+/* CRYPTO-frame stream (rx reassembly + tx chunker)               */
+/* ============================================================== */
+
+static void test_crypto_stream_rx_inorder(void) {
+    printf("== crypto stream rx: in-order delivery ==\n");
+    uint8_t data[64], bm[8];
+    quic_crypto_rx_t rx;
+    quic_crypto_rx_init(&rx, data, sizeof data, bm, sizeof bm);
+
+    static const uint8_t a[] = { 1,2,3,4 };
+    static const uint8_t b[] = { 5,6,7,8 };
+    check_int("stage [0..4)",  quic_crypto_rx_stage(&rx, 0, a, sizeof a), 1);
+    check_int("contig=4 after a", (long)rx.contig_len, 4);
+    check_int("stage [4..8)",  quic_crypto_rx_stage(&rx, 4, b, sizeof b), 1);
+    check_int("contig=8 after b", (long)rx.contig_len, 8);
+
+    size_t n = 0;
+    const uint8_t* p = quic_crypto_rx_peek(&rx, &n);
+    check_int("peek length 8", (long)n, 8);
+    static const uint8_t want[] = { 1,2,3,4,5,6,7,8 };
+    check_eq("peek bytes", p, want, sizeof want);
+    quic_crypto_rx_advance(&rx, 8);
+    check_int("post-advance peek empty", quic_crypto_rx_peek(&rx, &n) == NULL, 1);
+    check_int("peek out_len after advance", (long)n, 0);
+}
+
+static void test_crypto_stream_rx_outoforder(void) {
+    printf("== crypto stream rx: out-of-order with gap fill ==\n");
+    uint8_t data[64], bm[8];
+    quic_crypto_rx_t rx;
+    quic_crypto_rx_init(&rx, data, sizeof data, bm, sizeof bm);
+
+    static const uint8_t a[] = { 1,2,3,4 };
+    static const uint8_t b[] = { 5,6,7,8 };
+    static const uint8_t c[] = { 9,10,11,12 };
+
+    /* Receive last chunk first. */
+    check_int("stage [8..12) first", quic_crypto_rx_stage(&rx, 8, c, 4), 1);
+    check_int("no contig yet",       (long)rx.contig_len, 0);
+
+    /* Fill the prefix [0..4). */
+    check_int("stage [0..4)",        quic_crypto_rx_stage(&rx, 0, a, 4), 1);
+    check_int("still no contig until middle filled",
+              (long)rx.contig_len, 4);
+
+    /* Fill the middle [4..8) — now everything contiguous. */
+    check_int("stage [4..8)",        quic_crypto_rx_stage(&rx, 4, b, 4), 1);
+    check_int("contig now 12",       (long)rx.contig_len, 12);
+}
+
+static void test_crypto_stream_rx_duplicate(void) {
+    printf("== crypto stream rx: duplicate is no-op ==\n");
+    uint8_t data[32], bm[4];
+    quic_crypto_rx_t rx;
+    quic_crypto_rx_init(&rx, data, sizeof data, bm, sizeof bm);
+
+    static const uint8_t a[] = { 0xaa, 0xbb, 0xcc };
+    check_int("first stage",     quic_crypto_rx_stage(&rx, 5, a, 3), 1);
+    check_int("duplicate stage",  quic_crypto_rx_stage(&rx, 5, a, 3), 0);
+    check_int("highest unchanged", (long)rx.highest, 8);
+}
+
+static void test_crypto_stream_rx_overlap_conflict(void) {
+    printf("== crypto stream rx: conflicting overlap rejected ==\n");
+    uint8_t data[32], bm[4];
+    quic_crypto_rx_t rx;
+    quic_crypto_rx_init(&rx, data, sizeof data, bm, sizeof bm);
+
+    static const uint8_t a[] = { 0x01, 0x02, 0x03 };
+    static const uint8_t b[] = { 0x01, 0xff };  /* overlaps at offset 1 */
+    check_int("first stage", quic_crypto_rx_stage(&rx, 0, a, 3), 1);
+    check_int("conflicting overlap",
+              quic_crypto_rx_stage(&rx, 1, b, 2), -1);
+}
+
+static void test_crypto_stream_rx_overflow(void) {
+    printf("== crypto stream rx: overflow rejected ==\n");
+    uint8_t data[8], bm[1];
+    quic_crypto_rx_t rx;
+    quic_crypto_rx_init(&rx, data, sizeof data, bm, sizeof bm);
+
+    static const uint8_t a[] = { 1,2,3,4 };
+    check_int("offset past cap",
+              quic_crypto_rx_stage(&rx, 9, a, 1), -1);
+    check_int("len past cap",
+              quic_crypto_rx_stage(&rx, 6, a, 4), -1);
+}
+
+static void test_crypto_stream_rx_partial_consume(void) {
+    printf("== crypto stream rx: partial consume preserves remainder ==\n");
+    uint8_t data[32], bm[4];
+    quic_crypto_rx_t rx;
+    quic_crypto_rx_init(&rx, data, sizeof data, bm, sizeof bm);
+
+    static const uint8_t a[] = { 10,20,30,40,50,60,70,80 };
+    quic_crypto_rx_stage(&rx, 0, a, 8);
+    quic_crypto_rx_advance(&rx, 3);
+    size_t n;
+    const uint8_t* p = quic_crypto_rx_peek(&rx, &n);
+    check_int("remainder len", (long)n, 5);
+    static const uint8_t want[] = { 40,50,60,70,80 };
+    check_eq("remainder bytes", p, want, 5);
+
+    /* Stage more and ensure peek extends. */
+    static const uint8_t b[] = { 90,100 };
+    quic_crypto_rx_stage(&rx, 8, b, 2);
+    p = quic_crypto_rx_peek(&rx, &n);
+    check_int("remainder len after extend", (long)n, 7);
+}
+
+static void test_crypto_stream_tx_chunks(void) {
+    printf("== crypto stream tx: chunked emission ==\n");
+    static const uint8_t msg[10] = { 0,1,2,3,4,5,6,7,8,9 };
+    quic_crypto_tx_t tx;
+    quic_crypto_tx_init(&tx);
+    quic_crypto_tx_set_pending(&tx, msg, sizeof msg);
+
+    uint64_t off; const uint8_t* chunk; size_t len;
+    check_int("first chunk avail",
+              quic_crypto_tx_next(&tx, 4, &off, &chunk, &len), 1);
+    check_int("first offset 0", (long)off, 0);
+    check_int("first len 4",    (long)len, 4);
+    check_eq("first bytes",     chunk, msg, 4);
+    quic_crypto_tx_consume(&tx, len);
+
+    check_int("second chunk avail",
+              quic_crypto_tx_next(&tx, 4, &off, &chunk, &len), 1);
+    check_int("second offset 4", (long)off, 4);
+    check_int("second len 4",    (long)len, 4);
+    check_eq("second bytes",     chunk, msg + 4, 4);
+    quic_crypto_tx_consume(&tx, len);
+
+    check_int("third chunk avail",
+              quic_crypto_tx_next(&tx, 4, &off, &chunk, &len), 1);
+    check_int("third offset 8", (long)off, 8);
+    check_int("third len 2",    (long)len, 2);  /* only 2 bytes left */
+    quic_crypto_tx_consume(&tx, len);
+
+    check_int("no more chunks",
+              quic_crypto_tx_next(&tx, 4, &off, &chunk, &len), 0);
+    check_int("next_offset advanced", (long)tx.next_offset, 10);
+}
+
+static void test_crypto_stream_tx_zero_budget(void) {
+    printf("== crypto stream tx: zero MTU yields no chunk ==\n");
+    static const uint8_t m[] = {1,2,3};
+    quic_crypto_tx_t tx; quic_crypto_tx_init(&tx);
+    quic_crypto_tx_set_pending(&tx, m, sizeof m);
+    uint64_t off; const uint8_t* p; size_t len;
+    check_int("budget 0",
+              quic_crypto_tx_next(&tx, 0, &off, &p, &len), 0);
+    /* Empty pending */
+    quic_crypto_tx_set_pending(&tx, NULL, 0);
+    check_int("empty pending",
+              quic_crypto_tx_next(&tx, 16, &off, &p, &len), 0);
+}
+
+/* ============================================================== */
 
 
 int main(void) {
@@ -1617,6 +1776,15 @@ int main(void) {
     test_tp_decode_illegal_values();
     test_tp_encode_validation();
     test_tp_encode_buffer_overflow();
+
+    test_crypto_stream_rx_inorder();
+    test_crypto_stream_rx_outoforder();
+    test_crypto_stream_rx_duplicate();
+    test_crypto_stream_rx_overlap_conflict();
+    test_crypto_stream_rx_overflow();
+    test_crypto_stream_rx_partial_consume();
+    test_crypto_stream_tx_chunks();
+    test_crypto_stream_tx_zero_budget();
 
     printf("\n=== RESULTS: PASS=%d FAIL=%d ===\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
