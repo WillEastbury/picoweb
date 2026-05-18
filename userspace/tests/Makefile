@@ -75,6 +75,7 @@ QUIC_PRIM_SRC := \
     ../quic/conn.c               \
     ../quic/handshake_driver.c   \
     ../h3/h3.c                   \
+    ../qpack/qpack.c             \
     ../crypto/x25519.c
 
 .PHONY: all clean test
