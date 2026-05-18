@@ -1,3 +1,16 @@
 body { font: 16px/1.5 system-ui, sans-serif; margin: 2rem auto; max-width: 40rem; color: #222; }
 h1 { color: #06c; border-bottom: 1px solid #ddd; padding-bottom: .25rem; }
 code { background: #f4f4f4; padding: 2px 4px; border-radius: 3px; }
+label { display: block; font-weight: 600; margin-top: .75rem; }
+input, textarea, select, button { font: inherit; }
+input[type="text"], input[type="number"], textarea, select {
+  box-sizing: border-box;
+  width: 100%;
+  max-width: 100%;
+  padding: .4rem;
+}
+button { margin-top: .75rem; padding: .35rem .75rem; }
+.pw-field { margin-top: .35rem; padding: .5rem; border: 1px solid #e5e7eb; border-radius: 6px; }
+.pw-actions { margin-top: 1rem; padding-top: .5rem; border-top: 1px dashed #d1d5db; }
+.pw-hint { display: block; color: #555; margin-top: .35rem; }
+pre { background: #f8fafc; border: 1px solid #e5e7eb; border-radius: 6px; padding: .75rem; overflow: auto; }

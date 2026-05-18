@@ -1,0 +1,31 @@
+<h2>Picowal metadata form builder</h2>
+<p>Loads <code>/wal/forms/{pack}</code> and lets the browser render/submit the form.</p>
+
+<form id="pw-config-form">
+  <label for="pw-pack">Pack</label>
+  <input id="pw-pack" name="pack" type="number" min="0" max="1023" value="12" required>
+  <button type="submit">Load Form</button>
+</form>
+
+<section id="pw-form-section" hidden>
+  <h3 id="pw-form-title">Form</h3>
+  <form id="pw-data-form"></form>
+  <div class="pw-actions">
+    <label for="pw-method">Method</label>
+    <select id="pw-method" name="method">
+      <option value="POST">POST (create)</option>
+      <option value="PUT">PUT (upsert by record)</option>
+      <option value="DELETE">DELETE (by record)</option>
+    </select>
+
+    <label for="pw-record">Record</label>
+    <input id="pw-record" name="record" type="number" min="0" max="4194303" placeholder="required for PUT/DELETE">
+
+    <button id="pw-submit-btn" type="button">Send</button>
+  </div>
+</section>
+
+<h3>API response</h3>
+<pre id="pw-output">Load a form to begin.</pre>
+
+<script src="/js/picowal-form-builder.js"></script>
