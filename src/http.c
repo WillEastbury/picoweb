@@ -18,6 +18,7 @@ static http_method_t classify_method(const char* m, size_t len) {
     if (len == 4 && memcmp(m, "POST", 4) == 0) return M_POST;
     if (len == 3 && memcmp(m, "PUT", 3) == 0) return M_PUT;
     if (len == 6 && memcmp(m, "DELETE", 6) == 0) return M_DELETE;
+    if (len == 7 && memcmp(m, "OPTIONS", 7) == 0) return M_OPTIONS;
     return M_UNKNOWN;
 }
 
@@ -55,7 +56,7 @@ static const char* trim_ows(const char* s, size_t len, size_t* out_len) {
 /* ============================================================== */
 
 http_result_t http_parse(char* buf, size_t buf_len, http_request_t* out) {
-    memset(out, 0, sizeof(*out));
+    *out = (http_request_t){0};
 
     /* Look for end of headers \r\n\r\n */
     if (buf_len < 4) return HTTP_NEED_MORE;
@@ -99,7 +100,7 @@ http_result_t http_parse(char* buf, size_t buf_len, http_request_t* out) {
     if (!path_is_safe(path_start, path_len)) {
         return (path_len > MAX_URI_LEN) ? HTTP_ERR_414 : HTTP_ERR_400;
     }
-    /* Strip query string (we don't serve dynamic content). */
+    /* Strip query string for routing. */
     char* q = (char*)memchr(path_start, '?', path_len);
     if (q) path_len = (size_t)(q - path_start);
 
@@ -149,6 +150,26 @@ http_result_t http_parse(char* buf, size_t buf_len, http_request_t* out) {
                 out->host_len = hostlen;
             }
             break;
+        case 6:
+            if (metal_ieq(p, 6, "Cookie", 6)) {
+                out->cookie = tval;
+                out->cookie_len = tl;
+            } else if (metal_ieq(p, 6, "Origin", 6)) {
+                out->origin = tval;
+                out->origin_len = tl;
+            }
+            break;
+        case 9:
+            if (metal_ieq(p, 9, "X-PW-Auth", 9)) {
+                if (tl == 1 && tval[0] == '1') out->pw_auth_header = true;
+            }
+            break;
+        case 11:
+            if (metal_ieq(p, 11, "X-PW-Tenant", 11)) {
+                out->pw_tenant = tval;
+                out->pw_tenant_len = tl;
+            }
+            break;
         case 10:
             if (metal_ieq(p, 10, "Connection", 10)) {
                 size_t k = 0;
@@ -188,6 +209,10 @@ http_result_t http_parse(char* buf, size_t buf_len, http_request_t* out) {
                 if (body_present && out->content_length != cl) return HTTP_ERR_400;
                 out->content_length = cl;
                 if (cl > 0) body_present = true;
+            } else if (metal_ieq(p, 14, "X-PW-Principal", 14) ||
+                       metal_ieq(p, 14, "X-Principal-Id", 14)) {
+                out->pw_principal = tval;
+                out->pw_principal_len = tl;
             }
             break;
         case 15:
@@ -201,6 +226,12 @@ http_result_t http_parse(char* buf, size_t buf_len, http_request_t* out) {
                 /* We don't speak chunked. Reject any TE outright; safer
                  * than mis-framing the next request on this connection. */
                 return HTTP_ERR_400;
+            }
+            break;
+        case 30:
+            if (metal_ieq(p, 30, "Access-Control-Request-Headers", 30)) {
+                out->acr_headers = tval;
+                out->acr_headers_len = tl;
             }
             break;
         default:
@@ -252,7 +283,8 @@ const resource_t* http_select(const jumptable_t* jt,
     /* HTTP_OK from here */
     *out_close_after = req->client_close;
 
-    if (req->method == M_POST || req->method == M_PUT || req->method == M_DELETE) {
+    if (req->method == M_POST || req->method == M_PUT ||
+        req->method == M_DELETE || req->method == M_OPTIONS) {
         /* Allowed methods, but unsupported in v1. Keep-alive ok if
          * request was framed properly (no body declared). */
         return jt->err_405;

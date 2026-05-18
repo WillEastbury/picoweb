@@ -48,6 +48,24 @@ assert_code 200 "HEAD existing"          -I "http://127.0.0.1:$PORT/api/things/t
 assert_code 204 "PUT  replace"           -X PUT --data '{"a":2}' \
             "http://127.0.0.1:$PORT/api/things/t1"
 
+# Minimal request-context plumbing headers (principal from cookie + tenant app/env).
+ctx_hdr="$(mktemp)"
+ctx_code=$(curl -sS --max-time 3 -o /tmp/api-test-body -D "$ctx_hdr" -w '%{http_code}' \
+    -H 'Host: contoso.dev.local' \
+    -H 'X-PW-Tenant: contoso.orders.dev' \
+    "http://127.0.0.1:$PORT/api/things/t1") || ctx_code=000
+if [ "$ctx_code" = "200" ] && \
+   grep -qi '^X-PW-Principal-Id: anonymous' "$ctx_hdr" && \
+   grep -qi '^X-PW-Tenant-Id: contoso' "$ctx_hdr" && \
+   grep -qi '^X-PW-Tenant-System: dev' "$ctx_hdr"; then
+    echo "ok   request context headers"
+else
+    echo "FAIL request context headers -> $ctx_code"
+    sed -n '1,30p' "$ctx_hdr"
+    fail=$((fail + 1))
+fi
+rm -f "$ctx_hdr"
+
 # Body content survives a round-trip
 got_body=$(curl -sS --max-time 3 "http://127.0.0.1:$PORT/api/things/t1")
 if [ "$got_body" = '{"a":2}' ]; then
@@ -76,6 +94,15 @@ assert_code 400 "id with dot"            "http://127.0.0.1:$PORT/api/things/.hid
 assert_code 400 "id traversal collapsed"  --path-as-is "http://127.0.0.1:$PORT/api/things/../etc"
 assert_code 400 "non-ascii id"           "http://127.0.0.1:$PORT/api/things/h%C3%A9"
 
+# Symlink-hardening checks (must not follow symlinked object files/dirs).
+ln -s /etc/passwd "$ROOT/things/escape.json"
+assert_code 500 "GET symlinked object blocked" "http://127.0.0.1:$PORT/api/things/escape"
+rm -f "$ROOT/things/escape.json"
+ln -s /tmp "$ROOT/evilcoll"
+assert_code 500 "PUT symlinked collection blocked" -X PUT --data '{}' \
+            "http://127.0.0.1:$PORT/api/evilcoll/x"
+rm -f "$ROOT/evilcoll"
+
 # Body size cap (API_REQ_BODY_CAP = 6144). The 413 short-circuits without
 # the server having to buffer the body, so use Content-Length only.
 assert_code 413 "PUT  oversize CL"       -X PUT \
@@ -87,8 +114,25 @@ assert_code 413 "PUT  oversize CL"       -X PUT \
 # Static path still works alongside API
 assert_code 200 "static / still served"  -H 'Host: localhost' "http://127.0.0.1:$PORT/"
 
-# Unknown method on API path
-assert_code 405 "OPTIONS not allowed"    -X OPTIONS "http://127.0.0.1:$PORT/api/things/t2"
+# CORS preflight / allow-origin on API path
+cors_hdr="$(mktemp)"
+cors_code=$(curl -sS --max-time 3 -o /tmp/api-test-body -D "$cors_hdr" -w '%{http_code}' \
+    -X OPTIONS \
+    -H 'Origin: https://app.example' \
+    -H 'Access-Control-Request-Method: PUT' \
+    -H 'Access-Control-Request-Headers: Content-Type, X-PW-Auth' \
+    "http://127.0.0.1:$PORT/api/things/t2") || cors_code=000
+if [ "$cors_code" = "204" ] && \
+   grep -qi '^Access-Control-Allow-Origin: https://app.example' "$cors_hdr" && \
+   grep -qi '^Access-Control-Allow-Methods: GET, HEAD, POST, PUT, DELETE, OPTIONS' "$cors_hdr"; then
+    echo "ok   OPTIONS preflight cors -> $cors_code"
+else
+    echo "FAIL OPTIONS preflight cors -> $cors_code (expected 204 + CORS headers)"
+    echo "     headers:"
+    sed -n '1,30p' "$cors_hdr"
+    fail=$((fail + 1))
+fi
+rm -f "$cors_hdr"
 
 echo
 if [ $fail -eq 0 ]; then

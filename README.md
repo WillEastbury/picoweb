@@ -33,6 +33,7 @@ the CPU.
 - [Design highlights](#design-highlights)
 - [Build](#build)
 - [Run](#run)
+- [Optional API backends](#optional-api-backends)
 - [Filesystem conventions](#filesystem-conventions)
   - [Virtual hosts](#virtual-hosts)
   - [`_chrome/` — header/footer wrap for HTML](#_chrome--headerfooter-wrap-for-html)
@@ -174,6 +175,78 @@ sudo setcap 'cap_net_bind_service=+ep' ./picoweb
 ```
 
 `SIGINT` / `SIGTERM` cleanly stops all workers.
+
+---
+
+## Optional API backends
+
+picoweb can expose two lightweight data APIs in the same binary:
+
+- **JSON file API** (existing): `--api-root=DIR [--api-prefix=/api/]`
+- **picowal raw-volume API** (new): `--picowal-device=PATH [--picowal-prefix=/wal/]`
+- **OIDC cookie auth for picowal** (optional): `--oidc-cookie-auth --oidc-google-client-id=... --oidc-entra-client-id=... [--oidc-cookie-ttl-sec=900] [--oidc-entra-tenant=...]`
+
+`picowal` uses a sector-aligned append-only log over a raw volume/file and
+maps keys as `card`/`record` integers:
+
+- `card`: `0..1023`
+- `record`: `0..4194303`
+- route shape: `/{prefix}{card}/{record}` (default `/wal/{card}/{record}`)
+- query endpoint: `POST /wal/query` with picowal query text (`S:`, `F:`, `W:`) including joined pack references
+- schema endpoint: `/wal/schema/{pack}` (`PUT/GET/HEAD/DELETE`, `POST` create-only)
+- metadata wrappers:
+  - `/wal/metadata/name/{pack}` → pack 1
+  - `/wal/metadata/schema/{pack}` → pack 2
+  - `/wal/metadata/{pack}` → combined fetch (`pack1` + `pack2`)
+- auth endpoints (when `--oidc-cookie-auth` is enabled):
+  - `POST /wal/auth/login` body: `{"provider":"google|entra","access_token":"..."}`  
+    validates token with provider, then sets short-lived `HttpOnly` cookie
+  - `POST /wal/auth/logout` clears cookie
+  - all other `/wal/*` routes require `X-PW-Auth: 1` and a valid cookie
+- CORS is enabled on API responses when an `Origin` header is present:
+  - preflight `OPTIONS` for `/api/*` and `/wal/*` returns `204`
+  - response headers include `Access-Control-Allow-Origin`, methods, headers, and credentials
+- Minimal tenant/env routing context plumbing:
+  - principal id is resolved from `pw_session` cookie (falls back to `anonymous` when absent/invalid)
+  - tenant context is resolved from the `Host` header:
+    - first `.` component => `tenant_id`
+    - second `.` component => `tenant_system` (`dev|qa|prod`)
+  - API responses include:
+    - `X-PW-Principal-Id`
+    - `X-PW-Tenant-Id`
+    - `X-PW-Tenant-System`
+
+Query language (multi-line body):
+
+```text
+S:name,13.city
+F:12,13
+W:13.country|==|UK
+```
+
+- `S:` select list (`pack.field` supported)
+- `F:` from packs (numeric card ids, first is primary)
+- `W:` predicates (`==`, `!=`, `>`, `<`, `>=`, `<=`, `IN`, `NI`)
+
+Conventions wired in:
+- **pack 0** = users (query access denied)
+- **pack 1** = pack-name registry
+- **pack 2** = schema store (`fields` / `joins`)
+
+Example:
+
+```sh
+./picoweb --picowal-device=/mnt/picowal/wal.img --picowal-format \
+          --picowal-bytes=1073741824 --picowal-prefix=/wal/ \
+          8080 wwwroot
+```
+
+Safety knobs:
+
+- `--picowal-format` is required to initialize a new non-empty volume
+- default volume size is **1 GiB**
+- writes are durable (`fdatasync`) before ack
+- when OIDC auth is enabled, session cookies are short-lived (`Max-Age` = `--oidc-cookie-ttl-sec`, default 900s)
 
 ---
 

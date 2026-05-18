@@ -78,8 +78,21 @@ typedef struct conn {
     http_method_t api_method;
     uint16_t      api_headers_len;      /* bytes 0..api_headers_len = HTTP head */
     uint16_t      api_body_needed;      /* Content-Length of the request */
+    uint16_t      api_cookie_len;       /* length of copied Cookie header */
+    uint16_t      api_host_len;         /* Host header length */
+    uint16_t      api_origin_len;       /* length of copied Origin header */
+    uint16_t      api_acr_headers_len;  /* Access-Control-Request-Headers length */
+    uint16_t      api_principal_len;    /* X-PW-Principal/X-Principal-Id length */
+    uint16_t      api_tenant_len;       /* X-PW-Tenant length */
+    bool          api_has_pw_auth;      /* X-PW-Auth: 1 marker */
     uint8_t       api_path_len;
     char          api_path[256];        /* request-target copy (see above) */
+    char          api_cookie[512];      /* bounded Cookie copy */
+    char          api_host[256];        /* bounded Host copy */
+    char          api_origin[256];      /* bounded Origin copy */
+    char          api_acr_headers[256]; /* bounded ACR-Headers copy */
+    char          api_principal[128];   /* bounded principal id copy */
+    char          api_tenant[128];      /* bounded tenant hint copy */
 } conn_t;
 
 /* A per-worker pool of connection slots, mmapped at startup. */

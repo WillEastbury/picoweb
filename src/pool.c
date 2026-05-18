@@ -53,6 +53,18 @@ void pool_free(pool_t* p, conn_t* c) {
     c->send_body = false;
     c->req_start_tsc = 0;
     c->last_active_ms = 0;
+    c->api_pending = false;
+    c->api_method = M_UNKNOWN;
+    c->api_headers_len = 0;
+    c->api_body_needed = 0;
+    c->api_cookie_len = 0;
+    c->api_host_len = 0;
+    c->api_origin_len = 0;
+    c->api_acr_headers_len = 0;
+    c->api_principal_len = 0;
+    c->api_tenant_len = 0;
+    c->api_has_pw_auth = false;
+    c->api_path_len = 0;
     c->next_free = p->free_head;
     p->free_head = c;
     p->in_use--;
