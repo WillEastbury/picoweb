@@ -276,31 +276,37 @@ void tcp_input_at(tcp_stack_t* s, const tcp_seg_t* seg,
                   uint64_t now_ms,
                   tcp_on_data_fn on_data, void* on_data_user,
                   tcp_emit_fn emit, void* emit_user) {
-    /* Reject if not addressed to our local IP. */
+    /* Reject if not addressed to our local IP. Silently drop:
+     * with backends that don't pre-filter (raw AF_PACKET without a
+     * cBPF program installed), the worker sees every IPv4 frame on
+     * the interface, including unrelated cluster traffic. RSTing a
+     * third party is wrong, and the syscall-per-packet was an ms-
+     * scale tail-latency source. */
     if (seg->dst_ip != s->local_ip) {
-        emit_rst(seg, emit, emit_user);
         return;
     }
 
-    /* Port accept check (dispatch lookup or single-port match). */
+    /* Port accept check (dispatch lookup or single-port match).
+     * Same reasoning as above — silently drop. */
     const pw_service_t* svc = NULL;
     int port_ok = port_accepts(s, seg->dst_port, &svc);
     if (!port_ok) {
-        emit_rst(seg, emit, emit_user);
         return;
     }
 
     tcp_conn_t* c = find_conn(s, seg);
 
     /* No matching PCB. If it's a SYN, allocate one and move to
-     * SYN-RECEIVED; otherwise RST. */
+     * SYN-RECEIVED; otherwise drop silently. (RFC 793 says RST,
+     * but in practice these are almost always stray ACKs from
+     * sessions we just closed or scanner traffic — RSTing them
+     * costs a syscall per packet and tells scanners we're alive.) */
     if (!c) {
         if (!(seg->flags & TCPF_SYN) || (seg->flags & TCPF_ACK)) {
-            emit_rst(seg, emit, emit_user);
             return;
         }
         c = alloc_conn(s);
-        if (!c) { emit_rst(seg, emit, emit_user); return; }
+        if (!c) { return; }
         c->state       = TCP_SYN_RECEIVED;
         c->local_ip    = seg->dst_ip;
         c->remote_ip   = seg->src_ip;
