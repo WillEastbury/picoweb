@@ -34,6 +34,10 @@ static void usage(const char* argv0) {
         "  --tls-xdp-queue=N   AF_XDP queue id (default 0)\n"
         "  --http-early-hints  enable HTTP/1.1 103 Early Hints with auto-derived\n"
         "                      Link: rel=preload headers (off by default)\n"
+        "  --tls-busy-poll     legacy busy-spin RX loop (lowest latency; pegs a\n"
+        "                      full core; AVOID under Kubernetes cpu limits — CFS\n"
+        "                      throttling produces ~80ms tail-latency stalls).\n"
+        "                      Default is poll(2)-based RX with 10ms tick wakeups.\n"
         "  --sqpoll     enable IORING_SETUP_SQPOLL: kernel polls our SQ,\n"
         "               eliminating io_uring_enter() syscalls on the submit\n"
         "               path. Costs one kernel thread per worker. Requires\n"
@@ -72,6 +76,7 @@ int main(int argc, char** argv) {
     bool tls_use_xdp = false;
     uint32_t tls_xdp_queue = 0;
     bool http_early_hints = false;
+    bool tls_busy_poll = false;
 
     /* Two-pass parse: lift flags out of argv first, then handle the
      * remaining positional args exactly as before. This keeps the
@@ -171,6 +176,10 @@ int main(int argc, char** argv) {
             }
             tls_use_xdp = true;
             tls_xdp_queue = (uint32_t)q;
+            continue;
+        }
+        if (strcmp(argv[i], "--tls-busy-poll") == 0) {
+            tls_busy_poll = true;
             continue;
         }
         if (npos < (int)(sizeof(pos)/sizeof(pos[0]))) {
@@ -308,6 +317,7 @@ int main(int argc, char** argv) {
         cfgs[i].tls_use_xdp           = tls_use_xdp;
         cfgs[i].tls_xdp_queue         = tls_xdp_queue;
         cfgs[i].http_early_hints      = http_early_hints;
+        cfgs[i].tls_busy_poll         = tls_busy_poll;
         /* SQPOLL kernel-thread CPU policy: avoid pinning the kernel
          * polling thread to the same core as its userspace worker
          * (worker i is pinned to (i % nproc)) — they'd thrash one

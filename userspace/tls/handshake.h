@@ -209,18 +209,28 @@ int tls13_build_finished(uint8_t* out, size_t out_cap,
  *   uint32 ticket_age_add
  *   opaque ticket_nonce<0..255>
  *   opaque ticket<1..2^16-1>      -- server-chosen opaque label
- *   Extension extensions<0..2^16-2>  -- emitted empty (no early_data)
+ *   Extension extensions<0..2^16-2>
  *
  * `ticket_id` is the opaque label the server will hand back to the
  * client; the server uses it to look up the per-ticket PSK in its
- * own store. Returns total bytes written, or -1 on error. */
+ * own store.
+ *
+ * If `max_early_data` > 0, the NST extensions block contains a single
+ * `early_data` extension (RFC 8446 §4.6.1) whose body is the 32-bit
+ * `max_early_data_size` value; standards-compliant clients require
+ * this extension before they will attempt a 0-RTT handshake. If
+ * `max_early_data` == 0, the extensions block is empty (1-RTT
+ * resumption only).
+ *
+ * Returns total bytes written, or -1 on error. */
 int tls13_build_new_session_ticket(uint8_t* out, size_t out_cap,
                                    uint32_t lifetime_s,
                                    uint32_t age_add,
                                    const uint8_t* ticket_nonce,
                                    size_t nonce_len,
                                    const uint8_t* ticket_id,
-                                   size_t id_len);
+                                   size_t id_len,
+                                   uint32_t max_early_data);
 
 /* Per-ticket PSK derivation (RFC 8446 §4.6.1):
  *   PSK = HKDF-Expand-Label(resumption_master_secret, "resumption",

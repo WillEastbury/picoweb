@@ -26,7 +26,7 @@
 #include <stdint.h>
 
 #define PW_TLS_TICKET_ID_MAX   64u
-#define PW_TLS_TICKET_SLOTS    16u
+#define PW_TLS_TICKET_SLOTS    256u
 
 typedef struct {
     int      valid;
