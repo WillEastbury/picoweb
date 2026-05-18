@@ -8,6 +8,7 @@
 #include <errno.h>
 #include <ifaddrs.h>
 #include <net/if.h>
+#include <poll.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -647,23 +648,59 @@ void* tls_worker_main(void* arg) {
 
     uint64_t last_tick_ms = 0;
     uint8_t frame[2048];
+    /* Tick cadence — keep in lock-step with the legacy busy-poll path
+     * so RTO/delack/keepalive timing is unchanged. */
+    const uint64_t tick_period_ms = 10;
+    /* RX file descriptor for the active backend. Both af_xdp_t and
+     * af_packet_t expose .fd as the first/second member; we cache it
+     * here so the inner loop is identical regardless of mode. */
+    const int rx_fd = (w.io_mode == TLS_IO_AF_XDP) ? w.xdp.fd : w.afp.fd;
+    const bool busy_poll = cfg->tls_busy_poll;
     for (;;) {
-        const uint8_t* ip = NULL;
-        size_t ip_len = 0;
-        int csum_not_ready = 0;
-        int rr = (w.io_mode == TLS_IO_AF_XDP)
-                   ? af_xdp_recv(&w.xdp, frame, sizeof(frame), &ip, &ip_len)
-                   : af_packet_recv(&w.afp, frame, sizeof(frame), &ip, &ip_len,
-                                    &csum_not_ready);
-        if (rr == 0) {
+        /* Default RX dispatch: sleep on the backend fd until packets
+         * arrive or the next tick deadline elapses. AF_XDP sockets
+         * are opened with XDP_USE_NEED_WAKEUP, so the kernel signals
+         * POLLIN when the RX ring transitions empty -> non-empty.
+         * AF_PACKET fds are inherently poll(2)-able.
+         *
+         * The legacy --tls-busy-poll mode skips the syscall entirely
+         * and just spins on the ring head. That is the lowest-latency
+         * RX path on dedicated bare metal but is catastrophic under
+         * Kubernetes cpu limits: a busy spinner exhausts the CFS
+         * quota and gets throttled for ~80ms out of every 100ms
+         * period, which surfaces externally as alternating fast/slow
+         * tail latency on keep-alive connections. */
+        if (!busy_poll) {
+            uint64_t now = (uint64_t)metal_now_ms();
+            uint64_t next_tick = last_tick_ms + tick_period_ms;
+            int timeout_ms = (now >= next_tick) ? 0
+                              : (int)(next_tick - now);
+            if (timeout_ms > (int)tick_period_ms) timeout_ms = (int)tick_period_ms;
+            struct pollfd pfd = { .fd = rx_fd, .events = POLLIN };
+            (void)poll(&pfd, 1, timeout_ms);
+        }
+
+        /* Drain everything currently available in the RX ring before
+         * we go back to sleep / re-tick. Each backend's recv returns
+         * 0 on success and -1 when the ring is empty. */
+        for (int drained = 0; drained < 64; drained++) {
+            const uint8_t* ip = NULL;
+            size_t ip_len = 0;
+            int csum_not_ready = 0;
+            int rr = (w.io_mode == TLS_IO_AF_XDP)
+                       ? af_xdp_recv(&w.xdp, frame, sizeof(frame), &ip, &ip_len)
+                       : af_packet_recv(&w.afp, frame, sizeof(frame), &ip, &ip_len,
+                                        &csum_not_ready);
+            if (rr != 0) break;
             tcp_seg_t seg;
             if (ip_tcp_parse_ex(ip, ip_len, &seg, csum_not_ready) == 0) {
                 uint64_t now = (uint64_t)metal_now_ms();
                 tcp_input_at(&w.stack, &seg, now, NULL, NULL, emit_seg, &emit_ctx);
             }
         }
+
         uint64_t now = (uint64_t)metal_now_ms();
-        if (now - last_tick_ms >= 10) {
+        if (now - last_tick_ms >= tick_period_ms) {
             tcp_tick(&w.stack, now, emit_seg, &emit_ctx);
             last_tick_ms = now;
         }
