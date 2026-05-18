@@ -23,9 +23,23 @@ typedef enum {
     QUIC_FT_PING               = 0x01,
     QUIC_FT_ACK                = 0x02,
     QUIC_FT_ACK_ECN            = 0x03,
+    QUIC_FT_RESET_STREAM       = 0x04,
+    QUIC_FT_STOP_SENDING       = 0x05,
     QUIC_FT_CRYPTO             = 0x06,
     QUIC_FT_NEW_TOKEN          = 0x07,
     QUIC_FT_STREAM             = 0x08,  /* base; low 3 bits = OFF|LEN|FIN */
+    QUIC_FT_MAX_DATA           = 0x10,
+    QUIC_FT_MAX_STREAM_DATA    = 0x11,
+    QUIC_FT_MAX_STREAMS_BIDI   = 0x12,
+    QUIC_FT_MAX_STREAMS_UNI    = 0x13,
+    QUIC_FT_DATA_BLOCKED       = 0x14,
+    QUIC_FT_STREAM_DATA_BLOCK  = 0x15,
+    QUIC_FT_STREAMS_BLOCK_BIDI = 0x16,
+    QUIC_FT_STREAMS_BLOCK_UNI  = 0x17,
+    QUIC_FT_NEW_CONNECTION_ID  = 0x18,
+    QUIC_FT_RETIRE_CONN_ID     = 0x19,
+    QUIC_FT_PATH_CHALLENGE     = 0x1a,
+    QUIC_FT_PATH_RESPONSE      = 0x1b,
     QUIC_FT_CONNECTION_CLOSE   = 0x1c,
     QUIC_FT_CONNECTION_CLOSE_A = 0x1d,
     QUIC_FT_HANDSHAKE_DONE     = 0x1e,
@@ -71,15 +85,79 @@ typedef struct {
 } quic_frame_close_t;
 
 typedef struct {
+    uint64_t stream_id;
+    uint64_t app_error_code;
+    uint64_t final_size;
+} quic_frame_reset_stream_t;
+
+typedef struct {
+    uint64_t stream_id;
+    uint64_t app_error_code;
+} quic_frame_stop_sending_t;
+
+typedef struct {
+    uint64_t max;
+} quic_frame_max_data_t;
+
+typedef struct {
+    uint64_t stream_id;
+    uint64_t max;
+} quic_frame_max_stream_data_t;
+
+typedef struct {
+    uint64_t max;          /* max stream count, not stream id */
+} quic_frame_max_streams_t;
+
+typedef struct {
+    uint64_t limit;        /* the limit that triggered the BLOCKED */
+} quic_frame_data_blocked_t;
+
+typedef struct {
+    uint64_t stream_id;
+    uint64_t limit;
+} quic_frame_stream_data_blocked_t;
+
+typedef struct {
+    uint64_t limit;
+} quic_frame_streams_blocked_t;
+
+typedef struct {
+    uint64_t seq_no;
+    uint64_t retire_prior_to;
+    uint8_t  cid_len;          /* 1..20 per §19.15 */
+    uint8_t  cid[20];
+    uint8_t  stateless_reset_token[16];
+} quic_frame_new_conn_id_t;
+
+typedef struct {
+    uint64_t seq_no;
+} quic_frame_retire_conn_id_t;
+
+typedef struct {
+    uint8_t data[8];           /* PATH_CHALLENGE / PATH_RESPONSE payload */
+} quic_frame_path_data_t;
+
+typedef struct {
     quic_frame_type_t type;
     uint8_t raw_type;      /* original byte, useful for STREAM bit decoding */
     union {
-        quic_frame_ack_t        ack;
-        quic_frame_crypto_t     crypto;
-        quic_frame_new_token_t  new_token;
-        quic_frame_stream_t     stream;
-        quic_frame_close_t      close;
-        size_t                  padding_count;  /* coalesced run of 0x00 */
+        quic_frame_ack_t                 ack;
+        quic_frame_crypto_t              crypto;
+        quic_frame_new_token_t           new_token;
+        quic_frame_stream_t              stream;
+        quic_frame_close_t               close;
+        quic_frame_reset_stream_t        reset_stream;
+        quic_frame_stop_sending_t        stop_sending;
+        quic_frame_max_data_t            max_data;
+        quic_frame_max_stream_data_t     max_stream_data;
+        quic_frame_max_streams_t         max_streams;
+        quic_frame_data_blocked_t        data_blocked;
+        quic_frame_stream_data_blocked_t stream_data_blocked;
+        quic_frame_streams_blocked_t     streams_blocked;
+        quic_frame_new_conn_id_t         new_conn_id;
+        quic_frame_retire_conn_id_t      retire_conn_id;
+        quic_frame_path_data_t           path;
+        size_t                           padding_count;
     } u;
 } quic_frame_t;
 
@@ -111,5 +189,39 @@ size_t quic_frame_close_encode(uint8_t* out, size_t cap,
                                uint64_t error_code,
                                uint64_t frame_type,
                                const uint8_t* reason, size_t reason_len);
+
+size_t quic_frame_reset_stream_encode(uint8_t* out, size_t cap,
+                                      uint64_t stream_id,
+                                      uint64_t app_error_code,
+                                      uint64_t final_size);
+size_t quic_frame_stop_sending_encode(uint8_t* out, size_t cap,
+                                      uint64_t stream_id,
+                                      uint64_t app_error_code);
+size_t quic_frame_max_data_encode(uint8_t* out, size_t cap, uint64_t max);
+size_t quic_frame_max_stream_data_encode(uint8_t* out, size_t cap,
+                                         uint64_t stream_id, uint64_t max);
+/* uni=0 ⇒ MAX_STREAMS bidi (0x12); uni=1 ⇒ uni (0x13). */
+size_t quic_frame_max_streams_encode(uint8_t* out, size_t cap,
+                                     int uni, uint64_t max);
+size_t quic_frame_data_blocked_encode(uint8_t* out, size_t cap,
+                                      uint64_t limit);
+size_t quic_frame_stream_data_blocked_encode(uint8_t* out, size_t cap,
+                                             uint64_t stream_id,
+                                             uint64_t limit);
+size_t quic_frame_streams_blocked_encode(uint8_t* out, size_t cap,
+                                         int uni, uint64_t limit);
+/* cid_len in 1..20. token is 16 bytes (NULL ⇒ all zeros). */
+size_t quic_frame_new_conn_id_encode(uint8_t* out, size_t cap,
+                                     uint64_t seq_no,
+                                     uint64_t retire_prior_to,
+                                     const uint8_t* cid, size_t cid_len,
+                                     const uint8_t* stateless_reset_token);
+size_t quic_frame_retire_conn_id_encode(uint8_t* out, size_t cap,
+                                        uint64_t seq_no);
+/* PATH_CHALLENGE (0x1a) / PATH_RESPONSE (0x1b). data is 8 bytes. */
+size_t quic_frame_path_challenge_encode(uint8_t* out, size_t cap,
+                                        const uint8_t data[8]);
+size_t quic_frame_path_response_encode(uint8_t* out, size_t cap,
+                                       const uint8_t data[8]);
 
 #endif

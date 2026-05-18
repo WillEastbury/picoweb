@@ -24,6 +24,7 @@
 #include "../quic/loss.h"
 #include "../quic/cc.h"
 #include "../quic/flow.h"
+#include "../quic/special.h"
 
 static int g_pass = 0;
 static int g_fail = 0;
@@ -1088,6 +1089,224 @@ static void test_flow_should_update(void) {
 }
 
 /* ============================================================== */
+/* Phase 4d — auxiliary frames + special packets + idle           */
+/* ============================================================== */
+
+static void test_aux_reset_stream_roundtrip(void) {
+    printf("== aux: RESET_STREAM round-trip ==\n");
+    uint8_t buf[16];
+    size_t n = quic_frame_reset_stream_encode(buf, sizeof buf,
+                                              4, 0x100, 1024);
+    quic_frame_t f;
+    size_t c = quic_frame_decode(buf, n, &f);
+    check_int("rs consumed", (long)c, (long)n);
+    check_int("rs type",  f.type, QUIC_FT_RESET_STREAM);
+    check_int("rs sid",   (long)f.u.reset_stream.stream_id,      4);
+    check_int("rs err",   (long)f.u.reset_stream.app_error_code, 0x100);
+    check_int("rs final", (long)f.u.reset_stream.final_size,     1024);
+}
+
+static void test_aux_stop_sending_roundtrip(void) {
+    printf("== aux: STOP_SENDING round-trip ==\n");
+    uint8_t buf[16];
+    size_t n = quic_frame_stop_sending_encode(buf, sizeof buf, 8, 0x42);
+    quic_frame_t f;
+    size_t c = quic_frame_decode(buf, n, &f);
+    check_int("ss consumed", (long)c, (long)n);
+    check_int("ss type", f.type, QUIC_FT_STOP_SENDING);
+    check_int("ss sid",  (long)f.u.stop_sending.stream_id,      8);
+    check_int("ss err",  (long)f.u.stop_sending.app_error_code, 0x42);
+}
+
+static void test_aux_max_frames_roundtrip(void) {
+    printf("== aux: MAX_DATA / MAX_STREAM_DATA / MAX_STREAMS round-trip ==\n");
+    uint8_t buf[16];
+    quic_frame_t f;
+    size_t n = quic_frame_max_data_encode(buf, sizeof buf, 1048576);
+    quic_frame_decode(buf, n, &f);
+    check_int("max_data type", f.type, QUIC_FT_MAX_DATA);
+    check_int("max_data val",  (long)f.u.max_data.max, 1048576);
+
+    n = quic_frame_max_stream_data_encode(buf, sizeof buf, 4, 65536);
+    quic_frame_decode(buf, n, &f);
+    check_int("max_stream_data type", f.type, QUIC_FT_MAX_STREAM_DATA);
+    check_int("max_stream_data sid",  (long)f.u.max_stream_data.stream_id, 4);
+    check_int("max_stream_data max",  (long)f.u.max_stream_data.max,       65536);
+
+    n = quic_frame_max_streams_encode(buf, sizeof buf, 0, 100);
+    quic_frame_decode(buf, n, &f);
+    check_int("max_streams_bidi type", f.type, QUIC_FT_MAX_STREAMS_BIDI);
+    check_int("max_streams_bidi val",  (long)f.u.max_streams.max, 100);
+
+    n = quic_frame_max_streams_encode(buf, sizeof buf, 1, 50);
+    quic_frame_decode(buf, n, &f);
+    check_int("max_streams_uni type", f.type, QUIC_FT_MAX_STREAMS_UNI);
+    check_int("max_streams_uni val",  (long)f.u.max_streams.max, 50);
+}
+
+static void test_aux_blocked_frames_roundtrip(void) {
+    printf("== aux: DATA_BLOCKED / STREAM_DATA_BLOCKED / STREAMS_BLOCKED ==\n");
+    uint8_t buf[16];
+    quic_frame_t f;
+    size_t n = quic_frame_data_blocked_encode(buf, sizeof buf, 1024);
+    quic_frame_decode(buf, n, &f);
+    check_int("data_blocked type", f.type, QUIC_FT_DATA_BLOCKED);
+    check_int("data_blocked limit", (long)f.u.data_blocked.limit, 1024);
+
+    n = quic_frame_stream_data_blocked_encode(buf, sizeof buf, 4, 512);
+    quic_frame_decode(buf, n, &f);
+    check_int("sdb type", f.type, QUIC_FT_STREAM_DATA_BLOCK);
+    check_int("sdb sid",  (long)f.u.stream_data_blocked.stream_id, 4);
+    check_int("sdb lim",  (long)f.u.stream_data_blocked.limit,     512);
+
+    n = quic_frame_streams_blocked_encode(buf, sizeof buf, 0, 10);
+    quic_frame_decode(buf, n, &f);
+    check_int("sb_bidi type", f.type, QUIC_FT_STREAMS_BLOCK_BIDI);
+    check_int("sb_bidi limit", (long)f.u.streams_blocked.limit, 10);
+
+    n = quic_frame_streams_blocked_encode(buf, sizeof buf, 1, 5);
+    quic_frame_decode(buf, n, &f);
+    check_int("sb_uni type", f.type, QUIC_FT_STREAMS_BLOCK_UNI);
+    check_int("sb_uni limit", (long)f.u.streams_blocked.limit, 5);
+}
+
+static void test_aux_new_conn_id_roundtrip(void) {
+    printf("== aux: NEW_CONNECTION_ID round-trip ==\n");
+    uint8_t buf[64];
+    uint8_t cid[8]   = { 0xde, 0xad, 0xbe, 0xef, 0x01, 0x02, 0x03, 0x04 };
+    uint8_t token[16];
+    for (int i = 0; i < 16; i++) token[i] = (uint8_t)(i * 17);
+    size_t n = quic_frame_new_conn_id_encode(buf, sizeof buf,
+                                             3, 1, cid, sizeof cid, token);
+    /* 1 (type) + 1 (seq) + 1 (rpt) + 1 (cid_len) + 8 (cid) + 16 (token). */
+    check_int("nci encoded len", (long)n, 1 + 1 + 1 + 1 + 8 + 16);
+    quic_frame_t f;
+    size_t c = quic_frame_decode(buf, n, &f);
+    check_int("nci consumed", (long)c, (long)n);
+    check_int("nci type", f.type, QUIC_FT_NEW_CONNECTION_ID);
+    check_int("nci seq",  (long)f.u.new_conn_id.seq_no,          3);
+    check_int("nci rpt",  (long)f.u.new_conn_id.retire_prior_to, 1);
+    check_int("nci cid_len", f.u.new_conn_id.cid_len, 8);
+    check_eq("nci cid",   f.u.new_conn_id.cid, cid, 8);
+    check_eq("nci token", f.u.new_conn_id.stateless_reset_token, token, 16);
+
+    /* Negative: cid_len=0 must be rejected. */
+    uint8_t bad[] = { 0x18, 0x00, 0x00, 0x00,  /* type+seq+rpt+cid_len=0 */
+                      0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0 };
+    c = quic_frame_decode(bad, sizeof bad, &f);
+    check_int("nci cid_len=0 rejected", c == QUIC_FRAME_DECODE_ERROR, 1);
+    /* Negative: cid_len=21 must be rejected. */
+    uint8_t bad2[40] = { 0x18, 0x00, 0x00, 21 };
+    c = quic_frame_decode(bad2, sizeof bad2, &f);
+    check_int("nci cid_len=21 rejected", c == QUIC_FRAME_DECODE_ERROR, 1);
+    /* Negative: retire_prior_to > seq must be rejected. */
+    uint8_t bad3[] = { 0x18, 0x01, 0x05, 1, 0xaa,
+                       0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0 };
+    c = quic_frame_decode(bad3, sizeof bad3, &f);
+    check_int("nci rpt>seq rejected", c == QUIC_FRAME_DECODE_ERROR, 1);
+}
+
+static void test_aux_retire_conn_id_and_path(void) {
+    printf("== aux: RETIRE_CONNECTION_ID / PATH_CHALLENGE / PATH_RESPONSE ==\n");
+    uint8_t buf[16];
+    quic_frame_t f;
+
+    size_t n = quic_frame_retire_conn_id_encode(buf, sizeof buf, 7);
+    quic_frame_decode(buf, n, &f);
+    check_int("rci type", f.type, QUIC_FT_RETIRE_CONN_ID);
+    check_int("rci seq",  (long)f.u.retire_conn_id.seq_no, 7);
+
+    uint8_t data[8] = { 1, 2, 3, 4, 5, 6, 7, 8 };
+    n = quic_frame_path_challenge_encode(buf, sizeof buf, data);
+    check_int("path_chall encoded len", (long)n, 9);
+    quic_frame_decode(buf, n, &f);
+    check_int("path_chall type", f.type, QUIC_FT_PATH_CHALLENGE);
+    check_eq("path_chall data", f.u.path.data, data, 8);
+
+    n = quic_frame_path_response_encode(buf, sizeof buf, data);
+    quic_frame_decode(buf, n, &f);
+    check_int("path_resp type", f.type, QUIC_FT_PATH_RESPONSE);
+    check_eq("path_resp data", f.u.path.data, data, 8);
+}
+
+static void test_special_stateless_reset_build_match(void) {
+    printf("== special: stateless reset build + detect ==\n");
+    uint8_t token[16];
+    for (int i = 0; i < 16; i++) token[i] = (uint8_t)(0xa0 + i);
+    uint8_t rand_buf[64];
+    for (size_t i = 0; i < sizeof rand_buf; i++) rand_buf[i] = (uint8_t)(i ^ 0x55);
+
+    uint8_t out[40];
+    size_t n = quic_stateless_reset_build(out, sizeof out,
+                                          rand_buf, sizeof rand_buf, token);
+    check_int("sr length", (long)n, 40);
+    check_int("sr fixed bit set",  (out[0] & 0x40) != 0, 1);
+    check_int("sr form bit clear", (out[0] & 0x80) == 0, 1);
+    check_eq("sr token tail", out + n - 16, token, 16);
+
+    check_int("sr detect own packet", quic_stateless_reset_match(out, n, token), 1);
+    /* Mutate one tail byte → no match. */
+    out[n - 5] ^= 0x01;
+    check_int("sr mutated rejected", quic_stateless_reset_match(out, n, token), 0);
+    /* Too-short packet → no match. */
+    check_int("sr short rejected",
+              quic_stateless_reset_match(out, 15, token), 0);
+
+    /* Capacity below minimum rejected. */
+    check_int("sr below min rejected",
+              (long)quic_stateless_reset_build(out, 21, rand_buf, sizeof rand_buf, token), 0);
+    /* Insufficient randomness rejected. */
+    check_int("sr insufficient rand rejected",
+              (long)quic_stateless_reset_build(out, 30, rand_buf, 5, token), 0);
+}
+
+static void test_special_version_negotiation(void) {
+    printf("== special: version negotiation packet ==\n");
+    uint8_t cdcid[8] = { 1,2,3,4,5,6,7,8 };
+    uint8_t cscid[4] = { 0xaa,0xbb,0xcc,0xdd };
+    uint32_t versions[3] = { 0x00000001u, 0x709a50c4u /* Greasing */, 0xff00001du };
+    uint8_t out[64];
+    size_t n = quic_version_negotiation_build(out, sizeof out,
+                                              0x55,
+                                              cdcid, sizeof cdcid,
+                                              cscid, sizeof cscid,
+                                              versions, 3);
+    /* 1 + 4 + 1 + 4 (echoed scid as dcid) + 1 + 8 (echoed dcid as scid)
+     * + 3*4 versions = 31. */
+    check_int("vn length", (long)n, 31);
+    check_int("vn form bit set", (out[0] & 0x80) != 0, 1);
+    /* Version field = 0. */
+    check_int("vn ver byte 1", out[1], 0);
+    check_int("vn ver byte 2", out[2], 0);
+    check_int("vn ver byte 3", out[3], 0);
+    check_int("vn ver byte 4", out[4], 0);
+    /* dcid_len echoes client SCID (4). */
+    check_int("vn dcid_len", out[5], 4);
+    check_eq("vn dcid bytes", out + 6, cscid, 4);
+    /* scid_len echoes client DCID (8). */
+    check_int("vn scid_len", out[10], 8);
+    check_eq("vn scid bytes", out + 11, cdcid, 8);
+    /* Versions 1..3 at offsets 19, 23, 27 big-endian. */
+    check_int("vn v0[0]", out[19], 0x00);
+    check_int("vn v0[3]", out[22], 0x01);
+    check_int("vn v2[0]", out[27], 0xff);
+    check_int("vn v2[3]", out[30], 0x1d);
+}
+
+static void test_special_idle_expired(void) {
+    printf("== special: idle timeout helper ==\n");
+    /* 30s timeout, last recv at t=1_000_000us, now t=20_000_000us → not expired. */
+    check_int("not yet expired",
+              quic_idle_expired(1000000, 30000000, 20000000), 0);
+    check_int("just expired",
+              quic_idle_expired(1000000, 30000000, 31000000), 1);
+    check_int("disabled timeout",
+              quic_idle_expired(1000000, 0, 999999999), 0);
+    check_int("clock backwards safe",
+              quic_idle_expired(1000000, 30000000, 500000), 0);
+}
+
+/* ============================================================== */
 
 
 int main(void) {
@@ -1138,6 +1357,16 @@ int main(void) {
     test_cc_persistent_congestion();
     test_flow_basic();
     test_flow_should_update();
+
+    test_aux_reset_stream_roundtrip();
+    test_aux_stop_sending_roundtrip();
+    test_aux_max_frames_roundtrip();
+    test_aux_blocked_frames_roundtrip();
+    test_aux_new_conn_id_roundtrip();
+    test_aux_retire_conn_id_and_path();
+    test_special_stateless_reset_build_match();
+    test_special_version_negotiation();
+    test_special_idle_expired();
 
     printf("\n=== RESULTS: PASS=%d FAIL=%d ===\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
