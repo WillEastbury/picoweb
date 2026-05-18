@@ -3,6 +3,7 @@
 #include "api.h"
 #include "picowal_db.h"
 #include "picowal_query.h"
+#include "picowal_validate.h"
 
 #include <ctype.h>
 #include <errno.h>
@@ -792,6 +793,391 @@ static bool picowal_path_to_key(const char* coll, size_t coll_len,
     return picowal_db_pack_key((uint16_t)card, record, out_key);
 }
 
+static void trim_inplace(char* s) {
+    if (!s) return;
+    size_t n = strlen(s);
+    while (n > 0 && isspace((unsigned char)s[n - 1])) s[--n] = '\0';
+    size_t i = 0;
+    while (s[i] && isspace((unsigned char)s[i])) i++;
+    if (i > 0) memmove(s, s + i, strlen(s + i) + 1);
+}
+
+static bool csv_has_token(const char* csv, const char* token) {
+    if (!csv || !token || !*token) return false;
+    char tmp[512];
+    snprintf(tmp, sizeof(tmp), "%s", csv);
+    char* save = NULL;
+    for (char* t = strtok_r(tmp, ",", &save); t; t = strtok_r(NULL, ",", &save)) {
+        trim_inplace(t);
+        if (strcmp(t, token) == 0) return true;
+    }
+    return false;
+}
+
+static bool schema_relation_pack_for_field(const char* joins_csv, const char* field, uint16_t* out_pack) {
+    if (!joins_csv || !field || !out_pack) return false;
+    char tmp[512];
+    snprintf(tmp, sizeof(tmp), "%s", joins_csv);
+    char* save = NULL;
+    for (char* t = strtok_r(tmp, ",", &save); t; t = strtok_r(NULL, ",", &save)) {
+        trim_inplace(t);
+        char* sep = strchr(t, '=');
+        if (!sep) sep = strchr(t, ':');
+        if (!sep) continue;
+        *sep = '\0';
+        char* p = t;
+        char* f = sep + 1;
+        trim_inplace(p);
+        trim_inplace(f);
+        uint32_t pid = 0;
+        if (!parse_u32_dec(p, strlen(p), PICOWAL_CARD_MAX, &pid)) continue;
+        if (strcmp(f, field) != 0) continue;
+        *out_pack = (uint16_t)pid;
+        return true;
+    }
+    return false;
+}
+
+static bool picowal_read_meta_json(uint16_t meta_pack, uint32_t pack_id, char* out, size_t out_cap) {
+    uint32_t key = 0;
+    if (!picowal_db_pack_key(meta_pack, pack_id, &key)) return false;
+    int n = picowal_db_get_key(g_picowal, key, out, (uint32_t)(out_cap - 1));
+    if (n < 0) return false;
+    out[n] = '\0';
+    return true;
+}
+
+static bool picowal_build_form_spec(uint32_t pack_id, char** out_json, size_t* out_len,
+                                    int* out_status, char* err, size_t err_cap) {
+    if (!out_json || !out_len) return false;
+    *out_json = NULL;
+    *out_len = 0;
+    if (out_status) *out_status = 500;
+
+    char schema[4097];
+    if (!picowal_read_meta_json(2, pack_id, schema, sizeof(schema))) {
+        if (out_status) *out_status = 404;
+        snprintf(err, err_cap, "schema not found");
+        return false;
+    }
+    char fields_csv[1024];
+    if (!json_extract_string_field(schema, "fields", fields_csv, sizeof(fields_csv)) || !fields_csv[0]) {
+        if (out_status) *out_status = 400;
+        snprintf(err, err_cap, "schema fields missing");
+        return false;
+    }
+    char required_csv[512] = {0};
+    (void)json_extract_string_field(schema, "required", required_csv, sizeof(required_csv));
+    char joins_csv[512] = {0};
+    (void)json_extract_string_field(schema, "joins", joins_csv, sizeof(joins_csv));
+
+    char name_doc[4097];
+    char pack_name[128] = {0};
+    if (picowal_read_meta_json(1, pack_id, name_doc, sizeof(name_doc))) {
+        (void)json_extract_string_field(name_doc, "name", pack_name, sizeof(pack_name));
+    }
+
+    size_t cap = PICOWAL_DATA_MAX * 2;
+    char* out = (char*)malloc(cap);
+    if (!out) {
+        if (out_status) *out_status = 500;
+        snprintf(err, err_cap, "oom");
+        return false;
+    }
+
+    size_t o = 0;
+    int n = 0;
+    if (pack_name[0]) {
+        n = snprintf(out + o, cap - o, "{\"pack\":%u,\"entity\":\"%s\",\"fields\":[", pack_id, pack_name);
+    } else {
+        n = snprintf(out + o, cap - o, "{\"pack\":%u,\"entity\":null,\"fields\":[", pack_id);
+    }
+    if (n <= 0 || (size_t)n >= cap - o) { free(out); snprintf(err, err_cap, "render failed"); return false; }
+    o += (size_t)n;
+
+    char fields_copy[1024];
+    snprintf(fields_copy, sizeof(fields_copy), "%s", fields_csv);
+    char* save = NULL;
+    bool first = true;
+    for (char* t = strtok_r(fields_copy, ",", &save); t; t = strtok_r(NULL, ",", &save)) {
+        trim_inplace(t);
+        if (!t[0]) continue;
+        bool required = required_csv[0] && csv_has_token(required_csv, t);
+        uint16_t rel_pack = 0;
+        bool is_rel = joins_csv[0] && schema_relation_pack_for_field(joins_csv, t, &rel_pack);
+        const char* input = "text";
+        if (is_rel) input = "relation";
+        else if (strlen(t) > 3 && strcmp(t + strlen(t) - 3, "_id") == 0) input = "number";
+
+        n = snprintf(out + o, cap - o, "%s{\"name\":\"%s\",\"input\":\"%s\",\"required\":%s",
+                     first ? "" : ",", t, input, required ? "true" : "false");
+        if (n <= 0 || (size_t)n >= cap - o) { free(out); snprintf(err, err_cap, "render failed"); return false; }
+        o += (size_t)n;
+        if (is_rel) {
+            n = snprintf(out + o, cap - o, ",\"relation_pack\":%u", (unsigned)rel_pack);
+            if (n <= 0 || (size_t)n >= cap - o) { free(out); snprintf(err, err_cap, "render failed"); return false; }
+            o += (size_t)n;
+        }
+        n = snprintf(out + o, cap - o, "}");
+        if (n <= 0 || (size_t)n >= cap - o) { free(out); snprintf(err, err_cap, "render failed"); return false; }
+        o += (size_t)n;
+        first = false;
+    }
+
+    n = snprintf(out + o, cap - o,
+                 "],\"actions\":{\"create\":\"%s%u\",\"update\":\"%s%u/{record}\"}}",
+                 g_picowal_prefix, pack_id, g_picowal_prefix, pack_id);
+    if (n <= 0 || (size_t)n >= cap - o) { free(out); snprintf(err, err_cap, "render failed"); return false; }
+    o += (size_t)n;
+
+    *out_json = out;
+    *out_len = o;
+    return true;
+}
+
+static bool json_escape_copy(const char* src, char* out, size_t out_cap) {
+    if (!src || !out || out_cap < 2) return false;
+    size_t o = 0;
+    for (const unsigned char* p = (const unsigned char*)src; *p; p++) {
+        const char* esc = NULL;
+        char one[2] = {(char)*p, '\0'};
+        if (*p == '"' || *p == '\\') {
+            one[0] = (char)*p;
+            esc = one;
+            if (o + 2 >= out_cap) return false;
+            out[o++] = '\\';
+            out[o++] = *esc;
+            continue;
+        }
+        if (*p == '\n') esc = "n";
+        else if (*p == '\r') esc = "r";
+        else if (*p == '\t') esc = "t";
+        else if (*p < 0x20) esc = " ";
+        if (esc) {
+            if (esc[0] == ' ') {
+                if (o + 1 >= out_cap) return false;
+                out[o++] = ' ';
+            } else {
+                if (o + 2 >= out_cap) return false;
+                out[o++] = '\\';
+                out[o++] = esc[0];
+            }
+            continue;
+        }
+        if (o + 1 >= out_cap) return false;
+        out[o++] = (char)*p;
+    }
+    out[o] = '\0';
+    return true;
+}
+
+static bool picowal_build_report(const char* body, size_t body_len,
+                                 char** out_json, size_t* out_len,
+                                 int* out_status, char* err, size_t err_cap) {
+    if (!out_json || !out_len) return false;
+    *out_json = NULL;
+    *out_len = 0;
+    if (out_status) *out_status = 400;
+    if (!body || body_len == 0 || body_len > PICOWAL_DATA_MAX) {
+        snprintf(err, err_cap, "report query body required");
+        return false;
+    }
+
+    char query_buf[PICOWAL_DATA_MAX + 1];
+    memcpy(query_buf, body, body_len);
+    query_buf[body_len] = '\0';
+
+    char title[128] = {0};
+    if (query_buf[0] == '{') {
+        char extracted[PICOWAL_DATA_MAX + 1];
+        if (!json_extract_string_field(query_buf, "query", extracted, sizeof(extracted))) {
+            snprintf(err, err_cap, "report JSON body requires \"query\"");
+            return false;
+        }
+        (void)json_extract_string_field(query_buf, "title", title, sizeof(title));
+        snprintf(query_buf, sizeof(query_buf), "%s", extracted);
+    }
+
+    char* result_json = NULL;
+    size_t result_len = 0;
+    char qerr[128] = {0};
+    if (!picowal_query_run(g_picowal, query_buf, &result_json, &result_len, qerr, sizeof(qerr))) {
+        snprintf(err, err_cap, "%s", qerr[0] ? qerr : "report query failed");
+        return false;
+    }
+
+    char esc_title[256] = {0};
+    bool has_title = title[0] && json_escape_copy(title, esc_title, sizeof(esc_title));
+    size_t cap = result_len + (has_title ? strlen(esc_title) : 0) + 256;
+    char* out = (char*)malloc(cap);
+    if (!out) {
+        free(result_json);
+        if (out_status) *out_status = 500;
+        snprintf(err, err_cap, "oom");
+        return false;
+    }
+    int n = snprintf(out, cap, "{\"kind\":\"report\",\"generated_at\":%lld%s%s%s,\"report\":%s}",
+                     (long long)now_unix_sec(),
+                     has_title ? ",\"title\":\"" : "",
+                     has_title ? esc_title : "",
+                     has_title ? "\"" : "",
+                     result_json);
+    free(result_json);
+    if (n <= 0 || (size_t)n >= cap) {
+        free(out);
+        if (out_status) *out_status = 500;
+        snprintf(err, err_cap, "report render failed");
+        return false;
+    }
+    if (out_status) *out_status = 200;
+    *out_json = out;
+    *out_len = (size_t)n;
+    return true;
+}
+
+static bool picowal_build_dashboard(const char* body, size_t body_len,
+                                    char** out_json, size_t* out_len,
+                                    int* out_status, char* err, size_t err_cap) {
+    if (!out_json || !out_len) return false;
+    *out_json = NULL;
+    *out_len = 0;
+    if (out_status) *out_status = 400;
+    if (!body || body_len == 0 || body_len > PICOWAL_DATA_MAX) {
+        snprintf(err, err_cap, "dashboard body required");
+        return false;
+    }
+
+    typedef struct {
+        char title[96];
+        char* report_json;
+        size_t report_len;
+        bool ok;
+        char error[160];
+    } panel_result_t;
+
+    panel_result_t panels[8];
+    memset(panels, 0, sizeof(panels));
+    size_t panel_count = 0;
+
+    char text[PICOWAL_DATA_MAX + 1];
+    memcpy(text, body, body_len);
+    text[body_len] = '\0';
+    for (size_t i = 0; i < body_len; i++) if (text[i] == '\r') text[i] = '\n';
+
+    const char* cursor = text;
+    while (*cursor && panel_count < (sizeof(panels) / sizeof(panels[0]))) {
+        const char* sep = strstr(cursor, "\n---\n");
+        size_t seg_len = sep ? (size_t)(sep - cursor) : strlen(cursor);
+        char seg[PICOWAL_DATA_MAX + 1];
+        if (seg_len >= sizeof(seg)) seg_len = sizeof(seg) - 1;
+        memcpy(seg, cursor, seg_len);
+        seg[seg_len] = '\0';
+        trim_inplace(seg);
+        if (seg[0]) {
+            panel_result_t* pr = &panels[panel_count];
+            snprintf(pr->title, sizeof(pr->title), "Panel %u", (unsigned)(panel_count + 1));
+            char* qtxt = seg;
+            char* nl = strchr(seg, '\n');
+            if (strncmp(seg, "T:", 2) == 0) {
+                if (nl) {
+                    *nl = '\0';
+                    char* t = seg + 2;
+                    trim_inplace(t);
+                    if (t[0]) snprintf(pr->title, sizeof(pr->title), "%s", t);
+                    qtxt = nl + 1;
+                } else {
+                    qtxt = seg + 2;
+                }
+                trim_inplace(qtxt);
+            }
+
+            char qerr[128] = {0};
+            pr->ok = picowal_query_run(g_picowal, qtxt, &pr->report_json, &pr->report_len, qerr, sizeof(qerr));
+            if (!pr->ok) {
+                char esc_err[128] = {0};
+                const char* src_err = qerr[0] ? qerr : "query failed";
+                if (!json_escape_copy(src_err, esc_err, sizeof(esc_err))) snprintf(esc_err, sizeof(esc_err), "query failed");
+                snprintf(pr->error, sizeof(pr->error), "%s", esc_err);
+            }
+            panel_count++;
+        }
+        if (!sep) break;
+        cursor = sep + 5;
+    }
+
+    if (panel_count == 0) {
+        snprintf(err, err_cap, "dashboard requires at least one panel query");
+        return false;
+    }
+
+    size_t cap = 256;
+    for (size_t i = 0; i < panel_count; i++) {
+        cap += 256 + (panels[i].ok ? panels[i].report_len : strlen(panels[i].error));
+    }
+    char* out = (char*)malloc(cap);
+    if (!out) {
+        for (size_t i = 0; i < panel_count; i++) free(panels[i].report_json);
+        if (out_status) *out_status = 500;
+        snprintf(err, err_cap, "oom");
+        return false;
+    }
+
+    size_t o = 0;
+    int n = snprintf(out + o, cap - o, "{\"kind\":\"dashboard\",\"generated_at\":%lld,\"panels\":[",
+                     (long long)now_unix_sec());
+    if (n <= 0 || (size_t)n >= cap - o) {
+        free(out);
+        for (size_t i = 0; i < panel_count; i++) free(panels[i].report_json);
+        if (out_status) *out_status = 500;
+        snprintf(err, err_cap, "dashboard render failed");
+        return false;
+    }
+    o += (size_t)n;
+
+    for (size_t i = 0; i < panel_count; i++) {
+        char esc_title[192] = {0};
+        if (!json_escape_copy(panels[i].title, esc_title, sizeof(esc_title))) snprintf(esc_title, sizeof(esc_title), "Panel");
+        n = snprintf(out + o, cap - o, "%s{\"panel\":%u,\"title\":\"%s\",",
+                     (i == 0 ? "" : ","), (unsigned)(i + 1), esc_title);
+        if (n <= 0 || (size_t)n >= cap - o) {
+            free(out);
+            for (size_t j = 0; j < panel_count; j++) free(panels[j].report_json);
+            if (out_status) *out_status = 500;
+            snprintf(err, err_cap, "dashboard render failed");
+            return false;
+        }
+        o += (size_t)n;
+        if (panels[i].ok) {
+            n = snprintf(out + o, cap - o, "\"report\":%s}", panels[i].report_json);
+        } else {
+            n = snprintf(out + o, cap - o, "\"error\":\"%s\"}", panels[i].error);
+        }
+        if (n <= 0 || (size_t)n >= cap - o) {
+            free(out);
+            for (size_t j = 0; j < panel_count; j++) free(panels[j].report_json);
+            if (out_status) *out_status = 500;
+            snprintf(err, err_cap, "dashboard render failed");
+            return false;
+        }
+        o += (size_t)n;
+    }
+    n = snprintf(out + o, cap - o, "]}");
+    if (n <= 0 || (size_t)n >= cap - o) {
+        free(out);
+        for (size_t i = 0; i < panel_count; i++) free(panels[i].report_json);
+        if (out_status) *out_status = 500;
+        snprintf(err, err_cap, "dashboard render failed");
+        return false;
+    }
+    o += (size_t)n;
+
+    for (size_t i = 0; i < panel_count; i++) free(panels[i].report_json);
+    if (out_status) *out_status = 200;
+    *out_json = out;
+    *out_len = o;
+    return true;
+}
+
 static int copy_segment_name(char* out, size_t cap, const char* in, size_t in_len) {
     if (!out || !in || in_len == 0 || in_len + 1 > cap) return ENAMETOOLONG;
     memcpy(out, in, in_len);
@@ -1338,6 +1724,82 @@ static void dispatch_picowal(http_method_t method,
         return;
     }
 
+    if (path_len > g_picowal_prefix_len + 6 &&
+        memcmp(path + g_picowal_prefix_len, "forms/", 6) == 0) {
+        if (!(method == M_GET || method == M_HEAD)) {
+            resp_status_only(resp, 405, "Method Not Allowed");
+            return;
+        }
+        const char* seg = path + g_picowal_prefix_len + 6;
+        size_t seg_len = path_len - (g_picowal_prefix_len + 6);
+        if (seg_len == 0 || memchr(seg, '/', seg_len) != NULL) {
+            resp_text_error(resp, 400, "Bad Request", "invalid forms path\n");
+            return;
+        }
+        uint32_t pack_id = 0;
+        if (!parse_u32_dec(seg, seg_len, PICOWAL_CARD_MAX, &pack_id)) {
+            resp_text_error(resp, 400, "Bad Request", "invalid form pack id\n");
+            return;
+        }
+        char* form_json = NULL;
+        size_t form_len = 0;
+        int status = 500;
+        char err[128] = {0};
+        if (!picowal_build_form_spec(pack_id, &form_json, &form_len, &status, err, sizeof(err))) {
+            if (!err[0]) snprintf(err, sizeof(err), "form generation failed");
+            if (status == 404) {
+                resp_status_only(resp, 404, "Not Found");
+            } else if (status == 400) {
+                resp_text_error(resp, 400, "Bad Request", err);
+            } else {
+                resp_text_error(resp, 500, "Internal Server Error", err);
+            }
+            return;
+        }
+        resp_get_body(resp, form_json, form_len, method == M_HEAD);
+        return;
+    }
+
+    if (path_len == g_picowal_prefix_len + 6 &&
+        memcmp(path + g_picowal_prefix_len, "report", 6) == 0) {
+        if (method != M_POST) {
+            resp_status_only(resp, 405, "Method Not Allowed");
+            return;
+        }
+        char* out = NULL;
+        size_t out_len = 0;
+        int status = 500;
+        char err[128] = {0};
+        if (!picowal_build_report(body, body_len, &out, &out_len, &status, err, sizeof(err))) {
+            if (!err[0]) snprintf(err, sizeof(err), "report generation failed");
+            if (status == 400) resp_text_error(resp, 400, "Bad Request", err);
+            else resp_text_error(resp, 500, "Internal Server Error", err);
+            return;
+        }
+        resp_get_body(resp, out, out_len, false);
+        return;
+    }
+
+    if (path_len == g_picowal_prefix_len + 9 &&
+        memcmp(path + g_picowal_prefix_len, "dashboard", 9) == 0) {
+        if (method != M_POST) {
+            resp_status_only(resp, 405, "Method Not Allowed");
+            return;
+        }
+        char* out = NULL;
+        size_t out_len = 0;
+        int status = 500;
+        char err[128] = {0};
+        if (!picowal_build_dashboard(body, body_len, &out, &out_len, &status, err, sizeof(err))) {
+            if (!err[0]) snprintf(err, sizeof(err), "dashboard generation failed");
+            if (status == 400) resp_text_error(resp, 400, "Bad Request", err);
+            else resp_text_error(resp, 500, "Internal Server Error", err);
+            return;
+        }
+        resp_get_body(resp, out, out_len, false);
+        return;
+    }
+
     if (path_len > g_picowal_prefix_len + 7 &&
         memcmp(path + g_picowal_prefix_len, "schema/", 7) == 0) {
         dispatch_picowal_pack_record(method, 2,
@@ -1429,6 +1891,18 @@ static void dispatch_picowal(http_method_t method,
             resp_text_error(resp, 400, "Bad Request", "invalid card/record\n");
             return;
         }
+        uint16_t pack_id = 0;
+        uint32_t record_id = 0;
+        picowal_db_unpack_key(key, &pack_id, &record_id);
+        int vstatus = 400;
+        char verr[160] = {0};
+        if (!picowal_validate_mutation(g_picowal, pack_id, record_id, PWV_OP_PUT,
+                                       body, body_len, &vstatus, verr, sizeof(verr))) {
+            if (vstatus == 409) resp_text_error(resp, 409, "Conflict", verr);
+            else if (vstatus == 500) resp_text_error(resp, 500, "Internal Server Error", verr);
+            else resp_text_error(resp, 400, "Bad Request", verr);
+            return;
+        }
         if (picowal_db_put_key(g_picowal, key, body, (uint32_t)body_len, false) != 0) {
             if (errno == ENOSPC) {
                 resp_text_error(resp, 507, "Insufficient Storage", "wal volume full\n");
@@ -1450,6 +1924,15 @@ static void dispatch_picowal(http_method_t method,
             uint32_t card = 0;
             if (!parse_u32_dec(coll, coll_len, PICOWAL_CARD_MAX, &card)) {
                 resp_text_error(resp, 400, "Bad Request", "invalid card\n");
+                return;
+            }
+            int vstatus = 400;
+            char verr[160] = {0};
+            if (!picowal_validate_mutation(g_picowal, (uint16_t)card, UINT32_MAX, PWV_OP_POST,
+                                           body, body_len, &vstatus, verr, sizeof(verr))) {
+                if (vstatus == 409) resp_text_error(resp, 409, "Conflict", verr);
+                else if (vstatus == 500) resp_text_error(resp, 500, "Internal Server Error", verr);
+                else resp_text_error(resp, 400, "Bad Request", verr);
                 return;
             }
             for (int attempt = 0; attempt < 32; attempt++) {
@@ -1488,6 +1971,18 @@ static void dispatch_picowal(http_method_t method,
             resp_text_error(resp, 400, "Bad Request", "invalid card/record\n");
             return;
         }
+        uint16_t pack_id = 0;
+        uint32_t record_id = 0;
+        picowal_db_unpack_key(key, &pack_id, &record_id);
+        int vstatus = 400;
+        char verr[160] = {0};
+        if (!picowal_validate_mutation(g_picowal, pack_id, record_id, PWV_OP_POST,
+                                       body, body_len, &vstatus, verr, sizeof(verr))) {
+            if (vstatus == 409) resp_text_error(resp, 409, "Conflict", verr);
+            else if (vstatus == 500) resp_text_error(resp, 500, "Internal Server Error", verr);
+            else resp_text_error(resp, 400, "Bad Request", verr);
+            return;
+        }
         if (picowal_db_put_key(g_picowal, key, body, (uint32_t)body_len, true) != 0) {
             if (errno == EEXIST) { resp_status_only(resp, 409, "Conflict"); return; }
             if (errno == ENOSPC) {
@@ -1509,6 +2004,18 @@ static void dispatch_picowal(http_method_t method,
         uint32_t key = 0;
         if (!picowal_path_to_key(coll, coll_len, id, id_len, &key)) {
             resp_text_error(resp, 400, "Bad Request", "invalid card/record\n");
+            return;
+        }
+        uint16_t pack_id = 0;
+        uint32_t record_id = 0;
+        picowal_db_unpack_key(key, &pack_id, &record_id);
+        int vstatus = 400;
+        char verr[160] = {0};
+        if (!picowal_validate_mutation(g_picowal, pack_id, record_id, PWV_OP_DELETE,
+                                       NULL, 0, &vstatus, verr, sizeof(verr))) {
+            if (vstatus == 409) resp_text_error(resp, 409, "Conflict", verr);
+            else if (vstatus == 500) resp_text_error(resp, 500, "Internal Server Error", verr);
+            else resp_text_error(resp, 400, "Bad Request", verr);
             return;
         }
         if (picowal_db_delete_key(g_picowal, key) != 0) {

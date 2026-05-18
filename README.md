@@ -193,11 +193,15 @@ maps keys as `card`/`record` integers:
 - `record`: `0..4194303`
 - route shape: `/{prefix}{card}/{record}` (default `/wal/{card}/{record}`)
 - query endpoint: `POST /wal/query` with picowal query text (`S:`, `F:`, `W:`) including joined pack references
+- report endpoint: `POST /wal/report` (query DSL body, or JSON `{"query":"..."}`) returns wrapped report JSON
+- dashboard endpoint: `POST /wal/dashboard` (multiple query panels separated by `---`; optional `T:` title per panel)
 - schema endpoint: `/wal/schema/{pack}` (`PUT/GET/HEAD/DELETE`, `POST` create-only)
 - metadata wrappers:
   - `/wal/metadata/name/{pack}` → pack 1
   - `/wal/metadata/schema/{pack}` → pack 2
   - `/wal/metadata/{pack}` → combined fetch (`pack1` + `pack2`)
+- metadata-derived form spec:
+  - `/wal/forms/{pack}` (`GET/HEAD`) → returns a renderable form schema inferred from pack 2 `fields`/`joins` (+ pack 1 `name`)
 - auth endpoints (when `--oidc-cookie-auth` is enabled):
   - `POST /wal/auth/login` body: `{"provider":"google|entra","access_token":"..."}`  
     validates token with provider, then sets short-lived `HttpOnly` cookie
@@ -215,6 +219,16 @@ maps keys as `card`/`record` integers:
     - `X-PW-Principal-Id`
     - `X-PW-Tenant-Id`
     - `X-PW-Tenant-System`
+
+picowal mutation validation (`PUT/POST/DELETE` for non-system packs) is schema-driven
+from pack 2 metadata and enforces:
+
+- lookup referential integrity (`joins`: `<targetPack>=<fk_field>` CSV)
+- required fields (`required`: CSV)
+- type checks (`types`: `field=type;...` where type is `string|number|boolean|object|array` and `?` allows null)
+- email checks (`email`: CSV field list)
+- regex checks (`regex`: `field=pattern;...`)
+- transition rules (`transitions`: `field=from>to|from2>to2;...`)
 
 Query language (multi-line body):
 

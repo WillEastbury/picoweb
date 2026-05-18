@@ -92,7 +92,7 @@ assert_code 204 "PUT  metadata name orders" -X PUT --data '{"name":"orders","pac
             "http://127.0.0.1:$PORT/wal/metadata/name/12"
 assert_code 204 "PUT  metadata name countries" -X PUT --data '{"name":"countries","pack":13}' \
             "http://127.0.0.1:$PORT/wal/metadata/name/13"
-assert_code 204 "PUT  metadata schema orders" -X PUT --data '{"fields":"name,13_id","joins":"13=13_id"}' \
+assert_code 204 "PUT  metadata schema orders" -X PUT --data '{"fields":"name,13_id,status,email","required":"name,13_id,status","joins":"13=13_id","types":"name=string;13_id=number;status=string;email=string?","email":"email","regex":"status=^(Placed|Shipped|Delivered)$","transitions":"status=Placed>Shipped|Shipped>Delivered"}' \
             "http://127.0.0.1:$PORT/wal/metadata/schema/12"
 assert_code 204 "PUT  metadata schema countries" -X PUT --data '{"fields":"city,country"}' \
             "http://127.0.0.1:$PORT/wal/metadata/schema/13"
@@ -108,6 +108,38 @@ else
     fail=$((fail + 1))
 fi
 
+assert_code 200 "GET  form orders" "http://127.0.0.1:$PORT/wal/forms/12"
+form_out=$(cat /tmp/picowal-test-body)
+if echo "$form_out" | grep -q '"pack":12' && \
+   echo "$form_out" | grep -q '"entity":"orders"' && \
+   echo "$form_out" | grep -q '"name":"name"' && \
+   echo "$form_out" | grep -q '"name":"13_id"' && \
+   echo "$form_out" | grep -q '"relation_pack":13'; then
+    echo "ok   metadata form output"
+else
+    echo "FAIL metadata form output: $form_out"
+    fail=$((fail + 1))
+fi
+
+assert_code 404 "GET  form missing schema" "http://127.0.0.1:$PORT/wal/forms/77"
+
+assert_code 204 "validation good write" -X PUT --data '{"name":"Cara","13_id":1,"status":"Placed","email":"cara@example.com"}' \
+            "http://127.0.0.1:$PORT/wal/12/150"
+assert_code 409 "validation lookup missing" -X PUT --data '{"name":"Dana","13_id":999,"status":"Placed"}' \
+            "http://127.0.0.1:$PORT/wal/12/151"
+assert_code 400 "validation required missing" -X PUT --data '{"name":"Eli","13_id":1}' \
+            "http://127.0.0.1:$PORT/wal/12/152"
+assert_code 400 "validation regex fail" -X PUT --data '{"name":"Finn","13_id":1,"status":"Unknown"}' \
+            "http://127.0.0.1:$PORT/wal/12/153"
+assert_code 400 "validation email fail" -X PUT --data '{"name":"Gia","13_id":1,"status":"Placed","email":"bad-email"}' \
+            "http://127.0.0.1:$PORT/wal/12/154"
+assert_code 409 "validation transition blocked" -X PUT --data '{"name":"Cara","13_id":1,"status":"Delivered","email":"cara@example.com"}' \
+            "http://127.0.0.1:$PORT/wal/12/150"
+assert_code 204 "validation transition allowed" -X PUT --data '{"name":"Cara","13_id":1,"status":"Shipped","email":"cara@example.com"}' \
+            "http://127.0.0.1:$PORT/wal/12/150"
+assert_code 409 "validation delete ref blocked" -X DELETE \
+            "http://127.0.0.1:$PORT/wal/13/1"
+
 query_body=$'S:name,countries.city\nF:orders,countries\nW:countries.country|==|UK'
 assert_code 200 "POST query join named packs" -X POST --data-binary "$query_body" \
             "http://127.0.0.1:$PORT/wal/query"
@@ -118,6 +150,31 @@ if echo "$query_out" | grep -q '"name":"Ann"' && \
     echo "ok   query join output (named packs + schema)"
 else
     echo "FAIL query join output: $query_out"
+    fail=$((fail + 1))
+fi
+
+assert_code 200 "POST report endpoint" -X POST --data-binary "$query_body" \
+            "http://127.0.0.1:$PORT/wal/report"
+report_out=$(cat /tmp/picowal-test-body)
+if echo "$report_out" | grep -q '"kind":"report"' && \
+   echo "$report_out" | grep -q '"report":' && \
+   echo "$report_out" | grep -q '"count":'; then
+    echo "ok   report output"
+else
+    echo "FAIL report output: $report_out"
+    fail=$((fail + 1))
+fi
+
+dashboard_body=$'T:Open Orders\nS:name\nF:orders\n---\nT:Broken Panel\nS:name\nF:missingpack'
+assert_code 200 "POST dashboard endpoint" -X POST --data-binary "$dashboard_body" \
+            "http://127.0.0.1:$PORT/wal/dashboard"
+dash_out=$(cat /tmp/picowal-test-body)
+if echo "$dash_out" | grep -q '"kind":"dashboard"' && \
+   echo "$dash_out" | grep -q '"panels":' && \
+   echo "$dash_out" | grep -q '"error":'; then
+    echo "ok   dashboard output"
+else
+    echo "FAIL dashboard output: $dash_out"
     fail=$((fail + 1))
 fi
 
