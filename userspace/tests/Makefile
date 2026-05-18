@@ -45,8 +45,19 @@ CRYPTO_SRC := \
 QUIC_PRIM_SRC := \
     ../udp/udp.c                 \
     ../tcp/ip.c                  \
+    ../crypto/util.c             \
+    ../crypto/cpuid.c            \
+    ../crypto/sha256.c           \
+    ../crypto/sha256_shani.c     \
+    ../crypto/sha256_armv8.c     \
+    ../crypto/hmac.c             \
+    ../crypto/hkdf.c             \
     ../crypto/aes.c              \
-    ../crypto/aes_gcm.c
+    ../crypto/aes_gcm.c          \
+    ../tls/keysched.c            \
+    ../quic/varint.c             \
+    ../quic/initial.c            \
+    ../quic/packet.c
 
 .PHONY: all clean test
 
