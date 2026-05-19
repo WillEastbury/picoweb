@@ -67,6 +67,18 @@ echo '=== TEST 7: /health works ==='
 curl -sS -i -H 'Host: localhost' http://127.0.0.1:8080/health
 
 echo
+echo '=== TEST 8: app generator pages are served ==='
+forms_code=$(curl -sS -o /tmp/pw-forms-body -w '%{http_code}' -H 'Host: localhost' http://127.0.0.1:8080/forms.html)
+app_code=$(curl -sS -o /tmp/pw-app-body -w '%{http_code}' -H 'Host: localhost' http://127.0.0.1:8080/app.html)
+js_code=$(curl -sS -o /tmp/pw-app-js-body -w '%{http_code}' -H 'Host: localhost' http://127.0.0.1:8080/js/picowal-app-shell.js)
+if [ "$forms_code" != "200" ] || [ "$app_code" != "200" ] || [ "$js_code" != "200" ]; then
+  echo "FAIL app generator static assets forms=$forms_code app=$app_code js=$js_code"
+  kill $SVR_PID 2>/dev/null || true
+  exit 1
+fi
+echo "ok   app generator assets served"
+
+echo
 echo '=== Quick benchmark to confirm no regression ==='
 which wrk >/dev/null && wrk -t2 -c64 -d3s -H 'Host: localhost' http://127.0.0.1:8080/ || echo '(wrk not installed)'
 

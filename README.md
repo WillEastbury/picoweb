@@ -193,6 +193,7 @@ maps keys as `card`/`record` integers:
 - `record`: `0..4194303`
 - route shape: `/{prefix}{card}/{record}` (default `/wal/{card}/{record}`)
 - query endpoint: `POST /wal/query` with picowal query text (`S:`, `F:`, `W:`) including joined pack references
+- list endpoint: `GET /wal/list/{pack}` returns `{pack, records:[{record,data}], count}` for app-shell list views
 - report endpoint: `POST /wal/report` (query DSL body, or JSON `{"query":"..."}`) returns wrapped report JSON
 - dashboard endpoint: `POST /wal/dashboard` (multiple query panels separated by `---`; optional `T:` title per panel)
 - schema endpoint: `/wal/schema/{pack}` (`PUT/GET/HEAD/DELETE`, `POST` create-only)
@@ -201,8 +202,17 @@ maps keys as `card`/`record` integers:
   - `/wal/metadata/schema/{pack}` → pack 2
   - `/wal/metadata/{pack}` → combined fetch (`pack1` + `pack2`)
 - metadata-derived form spec:
-  - `/wal/forms/{pack}` (`GET/HEAD`) → returns a minimal JS handoff payload: `{pack, entity, schema}` where `schema` is pack 2 metadata as-is
+  - `/wal/forms/{pack}` (`GET/HEAD`) → returns a minimal JS handoff payload: `{pack, entity, schema, app}` where `schema` is pack 2 metadata as-is and `app` is expanded model metadata
   - example browser client: `/forms.html` (builds controls client-side from `schema` and submits to `/wal/{pack}[/{record}]`)
+  - generated app shell: `/app.html` (metadata-driven `list/create/edit/detail` routes using browser hash navigation)
+    - includes client-side filtering, sorting, pagination, and relation browse links derived from `joins`
+    - includes host+pack local versioned config persistence (save/load/history) via browser `localStorage`
+    - includes report and dashboard builders that call `/wal/report` and `/wal/dashboard`
+    - includes browser auth wiring (`login/logout` + cookie credentials + `X-PW-Auth`)
+    - includes client-side schema validation parity for required/type/email/regex/transition/lookup checks
+  - expanded app metadata model is carried in the same response under `app` (v1), with string-config keys:
+    - `title`, `icon`, `pages`, `nav`, `list_columns`, `layout`, `actions`, `page_size`, `default_sort`
+    - `field_labels` and `field_placeholders` (`field=value;...`)
 - auth endpoints (when `--oidc-cookie-auth` is enabled):
   - `POST /wal/auth/login` body: `{"provider":"google|entra","access_token":"..."}`  
     validates token with provider, then sets short-lived `HttpOnly` cookie

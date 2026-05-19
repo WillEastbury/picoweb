@@ -14,3 +14,13 @@ button { margin-top: .75rem; padding: .35rem .75rem; }
 .pw-actions { margin-top: 1rem; padding-top: .5rem; border-top: 1px dashed #d1d5db; }
 .pw-hint { display: block; color: #555; margin-top: .35rem; }
 pre { background: #f8fafc; border: 1px solid #e5e7eb; border-radius: 6px; padding: .75rem; overflow: auto; }
+.pw-nav { display: flex; gap: .5rem; flex-wrap: wrap; margin: .5rem 0 1rem; }
+.pw-nav-link { display: inline-block; padding: .25rem .5rem; border: 1px solid #d1d5db; border-radius: 5px; text-decoration: none; color: #0b4f96; background: #fff; }
+.pw-nav-link:hover { background: #f1f5f9; }
+.pw-table { width: 100%; border-collapse: collapse; margin-top: .75rem; }
+.pw-table th, .pw-table td { border: 1px solid #e5e7eb; padding: .4rem; text-align: left; vertical-align: top; }
+.pw-list-tools { display: grid; grid-template-columns: 1fr 1fr; gap: .5rem .75rem; align-items: end; margin-top: .5rem; }
+.pw-list-pager { margin-top: .6rem; display: flex; align-items: center; gap: .6rem; }
+.pw-auth { margin: .75rem 0 1rem; padding: .75rem; border: 1px solid #e5e7eb; border-radius: 6px; background: #f8fafc; }
+.pw-auth small { display: block; margin-top: .5rem; color: #334155; }
+.pw-config-actions { display: flex; flex-wrap: wrap; gap: .5rem; margin: .5rem 0 .75rem; }

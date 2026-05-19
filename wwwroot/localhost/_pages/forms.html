@@ -1,5 +1,20 @@
 <h2>Picowal metadata form builder</h2>
 <p>Loads <code>/wal/forms/{pack}</code> and lets the browser render/submit the form.</p>
+<p><a href="/app.html">Switch to generated app shell</a></p>
+
+<section class="pw-auth">
+  <h3>Authentication</h3>
+  <label for="pw-auth-provider">Provider</label>
+  <select id="pw-auth-provider">
+    <option value="google">google</option>
+    <option value="entra">entra</option>
+  </select>
+  <label for="pw-auth-token">Access token</label>
+  <input id="pw-auth-token" type="text" placeholder="Paste provider access token">
+  <button id="pw-auth-login" type="button">Login</button>
+  <button id="pw-auth-logout" type="button">Logout</button>
+  <small id="pw-auth-status">Status: not logged in</small>
+</section>
 
 <form id="pw-config-form">
   <label for="pw-pack">Pack</label>

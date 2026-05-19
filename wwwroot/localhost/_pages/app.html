@@ -1,0 +1,39 @@
+<h2>Picowal generated app shell</h2>
+<p>Generates list/create/edit/detail pages from <code>/wal/forms/{pack}</code> metadata.</p>
+<p><a href="/forms.html">Back to raw form builder</a></p>
+
+<section class="pw-auth">
+  <h3>Authentication</h3>
+  <label for="pw-auth-provider">Provider</label>
+  <select id="pw-auth-provider">
+    <option value="google">google</option>
+    <option value="entra">entra</option>
+  </select>
+  <label for="pw-auth-token">Access token</label>
+  <input id="pw-auth-token" type="text" placeholder="Paste provider access token">
+  <button id="pw-auth-login" type="button">Login</button>
+  <button id="pw-auth-logout" type="button">Logout</button>
+  <small id="pw-auth-status">Status: not logged in</small>
+</section>
+
+<form id="pw-app-config">
+  <label for="pw-app-pack">Pack</label>
+  <input id="pw-app-pack" name="pack" type="number" min="0" max="1023" value="12" required>
+  <button type="submit">Load App</button>
+</form>
+
+<section id="pw-app-shell" hidden>
+  <h3 id="pw-app-title">Generated App</h3>
+  <nav id="pw-app-nav" class="pw-nav"></nav>
+  <div class="pw-config-actions">
+    <button id="pw-save-config" type="button">Save app config version</button>
+    <button id="pw-load-config" type="button">Load latest saved config</button>
+    <button id="pw-show-config-history" type="button">Show config history</button>
+  </div>
+  <div id="pw-app-main"></div>
+</section>
+
+<h3>App output</h3>
+<pre id="pw-app-output">Load an app to begin.</pre>
+
+<script src="/js/picowal-app-shell.js"></script>

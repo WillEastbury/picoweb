@@ -833,7 +833,49 @@ static bool picowal_build_form_spec(uint32_t pack_id, char** out_json, size_t* o
         (void)json_extract_string_field(name_doc, "name", pack_name, sizeof(pack_name));
     }
 
-    size_t cap = PICOWAL_DATA_MAX * 2;
+    char app_title[160] = {0};
+    char app_icon[64] = {0};
+    char app_pages[192] = {0};
+    char app_nav[192] = {0};
+    char app_list_columns[256] = {0};
+    char app_layout[64] = {0};
+    char app_actions[96] = {0};
+    char app_page_size[16] = {0};
+    char app_default_sort[96] = {0};
+    char app_field_labels[512] = {0};
+    char app_field_placeholders[512] = {0};
+    char schema_fields[256] = {0};
+
+    (void)json_extract_string_field(schema, "title", app_title, sizeof(app_title));
+    (void)json_extract_string_field(schema, "icon", app_icon, sizeof(app_icon));
+    (void)json_extract_string_field(schema, "pages", app_pages, sizeof(app_pages));
+    (void)json_extract_string_field(schema, "nav", app_nav, sizeof(app_nav));
+    (void)json_extract_string_field(schema, "list_columns", app_list_columns, sizeof(app_list_columns));
+    (void)json_extract_string_field(schema, "layout", app_layout, sizeof(app_layout));
+    (void)json_extract_string_field(schema, "actions", app_actions, sizeof(app_actions));
+    (void)json_extract_string_field(schema, "page_size", app_page_size, sizeof(app_page_size));
+    (void)json_extract_string_field(schema, "default_sort", app_default_sort, sizeof(app_default_sort));
+    (void)json_extract_string_field(schema, "field_labels", app_field_labels, sizeof(app_field_labels));
+    (void)json_extract_string_field(schema, "field_placeholders", app_field_placeholders, sizeof(app_field_placeholders));
+    (void)json_extract_string_field(schema, "fields", schema_fields, sizeof(schema_fields));
+
+    if (!app_title[0]) {
+        if (pack_name[0]) snprintf(app_title, sizeof(app_title), "%s", pack_name);
+        else snprintf(app_title, sizeof(app_title), "pack-%u", pack_id);
+    }
+    if (!app_pages[0]) snprintf(app_pages, sizeof(app_pages), "list,create,edit,detail");
+    if (!app_actions[0]) snprintf(app_actions, sizeof(app_actions), "create,update,delete");
+    if (!app_layout[0]) snprintf(app_layout, sizeof(app_layout), "auto");
+    if (!app_page_size[0]) snprintf(app_page_size, sizeof(app_page_size), "25");
+    if (!app_nav[0]) {
+        if (pack_name[0]) snprintf(app_nav, sizeof(app_nav), "%s", pack_name);
+        else snprintf(app_nav, sizeof(app_nav), "pack-%u", pack_id);
+    }
+    if (!app_list_columns[0] && schema_fields[0]) {
+        snprintf(app_list_columns, sizeof(app_list_columns), "%s", schema_fields);
+    }
+
+    size_t cap = PICOWAL_DATA_MAX * 4;
     char* out = (char*)malloc(cap);
     if (!out) {
         if (out_status) *out_status = 500;
@@ -843,13 +885,57 @@ static bool picowal_build_form_spec(uint32_t pack_id, char** out_json, size_t* o
 
     char esc_name[256] = {0};
     bool has_name = pack_name[0] && json_escape_copy(pack_name, esc_name, sizeof(esc_name));
+    char esc_title[256] = {0};
+    char esc_icon[128] = {0};
+    char esc_pages[256] = {0};
+    char esc_nav[256] = {0};
+    char esc_list_columns[384] = {0};
+    char esc_layout[96] = {0};
+    char esc_actions[128] = {0};
+    char esc_page_size[32] = {0};
+    char esc_default_sort[160] = {0};
+    char esc_field_labels[768] = {0};
+    char esc_field_placeholders[768] = {0};
+    bool ok_escape = json_escape_copy(app_title, esc_title, sizeof(esc_title)) &&
+                     json_escape_copy(app_icon, esc_icon, sizeof(esc_icon)) &&
+                     json_escape_copy(app_pages, esc_pages, sizeof(esc_pages)) &&
+                     json_escape_copy(app_nav, esc_nav, sizeof(esc_nav)) &&
+                     json_escape_copy(app_list_columns, esc_list_columns, sizeof(esc_list_columns)) &&
+                     json_escape_copy(app_layout, esc_layout, sizeof(esc_layout)) &&
+                     json_escape_copy(app_actions, esc_actions, sizeof(esc_actions)) &&
+                     json_escape_copy(app_page_size, esc_page_size, sizeof(esc_page_size)) &&
+                     json_escape_copy(app_default_sort, esc_default_sort, sizeof(esc_default_sort)) &&
+                     json_escape_copy(app_field_labels, esc_field_labels, sizeof(esc_field_labels)) &&
+                     json_escape_copy(app_field_placeholders, esc_field_placeholders, sizeof(esc_field_placeholders));
+    if (!ok_escape) {
+        free(out);
+        if (out_status) *out_status = 500;
+        snprintf(err, err_cap, "metadata escape failed");
+        return false;
+    }
+
     size_t o = 0;
     int n;
     if (has_name) {
-        n = snprintf(out + o, cap - o, "{\"pack\":%u,\"entity\":\"%s\",\"schema\":%s}",
-                     pack_id, esc_name, schema);
+        n = snprintf(out + o, cap - o,
+                     "{\"pack\":%u,\"entity\":\"%s\",\"schema\":%s,"
+                     "\"app\":{\"model_version\":1,\"title\":\"%s\",\"icon\":\"%s\",\"pages\":\"%s\","
+                     "\"nav\":\"%s\",\"list_columns\":\"%s\",\"layout\":\"%s\",\"actions\":\"%s\","
+                     "\"page_size\":\"%s\",\"default_sort\":\"%s\",\"field_labels\":\"%s\","
+                     "\"field_placeholders\":\"%s\"}}",
+                     pack_id, esc_name, schema,
+                     esc_title, esc_icon, esc_pages, esc_nav, esc_list_columns, esc_layout,
+                     esc_actions, esc_page_size, esc_default_sort, esc_field_labels, esc_field_placeholders);
     } else {
-        n = snprintf(out + o, cap - o, "{\"pack\":%u,\"entity\":null,\"schema\":%s}", pack_id, schema);
+        n = snprintf(out + o, cap - o,
+                     "{\"pack\":%u,\"entity\":null,\"schema\":%s,"
+                     "\"app\":{\"model_version\":1,\"title\":\"%s\",\"icon\":\"%s\",\"pages\":\"%s\","
+                     "\"nav\":\"%s\",\"list_columns\":\"%s\",\"layout\":\"%s\",\"actions\":\"%s\","
+                     "\"page_size\":\"%s\",\"default_sort\":\"%s\",\"field_labels\":\"%s\","
+                     "\"field_placeholders\":\"%s\"}}",
+                     pack_id, schema,
+                     esc_title, esc_icon, esc_pages, esc_nav, esc_list_columns, esc_layout,
+                     esc_actions, esc_page_size, esc_default_sort, esc_field_labels, esc_field_placeholders);
     }
     if (n <= 0 || (size_t)n >= cap - o) { free(out); snprintf(err, err_cap, "render failed"); return false; }
     o += (size_t)n;
@@ -956,6 +1042,73 @@ static bool picowal_build_report(const char* body, size_t body_len,
     if (out_status) *out_status = 200;
     *out_json = out;
     *out_len = (size_t)n;
+    return true;
+}
+
+static bool picowal_build_list_payload(uint32_t pack_id, char** out_json, size_t* out_len,
+                                       int* out_status, char* err, size_t err_cap) {
+    if (!out_json || !out_len) return false;
+    *out_json = NULL;
+    *out_len = 0;
+    if (out_status) *out_status = 400;
+    if (pack_id > PICOWAL_CARD_MAX) {
+        snprintf(err, err_cap, "invalid pack id");
+        return false;
+    }
+
+    uint32_t recs[1024];
+    uint32_t n = picowal_db_list_records(g_picowal, (uint16_t)pack_id, recs, 1024);
+    size_t cap = (size_t)(n * (PICOWAL_DATA_MAX + 96) + 256);
+    if (cap < 512) cap = 512;
+    char* out = (char*)malloc(cap);
+    if (!out) {
+        if (out_status) *out_status = 500;
+        snprintf(err, err_cap, "oom");
+        return false;
+    }
+
+    size_t o = 0;
+    int w = snprintf(out + o, cap - o, "{\"pack\":%u,\"records\":[", pack_id);
+    if (w <= 0 || (size_t)w >= cap - o) {
+        free(out);
+        if (out_status) *out_status = 500;
+        snprintf(err, err_cap, "list render failed");
+        return false;
+    }
+    o += (size_t)w;
+
+    uint32_t emitted = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        uint32_t key = 0;
+        if (!picowal_db_pack_key((uint16_t)pack_id, recs[i], &key)) continue;
+        char payload[PICOWAL_DATA_MAX + 1];
+        int got = picowal_db_get_key(g_picowal, key, payload, PICOWAL_DATA_MAX);
+        if (got < 0) continue;
+        payload[got] = '\0';
+        w = snprintf(out + o, cap - o, "%s{\"record\":%u,\"data\":%s}",
+                     emitted ? "," : "", recs[i], payload);
+        if (w <= 0 || (size_t)w >= cap - o) {
+            free(out);
+            if (out_status) *out_status = 500;
+            snprintf(err, err_cap, "list render failed");
+            return false;
+        }
+        o += (size_t)w;
+        emitted++;
+    }
+
+    w = snprintf(out + o, cap - o, "],\"count\":%u}", emitted);
+    if (w <= 0 || (size_t)w >= cap - o) {
+        free(out);
+        if (out_status) *out_status = 500;
+        snprintf(err, err_cap, "list render failed");
+        return false;
+    }
+    o += (size_t)w;
+
+    if (out_status) *out_status = 200;
+    *out_json = out;
+    *out_len = o;
     return true;
 }
 
@@ -1681,6 +1834,37 @@ static void dispatch_picowal(http_method_t method,
             return;
         }
         resp_get_body(resp, form_json, form_len, method == M_HEAD);
+        return;
+    }
+
+    if (path_len > g_picowal_prefix_len + 5 &&
+        memcmp(path + g_picowal_prefix_len, "list/", 5) == 0) {
+        if (!(method == M_GET || method == M_HEAD)) {
+            resp_status_only(resp, 405, "Method Not Allowed");
+            return;
+        }
+        const char* seg = path + g_picowal_prefix_len + 5;
+        size_t seg_len = path_len - (g_picowal_prefix_len + 5);
+        if (seg_len == 0 || memchr(seg, '/', seg_len) != NULL) {
+            resp_text_error(resp, 400, "Bad Request", "invalid list path\n");
+            return;
+        }
+        uint32_t pack_id = 0;
+        if (!parse_u32_dec(seg, seg_len, PICOWAL_CARD_MAX, &pack_id)) {
+            resp_text_error(resp, 400, "Bad Request", "invalid list pack id\n");
+            return;
+        }
+        char* out = NULL;
+        size_t out_len = 0;
+        int status = 500;
+        char err[128] = {0};
+        if (!picowal_build_list_payload(pack_id, &out, &out_len, &status, err, sizeof(err))) {
+            if (!err[0]) snprintf(err, sizeof(err), "list generation failed");
+            if (status == 400) resp_text_error(resp, 400, "Bad Request", err);
+            else resp_text_error(resp, 500, "Internal Server Error", err);
+            return;
+        }
+        resp_get_body(resp, out, out_len, method == M_HEAD);
         return;
     }
 

@@ -92,7 +92,7 @@ assert_code 204 "PUT  metadata name orders" -X PUT --data '{"name":"orders","pac
             "http://127.0.0.1:$PORT/wal/metadata/name/12"
 assert_code 204 "PUT  metadata name countries" -X PUT --data '{"name":"countries","pack":13}' \
             "http://127.0.0.1:$PORT/wal/metadata/name/13"
-assert_code 204 "PUT  metadata schema orders" -X PUT --data '{"fields":"name,13_id,status,email","required":"name,13_id,status","joins":"13=13_id","types":"name=string;13_id=number;status=string;email=string?","email":"email","regex":"status=^(Placed|Shipped|Delivered)$","transitions":"status=Placed>Shipped|Shipped>Delivered"}' \
+assert_code 204 "PUT  metadata schema orders" -X PUT --data '{"title":"Orders","fields":"name,13_id,status,email","required":"name,13_id,status","joins":"13=13_id","types":"name=string;13_id=number;status=string;email=string?","email":"email","regex":"status=^(Placed|Shipped|Delivered)$","transitions":"status=Placed>Shipped|Shipped>Delivered","pages":"list,create,edit,detail","nav":"orders,countries","list_columns":"name,status,13_id","layout":"split","actions":"create,update,delete,report,dashboard","page_size":"50","default_sort":"status,-name","field_labels":"name=Order Name;13_id=Country;status=Order Status","field_placeholders":"name=SO-1001;email=owner@example.com"}' \
             "http://127.0.0.1:$PORT/wal/metadata/schema/12"
 assert_code 204 "PUT  metadata schema countries" -X PUT --data '{"fields":"city,country"}' \
             "http://127.0.0.1:$PORT/wal/metadata/schema/13"
@@ -114,7 +114,10 @@ if echo "$form_out" | grep -q '"pack":12' && \
    echo "$form_out" | grep -q '"entity":"orders"' && \
    echo "$form_out" | grep -q '"schema":' && \
    echo "$form_out" | grep -q '"fields":"name,13_id,status,email"' && \
-   ! echo "$form_out" | grep -q '"actions"'; then
+   echo "$form_out" | grep -q '"app":' && \
+   echo "$form_out" | grep -q '"model_version":1' && \
+   echo "$form_out" | grep -q '"title":"Orders"' && \
+   echo "$form_out" | grep -q '"pages":"list,create,edit,detail"'; then
     echo "ok   metadata form output"
 else
     echo "FAIL metadata form output: $form_out"
@@ -150,6 +153,18 @@ if echo "$query_out" | grep -q '"name":"Ann"' && \
     echo "ok   query join output (named packs + schema)"
 else
     echo "FAIL query join output: $query_out"
+    fail=$((fail + 1))
+fi
+
+assert_code 200 "GET list endpoint" "http://127.0.0.1:$PORT/wal/list/12"
+list_out=$(cat /tmp/picowal-test-body)
+if echo "$list_out" | grep -q '"pack":12' && \
+   echo "$list_out" | grep -q '"records":' && \
+   echo "$list_out" | grep -q '"record":101' && \
+   echo "$list_out" | grep -q '"data":'; then
+    echo "ok   list endpoint output"
+else
+    echo "FAIL list endpoint output: $list_out"
     fail=$((fail + 1))
 fi
 

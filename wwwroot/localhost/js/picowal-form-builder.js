@@ -10,6 +10,11 @@
   const recordEl = document.getElementById("pw-record");
   const submitBtn = document.getElementById("pw-submit-btn");
   const outputEl = document.getElementById("pw-output");
+  const authProviderEl = document.getElementById("pw-auth-provider");
+  const authTokenEl = document.getElementById("pw-auth-token");
+  const authLoginBtn = document.getElementById("pw-auth-login");
+  const authLogoutBtn = document.getElementById("pw-auth-logout");
+  const authStatusEl = document.getElementById("pw-auth-status");
 
   let currentPack = null;
   let currentSchema = null;
@@ -54,7 +59,147 @@
     return out;
   }
 
-  function controlForType(fieldName, typeDecl, isRequired) {
+  function parseJoinFieldMap(value) {
+    const map = {};
+    if (!value || typeof value !== "string") return map;
+    for (const part of value.split(",")) {
+      const trimmed = part.trim();
+      if (!trimmed) continue;
+      const sep = trimmed.includes("=") ? "=" : (trimmed.includes(":") ? ":" : "");
+      if (!sep) continue;
+      const bits = trimmed.split(sep);
+      if (bits.length < 2) continue;
+      const targetPack = bits[0].trim();
+      const field = bits[1].trim();
+      if (field && targetPack) map[field] = targetPack;
+    }
+    return map;
+  }
+
+  function isEmailLike(value) {
+    if (typeof value !== "string") return false;
+    return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value);
+  }
+
+  function validatePayloadAgainstSchema(payload, schema, originalRecord) {
+    const required = parseCsv(schema.required);
+    for (const field of required) {
+      const value = payload[field];
+      if (value === undefined || value === null || (typeof value === "string" && value.trim() === "")) {
+        return `Missing required field: ${field}`;
+      }
+    }
+
+    const types = parseAssignMap(schema.types);
+    for (const field of Object.keys(types)) {
+      if (!Object.prototype.hasOwnProperty.call(payload, field)) continue;
+      const typeDecl = types[field];
+      const nullable = typeDecl.endsWith("?");
+      const base = nullable ? typeDecl.slice(0, -1) : typeDecl;
+      const value = payload[field];
+      if (value === null && nullable) continue;
+      if (base === "string" && typeof value !== "string") return `Type mismatch for ${field}: expected string`;
+      if ((base === "number" || base === "integer") && typeof value !== "number") return `Type mismatch for ${field}: expected number`;
+      if ((base === "bool" || base === "boolean") && typeof value !== "boolean") return `Type mismatch for ${field}: expected boolean`;
+      if (base === "object" && (typeof value !== "object" || Array.isArray(value) || value === null)) return `Type mismatch for ${field}: expected object`;
+      if (base === "array" && !Array.isArray(value)) return `Type mismatch for ${field}: expected array`;
+    }
+
+    const emailFields = parseCsv(schema.email);
+    for (const field of emailFields) {
+      if (!Object.prototype.hasOwnProperty.call(payload, field)) continue;
+      const value = payload[field];
+      if (value === null || value === undefined || value === "") continue;
+      if (!isEmailLike(String(value))) return `Email validation failed for ${field}`;
+    }
+
+    const regexRules = parseAssignMap(schema.regex);
+    for (const field of Object.keys(regexRules)) {
+      if (!Object.prototype.hasOwnProperty.call(payload, field)) continue;
+      const value = payload[field];
+      if (value === null || value === undefined) continue;
+      let re;
+      try {
+        re = new RegExp(regexRules[field]);
+      } catch (_) {
+        return `Invalid regex rule for ${field}`;
+      }
+      if (!re.test(String(value))) return `Regex validation failed for ${field}`;
+    }
+
+    const transitionRules = parseAssignMap(schema.transitions);
+    for (const field of Object.keys(transitionRules)) {
+      if (!originalRecord || !Object.prototype.hasOwnProperty.call(payload, field)) continue;
+      const from = originalRecord[field];
+      const to = payload[field];
+      if (from === undefined || from === null || to === undefined || to === null) continue;
+      if (String(from) === String(to)) continue;
+      const allowed = String(transitionRules[field]).split("|").map((x) => x.trim()).filter(Boolean);
+      const token = `${String(from)}>${String(to)}`;
+      if (!allowed.includes(token)) return `Transition not allowed for ${field}: ${token}`;
+    }
+
+    return "";
+  }
+
+  async function validateJoinIntegrity(payload, schema) {
+    const joins = parseJoinFieldMap(schema.joins);
+    for (const field of Object.keys(joins)) {
+      if (!Object.prototype.hasOwnProperty.call(payload, field)) continue;
+      const value = payload[field];
+      if (value === null || value === undefined || value === "") continue;
+      const targetPack = joins[field];
+      const res = await authFetch(`/wal/${targetPack}/${encodeURIComponent(String(value))}`, { method: "GET" });
+      if (!res.ok) return `Lookup value not found for ${field} (pack ${targetPack}, record ${value})`;
+    }
+    return "";
+  }
+
+  async function authFetch(path, options) {
+    const merged = Object.assign({}, options || {});
+    merged.headers = Object.assign({ Accept: "application/json", "X-PW-Auth": "1" }, merged.headers || {});
+    merged.credentials = "include";
+    return fetch(path, merged);
+  }
+
+  function setAuthStatus(text) {
+    if (authStatusEl) authStatusEl.textContent = `Status: ${text}`;
+  }
+
+  function wireAuthUi() {
+    if (!authLoginBtn || !authLogoutBtn || !authProviderEl || !authTokenEl) return;
+    authLoginBtn.addEventListener("click", async () => {
+      const provider = authProviderEl.value;
+      const accessToken = (authTokenEl.value || "").trim();
+      if (!accessToken) {
+        setAuthStatus("missing access token");
+        return;
+      }
+      try {
+        const res = await authFetch("/wal/auth/login", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ provider, access_token: accessToken })
+        });
+        if (res.ok) setAuthStatus("logged in");
+        else setAuthStatus(`login failed (${res.status})`);
+      } catch (e) {
+        setAuthStatus(e.message || "login failed");
+      }
+    });
+
+    authLogoutBtn.addEventListener("click", async () => {
+      try {
+        const res = await authFetch("/wal/auth/logout", { method: "POST" });
+        if (res.ok) setAuthStatus("logged out");
+        else setAuthStatus(`logout failed (${res.status})`);
+      } catch (e) {
+        setAuthStatus(e.message || "logout failed");
+      }
+    });
+  }
+
+  function controlForType(fieldName, typeDecl, isRequired, displayLabel, placeholder) {
     const baseType = (typeDecl || "string").replace(/\?$/, "");
     const id = `pw-field-${fieldName}`;
     const wrap = document.createElement("div");
@@ -62,7 +207,7 @@
 
     const label = document.createElement("label");
     label.setAttribute("for", id);
-    label.textContent = fieldName;
+    label.textContent = displayLabel || fieldName;
     wrap.appendChild(label);
 
     let input;
@@ -84,6 +229,7 @@
     input.id = id;
     input.name = fieldName;
     input.dataset.typeDecl = typeDecl || "string";
+    if (placeholder && input.type !== "checkbox") input.placeholder = placeholder;
     if (input.type !== "checkbox" && isRequired) input.required = true;
     wrap.appendChild(input);
 
@@ -92,11 +238,14 @@
 
   function buildFormFromSchema(formSpec) {
     const schema = formSpec.schema || {};
+    const app = formSpec.app || {};
     const entity = formSpec.entity || `pack-${formSpec.pack}`;
     const fields = parseCsv(schema.fields);
     const required = new Set(parseCsv(schema.required));
     const types = parseAssignMap(schema.types);
     const joins = parseAssignMap(schema.joins);
+    const labels = parseAssignMap(app.field_labels || schema.field_labels);
+    const placeholders = parseAssignMap(app.field_placeholders || schema.field_placeholders);
 
     dataForm.innerHTML = "";
     if (fields.length === 0) {
@@ -105,7 +254,13 @@
 
     for (const field of fields) {
       const typeDecl = types[field] || (field.endsWith("_id") ? "number" : "string");
-      const node = controlForType(field, typeDecl, required.has(field));
+      const node = controlForType(
+        field,
+        typeDecl,
+        required.has(field),
+        labels[field] || field,
+        placeholders[field] || ""
+      );
       if (joins[field]) {
         const hint = document.createElement("small");
         hint.className = "pw-hint";
@@ -115,16 +270,16 @@
       dataForm.appendChild(node);
     }
 
-    titleEl.textContent = `Form: ${entity} (pack ${formSpec.pack})`;
+    const title = app.title || entity;
+    titleEl.textContent = `Form: ${title} (pack ${formSpec.pack})`;
     formSection.hidden = false;
     currentSchema = schema;
     currentPack = formSpec.pack;
   }
 
   async function loadForm(pack) {
-    const res = await fetch(`/wal/forms/${pack}`, {
+    const res = await authFetch(`/wal/forms/${pack}`, {
       method: "GET",
-      headers: { "Accept": "application/json", "X-PW-Auth": "1" }
     });
     const text = await res.text();
     let json = null;
@@ -200,11 +355,32 @@
         printOutput("n/a", e.message || "Invalid JSON in object/array field.");
         return;
       }
+      let originalRecord = null;
+      if (method === "PUT" && record) {
+        const prevRes = await authFetch(`/wal/${currentPack}/${encodeURIComponent(record)}`, { method: "GET" });
+        if (prevRes.ok) {
+          try {
+            originalRecord = await prevRes.json();
+          } catch (_) {
+            originalRecord = null;
+          }
+        }
+      }
+      const validationError = validatePayloadAgainstSchema(payload, currentSchema || {}, originalRecord);
+      if (validationError) {
+        printOutput("n/a", validationError);
+        return;
+      }
+      const joinError = await validateJoinIntegrity(payload, currentSchema || {});
+      if (joinError) {
+        printOutput("n/a", joinError);
+        return;
+      }
       options.headers["Content-Type"] = "application/json";
       options.body = JSON.stringify(payload);
     }
 
-    const res = await fetch(path, options);
+    const res = await authFetch(path, options);
     const text = await res.text();
     let body = text;
     try {
@@ -236,4 +412,6 @@
       printOutput("n/a", e.message || "Request failed.");
     }
   });
+
+  wireAuthUi();
 })();
