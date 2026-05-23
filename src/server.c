@@ -361,6 +361,29 @@ static bool is_ctx_token_char(char c) {
            c == '-' || c == '_';
 }
 
+static bool is_principal_char(char c) {
+    return (c >= 'a' && c <= 'z') ||
+           (c >= 'A' && c <= 'Z') ||
+           (c >= '0' && c <= '9') ||
+           c == '-' || c == '_' || c == '.' ||
+           c == '@' || c == '+';
+}
+
+static bool copy_principal(char* dst, size_t dst_cap, const char* src, size_t src_len) {
+    if (!dst || dst_cap == 0 || !src || src_len == 0) return false;
+    size_t start = 0;
+    size_t end = src_len;
+    while (start < end && (src[start] == ' ' || src[start] == '\t')) start++;
+    while (end > start && (src[end - 1] == ' ' || src[end - 1] == '\t')) end--;
+    if (end == start || end - start >= dst_cap) return false;
+    for (size_t i = start; i < end; i++) {
+        if (!is_principal_char(src[i])) return false;
+    }
+    memcpy(dst, src + start, end - start);
+    dst[end - start] = '\0';
+    return true;
+}
+
 static void resolve_api_request_context(const conn_t* c, api_request_context_t* ctx) {
     memset(ctx, 0, sizeof(*ctx));
     memcpy(ctx->tenant_system, "prod", 5);
@@ -369,6 +392,8 @@ static void resolve_api_request_context(const conn_t* c, api_request_context_t* 
 
     (void)api_principal_from_cookie(c->api_cookie, c->api_cookie_len,
                                     ctx->principal_id, sizeof(ctx->principal_id));
+    (void)copy_principal(ctx->principal_id, sizeof(ctx->principal_id),
+                         c->api_principal, c->api_principal_len);
 
     if (c->api_host_len > 0) {
         const char* h = c->api_host;

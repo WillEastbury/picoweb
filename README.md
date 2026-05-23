@@ -221,8 +221,15 @@ maps keys as `card`/`record` integers:
 - CORS is enabled on API responses when an `Origin` header is present:
   - preflight `OPTIONS` for `/api/*` and `/wal/*` returns `204`
   - response headers include `Access-Control-Allow-Origin`, methods, headers, and credentials
-- Minimal tenant/env routing context plumbing:
+- Minimal tenant/env routing context plumbing for deployments behind an
+  auth-terminating Ingress/oauth2-proxy:
   - principal id is resolved from `pw_session` cookie (falls back to `anonymous` when absent/invalid)
+  - trusted upstream identity headers override that context when present:
+    `X-PW-Principal`, `X-Principal-Id`, `X-Auth-Request-User`,
+    `X-Auth-Request-Preferred-Username`, `X-Auth-Request-Email`,
+    `X-Forwarded-User`, or `X-Forwarded-Email`
+  - only trust these headers when your Ingress strips any client-supplied
+    copies before forwarding to picoweb
   - tenant context is resolved from the `Host` header:
     - first `.` component => `tenant_id`
     - second `.` component => `tenant_system` (`dev|qa|prod`)
