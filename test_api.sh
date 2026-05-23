@@ -10,18 +10,24 @@ set -u
 cd "$(dirname "$0")"
 
 PORT="${1:-8765}"
-ROOT="$(mktemp -d)"
-WWW="$(mktemp -d)"
+SCRATCH="${PICOWEB_TEST_DIR:-.test-api-run}"
+ROOT="$SCRATCH/api-data"
+WWW="$SCRATCH/wwwroot"
+LOG="$SCRATCH/picoweb-api-test.log"
+PIDFILE="$SCRATCH/picoweb-api-test.pid"
+BODY="$SCRATCH/api-test-body"
+kill "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null || true
+rm -rf "$SCRATCH"
+mkdir -p "$ROOT" "$WWW"
 mkdir -p "$WWW/localhost"
 echo '<h1>hi</h1>' > "$WWW/localhost/index.html"
 
-kill "$(cat /tmp/picoweb-api-test.pid 2>/dev/null)" 2>/dev/null || true
 sleep 0.2
 
-./picoweb --api-root="$ROOT" "$PORT" "$WWW" 1 100 0 64 > /tmp/picoweb-api-test.log 2>&1 &
+./picoweb --api-root="$ROOT" "$PORT" "$WWW" 1 100 0 64 > "$LOG" 2>&1 &
 PID=$!
-echo "$PID" > /tmp/picoweb-api-test.pid
-trap 'kill "$PID" 2>/dev/null; rm -rf "$ROOT" "$WWW"' EXIT
+echo "$PID" > "$PIDFILE"
+trap 'kill "$PID" 2>/dev/null; rm -rf "$SCRATCH"' EXIT
 sleep 0.4
 
 fail=0
@@ -30,12 +36,12 @@ assert_code() {
     local expected="$1"; shift
     local label="$1"; shift
     local got
-    got=$(curl -sS --max-time 3 -o /tmp/api-test-body -w '%{http_code}' "$@") || got=000
+    got=$(curl -sS --max-time 3 -o "$BODY" -w '%{http_code}' "$@") || got=000
     if [ "$got" = "$expected" ]; then
         echo "ok   $label -> $got"
     else
         echo "FAIL $label -> $got (expected $expected)"
-        echo "     body: $(head -c 200 /tmp/api-test-body)"
+        echo "     body: $(head -c 200 "$BODY")"
         fail=$((fail + 1))
     fi
 }
@@ -48,14 +54,15 @@ assert_code 200 "HEAD existing"          -I "http://127.0.0.1:$PORT/api/things/t
 assert_code 204 "PUT  replace"           -X PUT --data '{"a":2}' \
             "http://127.0.0.1:$PORT/api/things/t1"
 
-# Minimal request-context plumbing headers (principal from cookie + tenant app/env).
-ctx_hdr="$(mktemp)"
-ctx_code=$(curl -sS --max-time 3 -o /tmp/api-test-body -D "$ctx_hdr" -w '%{http_code}' \
+# Minimal request-context plumbing headers (upstream SSO principal + tenant app/env).
+ctx_hdr="$SCRATCH/ctx.headers"
+ctx_code=$(curl -sS --max-time 3 -o "$BODY" -D "$ctx_hdr" -w '%{http_code}' \
     -H 'Host: contoso.dev.local' \
     -H 'X-PW-Tenant: contoso.orders.dev' \
+    -H 'X-Auth-Request-User: alice@example.com' \
     "http://127.0.0.1:$PORT/api/things/t1") || ctx_code=000
 if [ "$ctx_code" = "200" ] && \
-   grep -qi '^X-PW-Principal-Id: anonymous' "$ctx_hdr" && \
+   grep -qi '^X-PW-Principal-Id: alice@example.com' "$ctx_hdr" && \
    grep -qi '^X-PW-Tenant-Id: contoso' "$ctx_hdr" && \
    grep -qi '^X-PW-Tenant-System: dev' "$ctx_hdr"; then
     echo "ok   request context headers"
@@ -98,25 +105,27 @@ assert_code 400 "non-ascii id"           "http://127.0.0.1:$PORT/api/things/h%C3
 ln -s /etc/passwd "$ROOT/things/escape.json"
 assert_code 500 "GET symlinked object blocked" "http://127.0.0.1:$PORT/api/things/escape"
 rm -f "$ROOT/things/escape.json"
-ln -s /tmp "$ROOT/evilcoll"
+ln -s "$SCRATCH" "$ROOT/evilcoll"
 assert_code 500 "PUT symlinked collection blocked" -X PUT --data '{}' \
             "http://127.0.0.1:$PORT/api/evilcoll/x"
 rm -f "$ROOT/evilcoll"
 
 # Body size cap (API_REQ_BODY_CAP = 6144). The 413 short-circuits without
 # the server having to buffer the body, so use Content-Length only.
+big_body="$SCRATCH/big-body.bin"
+head -c 7000 /dev/zero > "$big_body"
 assert_code 413 "PUT  oversize CL"       -X PUT \
             -H 'Transfer-Encoding:' \
             -H 'Expect:' \
-            --data-binary @<(head -c 7000 /dev/zero) \
+            --data-binary @"$big_body" \
             "http://127.0.0.1:$PORT/api/things/big"
 
 # Static path still works alongside API
 assert_code 200 "static / still served"  -H 'Host: localhost' "http://127.0.0.1:$PORT/"
 
 # CORS preflight / allow-origin on API path
-cors_hdr="$(mktemp)"
-cors_code=$(curl -sS --max-time 3 -o /tmp/api-test-body -D "$cors_hdr" -w '%{http_code}' \
+cors_hdr="$SCRATCH/cors.headers"
+cors_code=$(curl -sS --max-time 3 -o "$BODY" -D "$cors_hdr" -w '%{http_code}' \
     -X OPTIONS \
     -H 'Origin: https://app.example' \
     -H 'Access-Control-Request-Method: PUT' \
@@ -141,6 +150,6 @@ if [ $fail -eq 0 ]; then
 else
     echo "FAIL — $fail test(s) failed"
     echo "--- server log tail ---"
-    tail -30 /tmp/picoweb-api-test.log
+    tail -30 "$LOG"
     exit 1
 fi

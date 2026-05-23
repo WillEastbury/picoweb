@@ -51,6 +51,13 @@ static const char* trim_ows(const char* s, size_t len, size_t* out_len) {
     return s + i;
 }
 
+static void set_principal_header(http_request_t* out, const char* val, size_t len) {
+    if (!out->pw_principal && len > 0) {
+        out->pw_principal = val;
+        out->pw_principal_len = len;
+    }
+}
+
 /* ============================================================== */
 /* Parser                                                         */
 /* ============================================================== */
@@ -211,8 +218,31 @@ http_result_t http_parse(char* buf, size_t buf_len, http_request_t* out) {
                 if (cl > 0) body_present = true;
             } else if (metal_ieq(p, 14, "X-PW-Principal", 14) ||
                        metal_ieq(p, 14, "X-Principal-Id", 14)) {
-                out->pw_principal = tval;
-                out->pw_principal_len = tl;
+                set_principal_header(out, tval, tl);
+            }
+            break;
+        case 16:
+            if (metal_ieq(p, 16, "X-Forwarded-User", 16)) {
+                set_principal_header(out, tval, tl);
+            }
+            break;
+        case 17:
+            if (metal_ieq(p, 17, "Transfer-Encoding", 17)) {
+                /* We don't speak chunked. Reject any TE outright; safer
+                 * than mis-framing the next request on this connection. */
+                return HTTP_ERR_400;
+            } else if (metal_ieq(p, 17, "X-Forwarded-Email", 17)) {
+                set_principal_header(out, tval, tl);
+            }
+            break;
+        case 19:
+            if (metal_ieq(p, 19, "X-Auth-Request-User", 19)) {
+                set_principal_header(out, tval, tl);
+            }
+            break;
+        case 20:
+            if (metal_ieq(p, 20, "X-Auth-Request-Email", 20)) {
+                set_principal_header(out, tval, tl);
             }
             break;
         case 15:
@@ -221,17 +251,15 @@ http_result_t http_parse(char* buf, size_t buf_len, http_request_t* out) {
                 if (brotli_accepted(tval, tl)) out->accept_br = true;
             }
             break;
-        case 17:
-            if (metal_ieq(p, 17, "Transfer-Encoding", 17)) {
-                /* We don't speak chunked. Reject any TE outright; safer
-                 * than mis-framing the next request on this connection. */
-                return HTTP_ERR_400;
-            }
-            break;
         case 30:
             if (metal_ieq(p, 30, "Access-Control-Request-Headers", 30)) {
                 out->acr_headers = tval;
                 out->acr_headers_len = tl;
+            }
+            break;
+        case 33:
+            if (metal_ieq(p, 33, "X-Auth-Request-Preferred-Username", 33)) {
+                set_principal_header(out, tval, tl);
             }
             break;
         default:
