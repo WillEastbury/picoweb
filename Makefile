@@ -51,6 +51,7 @@ ALL_SRC := $(wildcard src/*.c)
 # the one path that defines tls_worker_main in the default binary.
 SRC := $(filter-out src/server_tls.c,$(ALL_SRC)) $(USERSPACE_TLS_SRC)
 OBJ := $(SRC:.c=.o)
+DEP := $(OBJ:.o=.d)
 BIN := picoweb
 
 .PHONY: all clean run debug
@@ -61,10 +62,10 @@ $(BIN): $(OBJ)
 	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
 src/brotli.o: src/brotli.c
-	$(CC) $(CFLAGS) -fno-lto -O1 -c -o $@ $<
+	$(CC) $(CFLAGS) -MMD -MP -fno-lto -O1 -c -o $@ $<
 
 src/%.o: src/%.c
-	$(CC) $(CFLAGS) -c -o $@ $<
+	$(CC) $(CFLAGS) -MMD -MP -c -o $@ $<
 
 debug: CFLAGS := -O0 -g3 -Wall -Wextra -Wshadow -Wpedantic -std=c11 \
                  -D_GNU_SOURCE -fno-strict-aliasing \
@@ -77,4 +78,6 @@ run: $(BIN)
 	./$(BIN) 8080 wwwroot
 
 clean:
-	rm -f src/*.o userspace/**/*.o userspace/**/**/*.o picoweb picoweb_uring
+	rm -f src/*.o src/*.d userspace/**/*.o userspace/**/*.d userspace/**/**/*.o userspace/**/**/*.d picoweb picoweb_uring
+
+-include $(DEP)

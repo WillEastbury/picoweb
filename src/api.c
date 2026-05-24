@@ -4,6 +4,7 @@
 #include "picowal_db.h"
 #include "picowal_query.h"
 #include "picowal_validate.h"
+#include "security_headers.h"
 
 #include <ctype.h>
 #include <errno.h>
@@ -627,9 +628,15 @@ static void resp_cookie_status(api_resp_t* r, int status, const char* reason,
                      "Server: picoweb\r\n"
                      "Set-Cookie: " AUTH_COOKIE_NAME "=%s; Max-Age=%u; Path=%s; HttpOnly; Secure; SameSite=Lax\r\n"
                      "Content-Length: 0\r\n"
+                     PICOWEB_SECURITY_HEADERS
                      "Cache-Control: no-store\r\n",
                      status, reason, cookie_value ? cookie_value : "", max_age, g_picowal_prefix);
-    r->head_len = (n > 0) ? (size_t)n : 0;
+    if (n > 0 && (size_t)n < sizeof(r->head)) {
+        r->head_len = (size_t)n;
+    } else {
+        r->head_len = 0;
+        resp_status_only(r, 500, "Internal Server Error");
+    }
 }
 
 static bool auth_require_cookie(const char* cookie, size_t cookie_len, api_resp_t* resp) {
@@ -1303,15 +1310,39 @@ static int write_all_fd(int fd, const char* body, size_t body_len) {
 
 /* ---------- response builders ---------- */
 
+static void resp_head_overflow(api_resp_t* r) {
+    if (r->body_owned) free(r->body);
+    r->body = NULL;
+    r->body_len = 0;
+    r->body_owned = false;
+    r->status = 500;
+    int n = snprintf(r->head, sizeof(r->head),
+                     "HTTP/1.1 500 Internal Server Error\r\n"
+                     "Server: picoweb\r\n"
+                     "Content-Length: 0\r\n"
+                     PICOWEB_SECURITY_HEADERS
+                     "Cache-Control: no-store\r\n");
+    r->head_len = (n > 0 && (size_t)n < sizeof(r->head)) ? (size_t)n : 0;
+}
+
+static void resp_finish_head(api_resp_t* r, int n) {
+    if (n > 0 && (size_t)n < sizeof(r->head)) {
+        r->head_len = (size_t)n;
+        return;
+    }
+    resp_head_overflow(r);
+}
+
 static void resp_status_only(api_resp_t* r, int status, const char* reason) {
     r->status = status;
     int n = snprintf(r->head, sizeof(r->head),
                      "HTTP/1.1 %d %s\r\n"
                      "Server: picoweb\r\n"
                      "Content-Length: 0\r\n"
+                     PICOWEB_SECURITY_HEADERS
                      "Cache-Control: no-store\r\n",
                      status, reason);
-    r->head_len = (n > 0) ? (size_t)n : 0;
+    resp_finish_head(r, n);
 }
 
 static void resp_text_error(api_resp_t* r, int status, const char* reason,
@@ -1323,9 +1354,10 @@ static void resp_text_error(api_resp_t* r, int status, const char* reason,
                      "Server: picoweb\r\n"
                      "Content-Type: text/plain; charset=utf-8\r\n"
                      "Content-Length: %zu\r\n"
+                     PICOWEB_SECURITY_HEADERS
                      "Cache-Control: no-store\r\n",
                      status, reason, blen);
-    r->head_len = (n > 0) ? (size_t)n : 0;
+    resp_finish_head(r, n);
     if (blen) {
         r->body = (char*)malloc(blen);
         if (r->body) {
@@ -1347,9 +1379,14 @@ static void resp_get_body(api_resp_t* r, char* body, size_t blen, bool head_only
                      "Server: picoweb\r\n"
                      "Content-Type: application/json; charset=utf-8\r\n"
                      "Content-Length: %zu\r\n"
+                     PICOWEB_SECURITY_HEADERS
                      "Cache-Control: no-store\r\n",
                      blen);
-    r->head_len = (n > 0) ? (size_t)n : 0;
+    resp_finish_head(r, n);
+    if (r->status != 200) {
+        free(body);
+        return;
+    }
     if (head_only) {
         free(body);
         return;
@@ -1368,11 +1405,12 @@ static void resp_created(api_resp_t* r, const char* prefix,
                      "Server: picoweb\r\n"
                      "Location: %s%.*s/%.*s\r\n"
                      "Content-Length: 0\r\n"
+                     PICOWEB_SECURITY_HEADERS
                      "Cache-Control: no-store\r\n",
                      prefix,
                      (int)coll_len, coll,
                      (int)id_len, id);
-    r->head_len = (n > 0) ? (size_t)n : 0;
+    resp_finish_head(r, n);
 }
 
 /* ---------- random id generator (hex32) ---------- */

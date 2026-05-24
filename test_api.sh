@@ -123,6 +123,38 @@ assert_code 413 "PUT  oversize CL"       -X PUT \
 # Static path still works alongside API
 assert_code 200 "static / still served"  -H 'Host: localhost' "http://127.0.0.1:$PORT/"
 
+sec_hdr="$SCRATCH/security.headers"
+sec_code=$(curl -sS --max-time 3 -o "$BODY" -D "$sec_hdr" \
+    -w '%{http_code}' -H 'Host: localhost' "http://127.0.0.1:$PORT/") || sec_code=000
+if [ "$sec_code" = "200" ] && \
+   grep -qi '^Strict-Transport-Security: max-age=31536000; includeSubDomains; preload' "$sec_hdr" && \
+   grep -qi "^Content-Security-Policy: .*default-src 'self'" "$sec_hdr" && \
+   grep -qi '^Referrer-Policy: strict-origin-when-cross-origin' "$sec_hdr" && \
+   grep -qi '^Permissions-Policy: .*camera=()' "$sec_hdr"; then
+    echo "ok   static security headers"
+else
+    echo "FAIL static security headers -> $sec_code"
+    sed -n '1,30p' "$sec_hdr"
+    fail=$((fail + 1))
+fi
+rm -f "$sec_hdr"
+
+api_sec_hdr="$SCRATCH/api-security.headers"
+api_sec_code=$(curl -sS --max-time 3 -o "$BODY" -D "$api_sec_hdr" \
+    -w '%{http_code}' "http://127.0.0.1:$PORT/api/things/t2") || api_sec_code=000
+if [ "$api_sec_code" = "200" ] && \
+   grep -qi '^Strict-Transport-Security: max-age=31536000; includeSubDomains; preload' "$api_sec_hdr" && \
+   grep -qi "^Content-Security-Policy: .*connect-src 'self'" "$api_sec_hdr" && \
+   grep -qi '^Referrer-Policy: strict-origin-when-cross-origin' "$api_sec_hdr" && \
+   grep -qi '^Permissions-Policy: .*camera=()' "$api_sec_hdr"; then
+    echo "ok   api security headers"
+else
+    echo "FAIL api security headers -> $api_sec_code"
+    sed -n '1,30p' "$api_sec_hdr"
+    fail=$((fail + 1))
+fi
+rm -f "$api_sec_hdr"
+
 # CORS preflight / allow-origin on API path
 cors_hdr="$SCRATCH/cors.headers"
 cors_code=$(curl -sS --max-time 3 -o "$BODY" -D "$cors_hdr" -w '%{http_code}' \

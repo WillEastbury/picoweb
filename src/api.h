@@ -35,7 +35,7 @@
  * deferred). */
 #define API_REQ_BODY_CAP   6144
 #define API_RESP_BODY_CAP  (1u << 20)  /* 1 MiB read cap on GET */
-#define API_HEAD_CAP       1024
+#define API_HEAD_CAP       2048
 #define API_NAME_CAP       64
 
 /* Response built by api_dispatch. body is heap-owned iff body_owned is

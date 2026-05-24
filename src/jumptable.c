@@ -4,6 +4,7 @@
 #include "metrics.h"
 #include "mime.h"
 #include "preload.h"
+#include "security_headers.h"
 #include "simd.h"
 #include "util.h"
 
@@ -411,15 +412,14 @@ static const char* build_head(arena_t* arena,
                               size_t body_len,
                               const char* extra_header,
                               size_t* out_len) {
-    char buf[1024];
+    char buf[2048];
     int n = snprintf(buf, sizeof(buf),
         "%s\r\n"
         "Server: picoweb\r\n"
         "Date: %.*s\r\n"
         "Content-Type: %s\r\n"
         "Content-Length: %zu\r\n"
-        "X-Content-Type-Options: nosniff\r\n"
-        "X-Frame-Options: DENY\r\n"
+        PICOWEB_SECURITY_HEADERS
         "%s",
         status_line,
         (int)g_date_len, g_date_buf,
@@ -444,14 +444,13 @@ static const char* build_304_head(arena_t* arena,
                                   const char* etag,
                                   const char* cache_vary_header,
                                   size_t* out_len) {
-    char buf[512];
+    char buf[2048];
     int n = snprintf(buf, sizeof(buf),
         "HTTP/1.1 304 Not Modified\r\n"
         "Server: picoweb\r\n"
         "Date: %.*s\r\n"
         "ETag: %s\r\n"
-        "X-Content-Type-Options: nosniff\r\n"
-        "X-Frame-Options: DENY\r\n"
+        PICOWEB_SECURITY_HEADERS
         "%s",
         (int)g_date_len, g_date_buf,
         etag,
