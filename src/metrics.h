@@ -178,6 +178,18 @@ typedef enum {
         METRICS_WAL_COUNT,
 } metrics_wal_op_t;
 
+typedef enum {
+        METRICS_SCORE_REJECT_RATE_LIMITED = 0,
+        METRICS_SCORE_REJECT_INVALID_TOKEN,
+        METRICS_SCORE_REJECT_INVALID_BODY,
+        METRICS_SCORE_REJECT_METHOD,
+        METRICS_SCORE_REJECT_UNAVAILABLE,
+        METRICS_SCORE_REJECT_DRAINING,
+        METRICS_SCORE_REJECT_WRITE_FAILED,
+        METRICS_SCORE_REJECT_TOKEN_ISSUE_FAILED,
+        METRICS_SCORE_REJECT_COUNT,
+} metrics_score_reject_t;
+
 metrics_route_t metrics_route_for_path(const char* path, size_t path_len);
 const char* metrics_route_name(metrics_route_t route);
 
@@ -194,6 +206,8 @@ void metrics_observe_picowal(metrics_wal_op_t op,
                              uint64_t lock_wait_tsc,
                              uint64_t storage_tsc,
                              bool ok);
+
+void metrics_score_reject(metrics_score_reject_t reason);
 
 void metrics_set_picowal_recovery(uint64_t status_code,
                                   uint64_t records_scanned,

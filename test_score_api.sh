@@ -16,7 +16,8 @@ mkdir -p "$WWW/localhost"
 printf 'ok\n' > "$WWW/localhost/index.html"
 rm -f "$VOL"
 
-./picoweb --picowal-device="$VOL" --picowal-prefix=/wal/ --picowal-bytes=8388608 \
+PICOWEB_SCORE_TOKEN_KEYS_HEX=000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f \
+    ./picoweb --picowal-device="$VOL" --picowal-prefix=/wal/ --picowal-bytes=8388608 \
     "$PORT" "$WWW" 1 100 0 64 > /tmp/picoweb-score-test.log 2>&1 &
 PID=$!
 echo "$PID" > /tmp/picoweb-score-test.pid
@@ -41,6 +42,19 @@ token=$(sed -n 's/.*"token":"\([^"]*\)".*/\1/p' /tmp/picoweb-score-token)
 test -n "$token"
 
 code=$(curl -sS --max-time 3 -o /tmp/picoweb-score-body -w '%{http_code}' \
+    -X POST -d '{}' "http://127.0.0.1:$PORT/api/scores/start")
+test "$code" = 400
+
+tampered="${token%?}0"
+if [ "$tampered" = "$token" ]; then tampered="${token%?}1"; fi
+code=$(curl -sS --max-time 3 -o /tmp/picoweb-score-body -w '%{http_code}' \
+    -H 'Content-Type: application/json' \
+    -H "X-Score-Token: $tampered" \
+    -d '{"name":"Mallory","score":999}' \
+    "http://127.0.0.1:$PORT/api/scores")
+test "$code" = 401
+
+code=$(curl -sS --max-time 3 -o /tmp/picoweb-score-body -w '%{http_code}' \
     -H 'Content-Type: application/json' \
     -H "X-Score-Token: $token" \
     -d '{"name":"Ada","score":12345}' \
@@ -59,5 +73,18 @@ code=$(curl -sS --max-time 3 -o /tmp/picoweb-score-body -w '%{http_code}' \
 test "$code" = 200
 grep -q '"name":"Ada"' /tmp/picoweb-score-body
 grep -q '"score":12345' /tmp/picoweb-score-body
+
+code=$(curl -sS --max-time 3 -o /tmp/picoweb-score-body -w '%{http_code}' \
+    -X GET -d '{}' "http://127.0.0.1:$PORT/api/scores")
+test "$code" = 400
+
+code=$(curl -sS --max-time 3 -o /tmp/picoweb-score-body -w '%{http_code}' \
+    -X DELETE "http://127.0.0.1:$PORT/api/scores")
+test "$code" = 405
+
+curl -sS --max-time 3 "http://127.0.0.1:$PORT/metricsz" > /tmp/picoweb-score-body
+grep -q 'picoweb_score_rejects_total{reason="invalid_token"} 3' /tmp/picoweb-score-body
+grep -q 'picoweb_score_rejects_total{reason="invalid_body"} 2' /tmp/picoweb-score-body
+grep -q 'picoweb_score_rejects_total{reason="method"} 1' /tmp/picoweb-score-body
 
 echo "score api ok"
