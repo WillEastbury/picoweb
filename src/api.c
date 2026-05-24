@@ -91,6 +91,12 @@ bool api_enabled(void)              { return g_enabled; }
 bool api_picowal_enabled(void)      { return g_picowal_enabled; }
 size_t api_max_request_body(void)   { return API_REQ_BODY_CAP; }
 
+bool api_health_path_matches(const char* path, size_t path_len) {
+    return path &&
+           ((path_len == 8 && memcmp(path, "/healthz", 8) == 0) ||
+            (path_len == 7 && memcmp(path, "/readyz", 7) == 0));
+}
+
 static const char* public_api_prefix(size_t* out_len) {
     if (g_enabled && g_prefix_len > 0) {
         if (out_len) *out_len = g_prefix_len;
@@ -129,6 +135,7 @@ static bool valid_prefix(const char* prefix, size_t cap, const char* label) {
 
 bool api_path_matches(const char* path, size_t path_len) {
     if (!path) return false;
+    if (api_health_path_matches(path, path_len)) return true;
     if (g_enabled &&
         path_len >= g_prefix_len &&
         memcmp(path, g_prefix, g_prefix_len) == 0) return true;
@@ -1466,6 +1473,63 @@ static void resp_get_body(api_resp_t* r, char* body, size_t blen, bool head_only
     r->body_owned = true;
 }
 
+static void resp_json_literal(api_resp_t* r, int status, const char* reason,
+                              const char* body, bool head_only) {
+    size_t blen = body ? strlen(body) : 0;
+    r->status = status;
+    int n = snprintf(r->head, sizeof(r->head),
+                     "HTTP/1.1 %d %s\r\n"
+                     "Server: picoweb\r\n"
+                     "Content-Type: application/json; charset=utf-8\r\n"
+                     "Content-Length: %zu\r\n"
+                     "Cache-Control: no-store\r\n",
+                     status, reason, blen);
+    r->head_len = (n > 0) ? (size_t)n : 0;
+    if (head_only || blen == 0) return;
+    r->body = (char*)malloc(blen);
+    if (!r->body) {
+        r->head_len = 0;
+        resp_status_only(r, 500, "Internal Server Error");
+        return;
+    }
+    memcpy(r->body, body, blen);
+    r->body_len = blen;
+    r->body_owned = true;
+}
+
+static void dispatch_health(http_method_t method,
+                            const char* path, size_t path_len,
+                            api_resp_t* resp) {
+    if (method != M_GET && method != M_HEAD) {
+        resp_status_only(resp, 405, "Method Not Allowed");
+        return;
+    }
+    bool head_only = (method == M_HEAD);
+    if (path_len == 8 && memcmp(path, "/healthz", 8) == 0) {
+        resp_json_literal(resp, 200, "OK", "{\"status\":\"live\"}\n", head_only);
+        return;
+    }
+    if (path_len == 7 && memcmp(path, "/readyz", 7) == 0) {
+        if (!g_picowal) {
+            resp_json_literal(resp, 200, "OK",
+                              "{\"status\":\"ready\",\"picowal\":\"disabled\"}\n",
+                              head_only);
+            return;
+        }
+        if (g_picowal_enabled && picowal_db_healthy(g_picowal)) {
+            resp_json_literal(resp, 200, "OK",
+                              "{\"status\":\"ready\",\"picowal\":\"ready\"}\n",
+                              head_only);
+            return;
+        }
+        resp_json_literal(resp, 503, "Service Unavailable",
+                          "{\"status\":\"not_ready\",\"picowal\":\"unavailable\"}\n",
+                          head_only);
+        return;
+    }
+    resp_status_only(resp, 404, "Not Found");
+}
+
 static void resp_created(api_resp_t* r, const char* prefix,
                          const char* coll, size_t coll_len,
                          const char* id,   size_t id_len) {
@@ -2540,6 +2604,10 @@ void api_dispatch(http_method_t method,
                  const api_request_context_t* req_ctx,
                  api_resp_t* resp) {
     memset(resp, 0, sizeof(*resp));
+    if (api_health_path_matches(path, path_len)) {
+        dispatch_health(method, path, path_len, resp);
+        return;
+    }
     if (method == M_OPTIONS) {
         if (score_path_matches(path, path_len) ||
             (g_picowal_enabled && g_picowal_public_http &&
