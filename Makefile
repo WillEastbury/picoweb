@@ -4,7 +4,7 @@ CFLAGS  ?= -O3 -Wall -Wextra -Wshadow -Wpedantic -std=c11 -D_GNU_SOURCE \
            -fno-strict-aliasing -fstack-protector-strong \
            -flto -march=native -fomit-frame-pointer
 LDFLAGS ?= -flto -O3
-LDLIBS  ?= -pthread
+LDLIBS  ?= -pthread -lbrotlidec
 
 # All backends are compiled into a single binary; main.c picks
 # between epoll / io_uring / dpdk at runtime via:

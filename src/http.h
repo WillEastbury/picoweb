@@ -45,6 +45,8 @@ typedef struct {
     size_t pw_principal_len;
     const char* pw_tenant;       /* X-PW-Tenant value */
     size_t pw_tenant_len;
+    const char* score_token;     /* X-Score-Token value */
+    size_t score_token_len;
     /* Content-Length value, parsed from header. 0 if header absent or
      * value was "0". On a valid request, body bytes (if any) live in the
      * caller buffer at offset `consumed` and have length `content_length`.

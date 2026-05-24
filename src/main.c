@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <unistd.h>
 #include <errno.h>
 #include <limits.h>
@@ -19,7 +20,7 @@
 
 static void usage(const char* argv0) {
     fprintf(stderr,
-        "usage: %s [--io_uring | --dpdk | --tls] [--sqpoll [--sqpoll-cpu=N]] [--api-root=DIR [--api-prefix=/api/]] [--picowal-device=PATH [--picowal-prefix=/wal/] [--picowal-bytes=N] [--picowal-format] [--oidc-cookie-auth --oidc-cookie-ttl-sec=N --oidc-google-client-id=ID --oidc-entra-client-id=ID [--oidc-entra-tenant=TENANT]]] [--tls-cert=PATH --tls-key=PATH --tls-ifname=IFACE [--tls-peer-mac=MAC] [--tls-xdp [--tls-xdp-queue=N]]] [PORT] [WWWROOT] [WORKERS] [MAXREQS] [ZC_MIN] [POOL_CAP]\n"
+        "usage: %s [--io_uring | --dpdk | --tls] [--sqpoll [--sqpoll-cpu=N]] [--api-root=DIR [--api-prefix=/api/]] [--picowal-device=PATH [--picowal-prefix=/wal/] [--picowal-bytes=N] [--picowal-format] [--picowal-public-http] [--oidc-cookie-auth --oidc-cookie-ttl-sec=N --oidc-google-client-id=ID --oidc-entra-client-id=ID [--oidc-entra-tenant=TENANT]]] [--tls-cert=PATH --tls-key=PATH --tls-ifname=IFACE [--tls-peer-mac=MAC] [--tls-xdp [--tls-xdp-queue=N]]] [PORT] [WWWROOT] [WORKERS] [MAXREQS] [ZC_MIN] [POOL_CAP]\n"
         "\n"
         "  --io_uring   use the io_uring worker backend (Linux 5.6+, no liburing)\n"
         "  --dpdk       use the DPDK userspace backend (NOT BUILT — see\n"
@@ -43,6 +44,7 @@ static void usage(const char* argv0) {
         "  --picowal-prefix=/p/   route prefix for picowal API (default /wal/)\n"
         "  --picowal-bytes=N      raw-volume size in bytes (default 1073741824)\n"
         "  --picowal-format       initialize/format picowal volume when missing\n"
+        "  --picowal-public-http  expose raw /wal/ HTTPS routes (off by default)\n"
         "  --oidc-cookie-auth     require OIDC-backed short-lived cookie auth for /wal/ routes\n"
         "  --oidc-cookie-ttl-sec=N session cookie ttl in seconds (default 900)\n"
         "  --oidc-google-client-id=ID expected Google OAuth client id (aud)\n"
@@ -94,6 +96,7 @@ int main(int argc, char** argv) {
     bool picowal_prefix_set = false;
     unsigned long long picowal_bytes = 1073741824ULL;
     bool picowal_format = false;
+    bool picowal_public_http = false;
     bool oidc_cookie_auth = false;
     uint32_t oidc_cookie_ttl_sec = 900;
     const char* oidc_google_client_id = NULL;
@@ -235,6 +238,10 @@ int main(int argc, char** argv) {
         }
         if (strcmp(argv[i], "--picowal-format") == 0) {
             picowal_format = true;
+            continue;
+        }
+        if (strcmp(argv[i], "--picowal-public-http") == 0) {
+            picowal_public_http = true;
             continue;
         }
         if (strcmp(argv[i], "--oidc-cookie-auth") == 0) {
@@ -392,6 +399,7 @@ int main(int argc, char** argv) {
                               picowal_prefix_cli, picowal_format)) {
             return 1;
         }
+        api_picowal_set_public(picowal_public_http);
     }
     if (oidc_cookie_auth) {
         if (!api_oidc_init(true, oidc_cookie_ttl_sec,
@@ -438,6 +446,18 @@ int main(int argc, char** argv) {
     case PICOWEB_BACKEND_DPDK:  worker_fn = dpdk_worker_main;  backend_name = "dpdk";  break;
     case PICOWEB_BACKEND_TLS:   worker_fn = tls_worker_main;   backend_name = "tls";   break;
     }
+    if (backend != PICOWEB_BACKEND_TLS) {
+        const char* br_primary = getenv("PICOWEB_BROTLI_PRIMARY");
+        if (br_primary && (br_primary[0] == '1' || br_primary[0] == 't' ||
+                           br_primary[0] == 'T' || br_primary[0] == 'y' ||
+                           br_primary[0] == 'Y')) {
+            fprintf(stderr,
+                "picoweb: PICOWEB_BROTLI_PRIMARY requires the TLS backend; "
+                "disabling for backend=%s.\n",
+                backend_name);
+            unsetenv("PICOWEB_BROTLI_PRIMARY");
+        }
+    }
 
     /* SIGPIPE: ignore so writes to a peer-closed socket return EPIPE
      * instead of killing the process. (We also pass MSG_NOSIGNAL on
@@ -455,11 +475,18 @@ int main(int argc, char** argv) {
      * to the inline RFC 6979 path. Only meaningful for the TLS
      * backend, but cheap enough to start unconditionally. */
     if (backend == PICOWEB_BACKEND_TLS) {
-        if (ecdsa_p256_precomp_init(64) != 0) {
+        /* Pool size matters under sustained TLS-handshake bursts: each
+         * tuple is consumed by one handshake and the producer thread
+         * needs time (~5-50 ms) to mint a replacement. A small pool
+         * starves under load and forces the slow inline path on the
+         * tail of every burst, which directly shows up as p99 latency.
+         * 256 ≈ a worst-case handshake burst on a 2-vCPU node while
+         * still costing only ~24 KiB of state. */
+        if (ecdsa_p256_precomp_init(256) != 0) {
             metal_log("warning: ecdsa precompute pool init failed; "
                       "sign() will use inline path");
         } else {
-            metal_log("ecdsa precompute pool: cap=64, producer thread started");
+            metal_log("ecdsa precompute pool: cap=256, producer thread started");
         }
     }
 
@@ -467,6 +494,32 @@ int main(int argc, char** argv) {
     static jumptable_t jt;
     if (!jumptable_build(&jt, wwwroot)) {
         return 2;
+    }
+    /* Walk every reachable response head/body/variant/chrome so the
+     * kernel faults in every arena page before traffic arrives. The
+     * arena is already MAP_POPULATE'd and pinned, so this is mostly
+     * insurance — but it also fault-checks the table itself and warms
+     * the L1/L2 lines for the first burst of requests. */
+    jumptable_prewarm(&jt);
+
+    /* Pin everything mapped so far: code, .data/.bss, every mmap done
+     * during startup (jumptable arena, metrics counters). We DO NOT use
+     * MCL_FUTURE here: libc malloc can transparently use mmap for
+     * larger allocations (musl on Alpine does this for the per-worker
+     * conn tables), and auto-locking every future mapping silently
+     * blows past RLIMIT_MEMLOCK on calloc-sized allocations and turns
+     * into EAGAIN from the libc allocator. The pool, arena and metrics
+     * buffers already mlock themselves explicitly in their own init
+     * paths, so MCL_CURRENT here covers everything that matters
+     * without booby-trapping later allocations. Best-effort: without
+     * CAP_IPC_LOCK we log and continue; the per-mmap pinning will
+     * have logged the same EPERM, giving a consistent
+     * "residency without pinning" mode. */
+    if (mlockall(MCL_CURRENT) != 0) {
+        metal_log("mlockall: %s (add CAP_IPC_LOCK to pin all pages)",
+                  strerror(errno));
+    } else {
+        metal_log("mlockall: pinned current pages");
     }
 
     /* Spawn workers. */

@@ -42,6 +42,15 @@ bool arena_init(arena_t* a, size_t cap_bytes) {
      * we don't care if the kernel ignores it. */
     (void)madvise(p, cap, MADV_HUGEPAGE);
 #endif
+    /* Pin the arena. Arena memory is the head/body/brotli bytes of
+     * every response — the actual static-serving working set. Pinning
+     * removes the kernel from the critical path entirely: no reclaim,
+     * no swap-out, no minor faults from background memory pressure.
+     * Best-effort; logs and continues without CAP_IPC_LOCK. */
+    if (mlock(p, cap) != 0) {
+        metal_log("arena: mlock(%zu) failed: %s (add CAP_IPC_LOCK or raise "
+                  "RLIMIT_MEMLOCK to pin response bodies)", cap, strerror(errno));
+    }
     a->base = (char*)p;
     a->cap = cap;
     a->off = 0;

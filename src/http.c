@@ -191,6 +191,9 @@ http_result_t http_parse(char* buf, size_t buf_len, http_request_t* out) {
             if (metal_ieq(p, 13, "If-None-Match", 13)) {
                 out->if_none_match = tval;
                 out->if_none_match_len = tl;
+            } else if (metal_ieq(p, 13, "X-Score-Token", 13)) {
+                out->score_token = tval;
+                out->score_token_len = tl;
             }
             break;
         case 14:
