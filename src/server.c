@@ -180,7 +180,9 @@ static int g_listen_marker;
 
 static void try_accept(int listen_fd, int ep, pool_t* pool, int64_t batch_now_ms) {
     for (;;) {
-        int c = accept4(listen_fd, NULL, NULL,
+        struct sockaddr_storage peer;
+        socklen_t peer_len = sizeof(peer);
+        int c = accept4(listen_fd, (struct sockaddr*)&peer, &peer_len,
                         SOCK_NONBLOCK | SOCK_CLOEXEC);
         if (c < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) return;
@@ -218,6 +220,14 @@ static void try_accept(int listen_fd, int ep, pool_t* pool, int64_t batch_now_ms
             continue;
         }
         conn->fd = c;
+        conn->peer_ip[0] = '\0';
+        if (peer.ss_family == AF_INET) {
+            struct sockaddr_in* in = (struct sockaddr_in*)&peer;
+            (void)inet_ntop(AF_INET, &in->sin_addr, conn->peer_ip, sizeof(conn->peer_ip));
+        } else if (peer.ss_family == AF_INET6) {
+            struct sockaddr_in6* in6 = (struct sockaddr_in6*)&peer;
+            (void)inet_ntop(AF_INET6, &in6->sin6_addr, conn->peer_ip, sizeof(conn->peer_ip));
+        }
         conn->state = ST_READING;
         conn->read_off = 0;
         conn->res = NULL;
@@ -238,6 +248,7 @@ static void try_accept(int listen_fd, int ep, pool_t* pool, int64_t batch_now_ms
         conn->api_acr_headers_len = 0;
         conn->api_principal_len = 0;
         conn->api_tenant_len = 0;
+        conn->api_score_token_len = 0;
         conn->api_has_pw_auth = false;
         conn->api_path_len = 0;
         conn->last_active_ms = batch_now_ms;
@@ -366,6 +377,9 @@ static void resolve_api_request_context(const conn_t* c, api_request_context_t* 
     memcpy(ctx->tenant_system, "prod", 5);
     memcpy(ctx->tenant_id, "default", 8);
     memcpy(ctx->principal_id, "anonymous", 10);
+    if (c->peer_ip[0]) {
+        snprintf(ctx->client_ip, sizeof(ctx->client_ip), "%s", c->peer_ip);
+    }
 
     (void)api_principal_from_cookie(c->api_cookie, c->api_cookie_len,
                                     ctx->principal_id, sizeof(ctx->principal_id));
@@ -425,6 +439,7 @@ static void api_run(conn_t* c) {
                  body, body_len,
                  c->api_cookie, c->api_cookie_len,
                  c->api_has_pw_auth,
+                 c->api_score_token, c->api_score_token_len,
                  &req_ctx,
                  &c->api_resp);
     api_apply_request_context_headers(&c->api_resp, &req_ctx);
@@ -499,6 +514,7 @@ static __attribute__((hot)) int dispatch_one(conn_t* c, const jumptable_t* jt, u
         c->api_acr_headers_len = 0;
         c->api_principal_len = 0;
         c->api_tenant_len = 0;
+        c->api_score_token_len = 0;
         c->api_path_len     = (uint8_t)req.path_len;
         memcpy(c->api_path, req.path, req.path_len);
         if (req.cookie && req.cookie_len > 0) {
@@ -554,6 +570,15 @@ static __attribute__((hot)) int dispatch_one(conn_t* c, const jumptable_t* jt, u
             memcpy(c->api_tenant, req.pw_tenant, req.pw_tenant_len);
             c->api_tenant[req.pw_tenant_len] = '\0';
             c->api_tenant_len = (uint16_t)req.pw_tenant_len;
+        }
+        if (req.score_token && req.score_token_len > 0) {
+            if (req.score_token_len >= sizeof(c->api_score_token)) {
+                pr = HTTP_ERR_400;
+                goto fallback_static;
+            }
+            memcpy(c->api_score_token, req.score_token, req.score_token_len);
+            c->api_score_token[req.score_token_len] = '\0';
+            c->api_score_token_len = (uint16_t)req.score_token_len;
         }
 
         /* Required header+body footprint must fit in read_buf so that

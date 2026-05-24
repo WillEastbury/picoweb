@@ -1,6 +1,7 @@
 #include "metrics.h"
 #include "util.h"
 
+#include <errno.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -195,15 +196,33 @@ void metrics_init(int n_workers) {
 
     size_t bytes = (size_t)n_workers * sizeof(metrics_t);
     void* p = mmap(NULL, bytes, PROT_READ | PROT_WRITE,
-                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+                   MAP_PRIVATE | MAP_ANONYMOUS
+#ifdef MAP_POPULATE
+                   | MAP_POPULATE
+#endif
+                   , -1, 0);
     if (p == MAP_FAILED) metal_die("mmap metrics array");
+    /* Dirty + pin the per-worker counters so they never incur a fault
+     * on the hot path. memset guarantees real anonymous pages even on
+     * kernels that lazy-fault MAP_POPULATE; mlock pins them. */
+    memset(p, 0, bytes);
+    if (mlock(p, bytes) != 0) {
+        metal_log("metrics: mlock(%zu) failed: %s", bytes, strerror(errno));
+    }
     g_metrics = (metrics_t*)p;
     g_n_workers = n_workers;
 
     /* Allocate the writable /stats body buffer (single page is plenty). */
     void* sp = mmap(NULL, 4096, PROT_READ | PROT_WRITE,
-                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+                    MAP_PRIVATE | MAP_ANONYMOUS
+#ifdef MAP_POPULATE
+                    | MAP_POPULATE
+#endif
+                    , -1, 0);
     if (sp == MAP_FAILED) metal_die("mmap stats body");
+    if (mlock(sp, 4096) != 0) {
+        metal_log("metrics: mlock(stats body) failed: %s", strerror(errno));
+    }
     g_stats_body = (char*)sp;
     memcpy(g_stats_body, STATS_BODY_TEMPLATE, STATS_BODY_LEN);
 

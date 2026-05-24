@@ -54,6 +54,7 @@ typedef struct {
     char principal_id[128];  /* request principal id resolved from session cookie */
     char tenant_id[64];      /* tenant id from first host component */
     char tenant_system[8];   /* dev / qa / prod from second host component */
+    char client_ip[64];      /* peer IP for rate limiting; empty when unknown */
 } api_request_context_t;
 
 /* Configure once on the main thread before workers spawn. Creates root
@@ -79,6 +80,7 @@ size_t api_max_request_body(void);
  * (default "/wal/"). This can be enabled alongside the JSON file backend. */
 bool api_picowal_init(const char* device_path, uint64_t volume_bytes,
                       const char* prefix, bool format);
+void api_picowal_set_public(bool public_routes);
 
 /* Optional OIDC-backed cookie auth for picowal routes. When enabled,
  * non-auth picowal endpoints require an authenticated session cookie.
@@ -110,6 +112,7 @@ void api_dispatch(http_method_t method,
                   const char* body, size_t body_len,
                   const char* cookie, size_t cookie_len,
                   bool has_pw_auth_header,
+                  const char* score_token, size_t score_token_len,
                   const api_request_context_t* req_ctx,
                   api_resp_t* resp);
 

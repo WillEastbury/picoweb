@@ -1,9 +1,11 @@
 /* api.c — simple JSON-file CRUD for picoweb. See api.h for protocol. */
 
 #include "api.h"
+#include "picowal_api.h"
 #include "picowal_db.h"
 #include "picowal_query.h"
 #include "picowal_validate.h"
+#include "../userspace/crypto/hmac.h"
 
 #include <ctype.h>
 #include <errno.h>
@@ -30,8 +32,36 @@ static size_t g_prefix_len   = 0;
 static bool   g_enabled      = false;
 static picowal_db_t* g_picowal = NULL;
 static bool   g_picowal_enabled = false;
+static bool   g_picowal_public_http = false;
 static char   g_picowal_prefix[64] = {0};
 static size_t g_picowal_prefix_len = 0;
+
+#define SCORE_CARD_ID             42u
+#define SCORE_TOKEN_TTL_SEC       900
+#define SCORE_NONCES_MAX          4096
+#define SCORE_RATE_BUCKETS        256
+#define SCORE_RATE_CAPACITY       12
+#define SCORE_RATE_REFILL_PER_SEC 0.2
+
+typedef struct {
+    bool used;
+    bool consumed;
+    int64_t exp_unix;
+    uint8_t nonce[16];
+} score_nonce_t;
+
+typedef struct {
+    bool used;
+    char key[64];
+    double tokens;
+    int64_t last_unix;
+} score_rate_bucket_t;
+
+static pthread_mutex_t g_score_mu = PTHREAD_MUTEX_INITIALIZER;
+static uint8_t g_score_secret[32];
+static bool g_score_secret_ready = false;
+static score_nonce_t g_score_nonces[SCORE_NONCES_MAX];
+static score_rate_bucket_t g_score_rate[SCORE_RATE_BUCKETS];
 
 #define AUTH_COOKIE_NAME       "pw_session"
 #define AUTH_COOKIE_VALUE_CAP  64
@@ -61,6 +91,27 @@ bool api_enabled(void)              { return g_enabled; }
 bool api_picowal_enabled(void)      { return g_picowal_enabled; }
 size_t api_max_request_body(void)   { return API_REQ_BODY_CAP; }
 
+static const char* public_api_prefix(size_t* out_len) {
+    if (g_enabled && g_prefix_len > 0) {
+        if (out_len) *out_len = g_prefix_len;
+        return g_prefix;
+    }
+    if (out_len) *out_len = 5;
+    return "/api/";
+}
+
+static bool score_path_matches(const char* path, size_t path_len) {
+    size_t prefix_len = 0;
+    const char* prefix = public_api_prefix(&prefix_len);
+    return g_picowal_enabled &&
+           path_len >= prefix_len + 6 &&
+           memcmp(path, prefix, prefix_len) == 0 &&
+           memcmp(path + prefix_len, "scores", 6) == 0 &&
+           (path_len == prefix_len + 6 ||
+            (path_len == prefix_len + 12 &&
+             memcmp(path + prefix_len + 6, "/start", 6) == 0));
+}
+
 static bool valid_prefix(const char* prefix, size_t cap, const char* label) {
     size_t pl = prefix ? strlen(prefix) : 0;
     if (pl < 2 || pl >= cap) {
@@ -81,7 +132,8 @@ bool api_path_matches(const char* path, size_t path_len) {
     if (g_enabled &&
         path_len >= g_prefix_len &&
         memcmp(path, g_prefix, g_prefix_len) == 0) return true;
-    if (g_picowal_enabled &&
+    if (score_path_matches(path, path_len)) return true;
+    if (g_picowal_enabled && g_picowal_public_http &&
         path_len >= g_picowal_prefix_len &&
         memcmp(path, g_picowal_prefix, g_picowal_prefix_len) == 0) return true;
     return false;
@@ -172,6 +224,10 @@ bool api_picowal_init(const char* device_path, uint64_t volume_bytes,
     return true;
 }
 
+void api_picowal_set_public(bool public_routes) {
+    g_picowal_public_http = public_routes;
+}
+
 bool api_oidc_init(bool cookie_auth_enabled, uint32_t cookie_ttl_sec,
                    const char* google_client_id,
                    const char* entra_client_id,
@@ -241,6 +297,108 @@ static bool gen_session_id_hex(char out[AUTH_COOKIE_VALUE_CAP + 1]) {
     }
     out[AUTH_COOKIE_VALUE_CAP] = '\0';
     return true;
+}
+
+static bool fill_random(uint8_t* out, size_t len) {
+    size_t got = 0;
+    while (got < len) {
+        ssize_t r = getrandom(out + got, len - got, 0);
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            return false;
+        }
+        got += (size_t)r;
+    }
+    return true;
+}
+
+static void hex_encode(const uint8_t* in, size_t len, char* out) {
+    static const char hex[] = "0123456789abcdef";
+    for (size_t i = 0; i < len; i++) {
+        out[i * 2] = hex[(in[i] >> 4) & 0xF];
+        out[i * 2 + 1] = hex[in[i] & 0xF];
+    }
+    out[len * 2] = '\0';
+}
+
+static int hex_val(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+static bool hex_decode(const char* in, size_t len, uint8_t* out, size_t out_len) {
+    if (len != out_len * 2) return false;
+    for (size_t i = 0; i < out_len; i++) {
+        int hi = hex_val(in[i * 2]);
+        int lo = hex_val(in[i * 2 + 1]);
+        if (hi < 0 || lo < 0) return false;
+        out[i] = (uint8_t)((hi << 4) | lo);
+    }
+    return true;
+}
+
+static bool score_secret_ready(void) {
+    if (g_score_secret_ready) return true;
+    pthread_mutex_lock(&g_score_mu);
+    if (!g_score_secret_ready) {
+        g_score_secret_ready = fill_random(g_score_secret, sizeof(g_score_secret));
+    }
+    bool ok = g_score_secret_ready;
+    pthread_mutex_unlock(&g_score_mu);
+    return ok;
+}
+
+static bool constant_time_eq(const uint8_t* a, const uint8_t* b, size_t n) {
+    uint8_t diff = 0;
+    for (size_t i = 0; i < n; i++) diff |= (uint8_t)(a[i] ^ b[i]);
+    return diff == 0;
+}
+
+static uint32_t rate_hash(const char* s) {
+    uint32_t h = 2166136261u;
+    if (!s || !s[0]) s = "unknown";
+    for (; *s; s++) {
+        h ^= (unsigned char)*s;
+        h *= 16777619u;
+    }
+    return h;
+}
+
+static bool score_rate_allow(const api_request_context_t* ctx, const char* suffix,
+                             int64_t now_sec) {
+    char key[64];
+    const char* ip = (ctx && ctx->client_ip[0]) ? ctx->client_ip : "unknown";
+    snprintf(key, sizeof(key), "%s:%s", ip, suffix);
+    uint32_t start = rate_hash(key) % SCORE_RATE_BUCKETS;
+    pthread_mutex_lock(&g_score_mu);
+    score_rate_bucket_t* chosen = NULL;
+    for (uint32_t i = 0; i < SCORE_RATE_BUCKETS; i++) {
+        score_rate_bucket_t* b = &g_score_rate[(start + i) % SCORE_RATE_BUCKETS];
+        if (!b->used || strcmp(b->key, key) == 0) {
+            chosen = b;
+            break;
+        }
+    }
+    if (!chosen) chosen = &g_score_rate[start];
+    if (!chosen->used || strcmp(chosen->key, key) != 0) {
+        memset(chosen, 0, sizeof(*chosen));
+        chosen->used = true;
+        snprintf(chosen->key, sizeof(chosen->key), "%s", key);
+        chosen->tokens = SCORE_RATE_CAPACITY;
+        chosen->last_unix = now_sec;
+    }
+    int64_t elapsed = now_sec - chosen->last_unix;
+    if (elapsed > 0) {
+        chosen->tokens += (double)elapsed * SCORE_RATE_REFILL_PER_SEC;
+        if (chosen->tokens > SCORE_RATE_CAPACITY) chosen->tokens = SCORE_RATE_CAPACITY;
+        chosen->last_unix = now_sec;
+    }
+    bool ok = chosen->tokens >= 1.0;
+    if (ok) chosen->tokens -= 1.0;
+    pthread_mutex_unlock(&g_score_mu);
+    return ok;
 }
 
 static void auth_prune_locked(int64_t now_sec) {
@@ -411,6 +569,32 @@ static bool json_extract_string_field(const char* json, const char* key,
         }
         if (*p != '"') return false;
         out[o] = '\0';
+        return true;
+    }
+    return false;
+}
+
+static bool json_extract_u32_field(const char* json, const char* key,
+                                   uint32_t max, uint32_t* out) {
+    if (!json || !key || !out) return false;
+    char needle[96];
+    int nn = snprintf(needle, sizeof(needle), "\"%s\"", key);
+    if (nn <= 0 || (size_t)nn >= sizeof(needle)) return false;
+    const char* p = json;
+    while ((p = strstr(p, needle)) != NULL) {
+        p += (size_t)nn;
+        while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+        if (*p != ':') continue;
+        p++;
+        while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+        if (*p < '0' || *p > '9') continue;
+        uint64_t v = 0;
+        while (*p >= '0' && *p <= '9') {
+            v = v * 10u + (uint64_t)(*p - '0');
+            if (v > max) return false;
+            p++;
+        }
+        *out = (uint32_t)v;
         return true;
     }
     return false;
@@ -674,7 +858,7 @@ void api_apply_cors(api_resp_t* resp,
     static const char k_allow_methods[] =
         "Access-Control-Allow-Methods: GET, HEAD, POST, PUT, DELETE, OPTIONS\r\n";
     static const char k_allow_headers[] = "Access-Control-Allow-Headers: ";
-    static const char k_default_headers[] = "Content-Type, X-PW-Auth";
+    static const char k_default_headers[] = "Content-Type, X-PW-Auth, X-Score-Token";
     static const char k_max_age[] = "Access-Control-Max-Age: 600\r\n";
     static const char k_crlf[] = "\r\n";
 
@@ -1296,6 +1480,313 @@ static void resp_created(api_resp_t* r, const char* prefix,
                      (int)coll_len, coll,
                      (int)id_len, id);
     r->head_len = (n > 0) ? (size_t)n : 0;
+}
+
+typedef struct {
+    char name[33];
+    uint32_t score;
+    char ts[32];
+    char day[11];
+} score_entry_t;
+
+static void score_day_utc(int64_t unix_sec, char out[11]) {
+    time_t t = (time_t)unix_sec;
+    struct tm tmv;
+    if (!gmtime_r(&t, &tmv)) {
+        memcpy(out, "1970-01-01", 11);
+        return;
+    }
+    snprintf(out, 11, "%04d-%02d-%02d",
+             tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday);
+}
+
+static void score_ts_utc(int64_t unix_sec, char out[32]) {
+    time_t t = (time_t)unix_sec;
+    struct tm tmv;
+    if (!gmtime_r(&t, &tmv)) {
+        memcpy(out, "1970-01-01T00:00:00Z", 21);
+        return;
+    }
+    strftime(out, 32, "%Y-%m-%dT%H:%M:%SZ", &tmv);
+}
+
+static void score_clean_name(const char* in, char out[33]) {
+    size_t o = 0;
+    if (in) {
+        for (size_t i = 0; in[i] && o < 32; i++) {
+            unsigned char c = (unsigned char)in[i];
+            if (c < 0x20 || c > 0x7e || c == '"' || c == '\\') continue;
+            out[o++] = (char)c;
+        }
+    }
+    while (o > 0 && out[o - 1] == ' ') o--;
+    if (o == 0) {
+        memcpy(out, "anon", 5);
+        return;
+    }
+    out[o] = '\0';
+}
+
+static int score_entry_cmp(const void* ap, const void* bp) {
+    const score_entry_t* a = (const score_entry_t*)ap;
+    const score_entry_t* b = (const score_entry_t*)bp;
+    if (a->score != b->score) return (a->score < b->score) ? 1 : -1;
+    return strcmp(a->ts, b->ts);
+}
+
+static bool score_append_json_entry(char* out, size_t cap, size_t* off,
+                                    const score_entry_t* e) {
+    int n = snprintf(out + *off, cap - *off,
+                     "{\"name\":\"%s\",\"score\":%u,\"ts\":\"%s\",\"day\":\"%s\"}",
+                     e->name, e->score, e->ts, e->day);
+    if (n < 0 || (size_t)n >= cap - *off) return false;
+    *off += (size_t)n;
+    return true;
+}
+
+static bool score_issue_token(char out[128], int64_t now_sec) {
+    if (!score_secret_ready()) return false;
+    uint8_t nonce[16];
+    if (!fill_random(nonce, sizeof(nonce))) return false;
+    int64_t exp = now_sec + SCORE_TOKEN_TTL_SEC;
+
+    char nonce_hex[33];
+    hex_encode(nonce, sizeof(nonce), nonce_hex);
+    char msg[64];
+    int mn = snprintf(msg, sizeof(msg), "%s.%lld", nonce_hex, (long long)exp);
+    if (mn <= 0 || (size_t)mn >= sizeof(msg)) return false;
+    uint8_t tag[HMAC_SHA256_TAG_LEN];
+    hmac_sha256(g_score_secret, sizeof(g_score_secret), msg, (size_t)mn, tag);
+    char tag_hex[HMAC_SHA256_TAG_LEN * 2 + 1];
+    hex_encode(tag, sizeof(tag), tag_hex);
+    int tn = snprintf(out, 128, "%s.%lld.%s", nonce_hex, (long long)exp, tag_hex);
+    if (tn <= 0 || tn >= 128) return false;
+
+    pthread_mutex_lock(&g_score_mu);
+    size_t slot = SCORE_NONCES_MAX;
+    for (size_t i = 0; i < SCORE_NONCES_MAX; i++) {
+        if (g_score_nonces[i].used && g_score_nonces[i].exp_unix <= now_sec) {
+            memset(&g_score_nonces[i], 0, sizeof(g_score_nonces[i]));
+        }
+        if (slot == SCORE_NONCES_MAX && !g_score_nonces[i].used) slot = i;
+    }
+    if (slot == SCORE_NONCES_MAX) slot = (size_t)(rate_hash(nonce_hex) % SCORE_NONCES_MAX);
+    g_score_nonces[slot].used = true;
+    g_score_nonces[slot].consumed = false;
+    g_score_nonces[slot].exp_unix = exp;
+    memcpy(g_score_nonces[slot].nonce, nonce, sizeof(nonce));
+    pthread_mutex_unlock(&g_score_mu);
+    return true;
+}
+
+static bool score_consume_token(const char* token, size_t token_len, int64_t now_sec) {
+    if (!score_secret_ready() || !token || token_len >= 128 || token_len < 99) return false;
+    char tmp[128];
+    memcpy(tmp, token, token_len);
+    tmp[token_len] = '\0';
+    char* dot1 = strchr(tmp, '.');
+    if (!dot1) return false;
+    char* dot2 = strchr(dot1 + 1, '.');
+    if (!dot2) return false;
+    *dot1 = '\0';
+    *dot2 = '\0';
+    const char* nonce_hex = tmp;
+    const char* exp_str = dot1 + 1;
+    const char* tag_hex = dot2 + 1;
+    uint8_t nonce[16];
+    uint8_t tag[HMAC_SHA256_TAG_LEN];
+    if (!hex_decode(nonce_hex, strlen(nonce_hex), nonce, sizeof(nonce))) return false;
+    if (!hex_decode(tag_hex, strlen(tag_hex), tag, sizeof(tag))) return false;
+    char* end = NULL;
+    long long exp_ll = strtoll(exp_str, &end, 10);
+    if (end == exp_str || *end != '\0' || exp_ll <= now_sec) return false;
+    char msg[64];
+    int mn = snprintf(msg, sizeof(msg), "%s.%lld", nonce_hex, exp_ll);
+    if (mn <= 0 || (size_t)mn >= sizeof(msg)) return false;
+    uint8_t expected[HMAC_SHA256_TAG_LEN];
+    hmac_sha256(g_score_secret, sizeof(g_score_secret), msg, (size_t)mn, expected);
+    if (!constant_time_eq(tag, expected, sizeof(tag))) return false;
+
+    bool ok = false;
+    pthread_mutex_lock(&g_score_mu);
+    for (size_t i = 0; i < SCORE_NONCES_MAX; i++) {
+        if (!g_score_nonces[i].used) continue;
+        if (g_score_nonces[i].exp_unix <= now_sec) {
+            memset(&g_score_nonces[i], 0, sizeof(g_score_nonces[i]));
+            continue;
+        }
+        if (!g_score_nonces[i].consumed &&
+            g_score_nonces[i].exp_unix == (int64_t)exp_ll &&
+            memcmp(g_score_nonces[i].nonce, nonce, sizeof(nonce)) == 0) {
+            g_score_nonces[i].consumed = true;
+            ok = true;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_score_mu);
+    return ok;
+}
+
+static bool score_parse_entry(const char* json, size_t len, score_entry_t* out) {
+    if (!json || !out || len == 0 || len > PICOWAL_DATA_MAX) return false;
+    char tmp[PICOWAL_DATA_MAX + 1];
+    memcpy(tmp, json, len);
+    tmp[len] = '\0';
+    char name[64];
+    uint32_t score = 0;
+    char ts[32] = {0};
+    char day[11] = {0};
+    if (!json_extract_string_field(tmp, "name", name, sizeof(name))) return false;
+    if (!json_extract_u32_field(tmp, "score", 1000000000u, &score)) return false;
+    if (!json_extract_string_field(tmp, "ts", ts, sizeof(ts))) return false;
+    (void)json_extract_string_field(tmp, "day", day, sizeof(day));
+    memset(out, 0, sizeof(*out));
+    score_clean_name(name, out->name);
+    out->score = score;
+    snprintf(out->ts, sizeof(out->ts), "%s", ts);
+    if (day[0]) snprintf(out->day, sizeof(out->day), "%s", day);
+    else snprintf(out->day, sizeof(out->day), "%.10s", ts);
+    return true;
+}
+
+static void dispatch_scores(http_method_t method,
+                            const char* path, size_t path_len,
+                            const char* body, size_t body_len,
+                            const char* score_token, size_t score_token_len,
+                            const api_request_context_t* req_ctx,
+                            api_resp_t* resp) {
+    if (!g_picowal_enabled || !g_picowal) {
+        resp_status_only(resp, 404, "Not Found");
+        return;
+    }
+    int64_t now = now_unix_sec();
+    size_t prefix_len = 0;
+    (void)public_api_prefix(&prefix_len);
+    bool is_start = path_len == prefix_len + 12 &&
+                    memcmp(path + prefix_len, "scores/start", 12) == 0;
+    if (!score_rate_allow(req_ctx, is_start ? "start" : "scores", now)) {
+        resp_text_error(resp, 429, "Too Many Requests", "rate limit exceeded\n");
+        return;
+    }
+    if (is_start) {
+        if (method != M_POST) {
+            resp_status_only(resp, 405, "Method Not Allowed");
+            return;
+        }
+        char token[128];
+        if (!score_issue_token(token, now)) {
+            resp_text_error(resp, 500, "Internal Server Error", "token issue failed\n");
+            return;
+        }
+        char* out = (char*)malloc(192);
+        if (!out) {
+            resp_status_only(resp, 500, "Internal Server Error");
+            return;
+        }
+        int n = snprintf(out, 192, "{\"token\":\"%s\",\"expiresIn\":%d}\n",
+                         token, SCORE_TOKEN_TTL_SEC);
+        resp_get_body(resp, out, (size_t)n, false);
+        return;
+    }
+
+    if (method == M_GET || method == M_HEAD) {
+        uint32_t records[2048];
+        uint32_t nrec = picowal_api_list(g_picowal, SCORE_CARD_ID, records,
+                                         (uint32_t)(sizeof(records) / sizeof(records[0])));
+        score_entry_t all[2048];
+        score_entry_t today[2048];
+        size_t all_n = 0, today_n = 0;
+        char day[11];
+        score_day_utc(now, day);
+        for (uint32_t i = 0; i < nrec; i++) {
+            char buf[PICOWAL_DATA_MAX + 1];
+            uint32_t got = 0;
+            if (picowal_api_get(g_picowal, SCORE_CARD_ID, records[i], buf,
+                                PICOWAL_DATA_MAX, &got) != PICOWAL_API_OK) {
+                continue;
+            }
+            score_entry_t e;
+            if (!score_parse_entry(buf, got, &e) || e.score == 0) continue;
+            if (all_n < sizeof(all) / sizeof(all[0])) all[all_n++] = e;
+            if (strcmp(e.day, day) == 0 && today_n < sizeof(today) / sizeof(today[0])) {
+                today[today_n++] = e;
+            }
+        }
+        qsort(all, all_n, sizeof(all[0]), score_entry_cmp);
+        qsort(today, today_n, sizeof(today[0]), score_entry_cmp);
+        if (all_n > 20) all_n = 20;
+        if (today_n > 20) today_n = 20;
+        char* out = (char*)malloc(8192);
+        if (!out) {
+            resp_status_only(resp, 500, "Internal Server Error");
+            return;
+        }
+        size_t off = 0;
+        off += (size_t)snprintf(out + off, 8192 - off, "{\"alltime\":[");
+        for (size_t i = 0; i < all_n; i++) {
+            if (i) out[off++] = ',';
+            if (!score_append_json_entry(out, 8192, &off, &all[i])) goto scores_oom;
+        }
+        off += (size_t)snprintf(out + off, 8192 - off, "],\"today\":[");
+        for (size_t i = 0; i < today_n; i++) {
+            if (i) out[off++] = ',';
+            if (!score_append_json_entry(out, 8192, &off, &today[i])) goto scores_oom;
+        }
+        if (off + 3 >= 8192) goto scores_oom;
+        memcpy(out + off, "]}\n", 3);
+        off += 3;
+        resp_get_body(resp, out, off, method == M_HEAD);
+        return;
+scores_oom:
+        free(out);
+        resp_text_error(resp, 500, "Internal Server Error", "scores response too large\n");
+        return;
+    }
+
+    if (method == M_POST) {
+        if (body_len == 0 || body_len > 512) {
+            resp_status_only(resp, 413, "Payload Too Large");
+            return;
+        }
+        if (!score_consume_token(score_token, score_token_len, now)) {
+            resp_text_error(resp, 401, "Unauthorized", "invalid score token\n");
+            return;
+        }
+        char tmp[513];
+        memcpy(tmp, body, body_len);
+        tmp[body_len] = '\0';
+        char name_raw[64];
+        uint32_t score = 0;
+        if (!json_extract_string_field(tmp, "name", name_raw, sizeof(name_raw)) ||
+            !json_extract_u32_field(tmp, "score", 1000000000u, &score) ||
+            score == 0) {
+            resp_text_error(resp, 400, "Bad Request", "invalid score\n");
+            return;
+        }
+        char name[33], ts[32], day[11];
+        score_clean_name(name_raw, name);
+        score_ts_utc(now, ts);
+        score_day_utc(now, day);
+        char doc[256];
+        int dn = snprintf(doc, sizeof(doc),
+                          "{\"name\":\"%s\",\"score\":%u,\"ts\":\"%s\",\"day\":\"%s\"}\n",
+                          name, score, ts, day);
+        if (dn <= 0 || (size_t)dn >= sizeof(doc)) {
+            resp_text_error(resp, 400, "Bad Request", "invalid score\n");
+            return;
+        }
+        uint32_t rec = 0;
+        picowal_api_status_t st = picowal_api_create_random(g_picowal, SCORE_CARD_ID,
+                                                             doc, (uint32_t)dn, &rec);
+        if (st != PICOWAL_API_OK) {
+            resp_text_error(resp, 500, "Internal Server Error", "score write failed\n");
+            return;
+        }
+        resp_status_only(resp, 201, "Created");
+        return;
+    }
+
+    resp_status_only(resp, 405, "Method Not Allowed");
 }
 
 /* ---------- random id generator (hex32) ---------- */
@@ -2045,12 +2536,13 @@ void api_dispatch(http_method_t method,
                   const char* body, size_t body_len,
                   const char* cookie, size_t cookie_len,
                   bool has_pw_auth_header,
-                  const api_request_context_t* req_ctx,
-                  api_resp_t* resp) {
-    (void)req_ctx;
+                 const char* score_token, size_t score_token_len,
+                 const api_request_context_t* req_ctx,
+                 api_resp_t* resp) {
     memset(resp, 0, sizeof(*resp));
     if (method == M_OPTIONS) {
-        if ((g_picowal_enabled &&
+        if (score_path_matches(path, path_len) ||
+            (g_picowal_enabled && g_picowal_public_http &&
              path_len >= g_picowal_prefix_len &&
              memcmp(path, g_picowal_prefix, g_picowal_prefix_len) == 0) ||
             (g_enabled &&
@@ -2062,7 +2554,12 @@ void api_dispatch(http_method_t method,
         }
         return;
     }
-    if (g_picowal_enabled &&
+    if (score_path_matches(path, path_len)) {
+        dispatch_scores(method, path, path_len, body, body_len,
+                        score_token, score_token_len, req_ctx, resp);
+        return;
+    }
+    if (g_picowal_enabled && g_picowal_public_http &&
         path_len >= g_picowal_prefix_len &&
         memcmp(path, g_picowal_prefix, g_picowal_prefix_len) == 0) {
         dispatch_picowal(method, path, path_len, body, body_len,

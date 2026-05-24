@@ -22,6 +22,7 @@
 #endif
 
 #include "server.h"
+#include "api.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -34,10 +35,13 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/epoll.h>
+#include <sys/mman.h>
 #include <sys/random.h>
 #include <sys/socket.h>
 #include <time.h>
 #include <unistd.h>
+
+#include <brotli/decode.h>
 
 #include "../userspace/tls/cert.h"
 #include "../userspace/tls/engine.h"
@@ -96,6 +100,7 @@ typedef struct {
 
     int             ticket_emitted;
     int             want_close;     /* HTTP signalled close; finish TX then exit */
+    char            peer_ip[64];
 } kconn_t;
 
 struct tls_kworker {
@@ -122,11 +127,74 @@ struct tls_kworker {
     uint16_t               cert_sig_scheme;
 
     pw_tls_ticket_store_t  ticket_store;
+
+    uint8_t*               br_identity_scratch;
+    size_t                 br_identity_scratch_len;
 };
 
 /* Marker used to identify the listen-fd event vs per-conn events
  * via epoll_event.data.ptr. */
 static int g_listen_marker;
+
+static bool is_ctx_token_char(char c) {
+    return (c >= 'a' && c <= 'z') ||
+           (c >= 'A' && c <= 'Z') ||
+           (c >= '0' && c <= '9') ||
+           c == '-' || c == '_';
+}
+
+static void resolve_api_request_context_tls(const http_request_t* req,
+                                            api_request_context_t* ctx) {
+    memset(ctx, 0, sizeof(*ctx));
+    memcpy(ctx->tenant_system, "prod", 5);
+    memcpy(ctx->tenant_id, "default", 8);
+    memcpy(ctx->principal_id, "anonymous", 10);
+
+    (void)api_principal_from_cookie(req->cookie, req->cookie_len,
+                                    ctx->principal_id, sizeof(ctx->principal_id));
+
+    if (req->host_len > 0) {
+        const char* h = req->host;
+        size_t n = req->host_len;
+        size_t dot1 = 0;
+        while (dot1 < n && h[dot1] != '.') dot1++;
+        if (dot1 > 0) {
+            size_t o = 0;
+            for (size_t i = 0; i < dot1 && o + 1 < sizeof(ctx->tenant_id); i++) {
+                char ch = h[i];
+                if (!is_ctx_token_char(ch)) continue;
+                ctx->tenant_id[o++] = ch;
+            }
+            if (o > 0) ctx->tenant_id[o] = '\0';
+        }
+        if (dot1 + 1 < n) {
+            size_t s2 = dot1 + 1;
+            size_t e2 = s2;
+            while (e2 < n && h[e2] != '.') e2++;
+            size_t l2 = e2 - s2;
+            if ((l2 == 3 && memcmp(h + s2, "dev", 3) == 0) ||
+                (l2 == 2 && memcmp(h + s2, "qa", 2) == 0) ||
+                (l2 == 4 && memcmp(h + s2, "prod", 4) == 0)) {
+                snprintf(ctx->tenant_system, sizeof(ctx->tenant_system), "%.*s", (int)l2, h + s2);
+            }
+        }
+    }
+}
+
+static void api_apply_request_context_headers_tls(api_resp_t* resp,
+                                                  const api_request_context_t* ctx) {
+    if (!resp || !ctx) return;
+    size_t rem = (resp->head_len < sizeof(resp->head)) ? (sizeof(resp->head) - resp->head_len) : 0;
+    if (rem < 8) return;
+    int n = snprintf(resp->head + resp->head_len, rem,
+                     "X-PW-Principal-Id: %s\r\n"
+                     "X-PW-Tenant-Id: %s\r\n"
+                     "X-PW-Tenant-System: %s\r\n",
+                     ctx->principal_id,
+                     ctx->tenant_id,
+                     ctx->tenant_system);
+    if (n > 0 && (size_t)n < rem) resp->head_len += (size_t)n;
+}
 
 /* -----------------------------------------------------------------
  * RNG, file slurp, cert chain length parser
@@ -383,9 +451,61 @@ static int build_http_response_iov(kconn_t* c,
         c->req_count >= w->cfg->max_requests_per_conn) close_after = true;
 
     const resource_compress_t* variant = NULL;
-    if (pr == HTTP_OK && !head_only) {
+    if (pr == HTTP_OK) {
         if      (req->accept_br && r->brotli)     variant = r->brotli;
         else if (req->accept_pc && r->compressed) variant = r->compressed;
+    }
+
+    if (pr == HTTP_OK && req->if_none_match &&
+        (req->method == M_GET || req->method == M_HEAD)) {
+        const char* etag = NULL;
+        const char* w304 = NULL;
+        size_t w304_len  = 0;
+        if (variant) {
+            etag = variant->etag; w304 = variant->wire_304; w304_len = variant->wire_304_len;
+        } else if (r->etag[0] != '\0') {
+            etag = r->etag; w304 = r->wire_304; w304_len = r->wire_304_len;
+        }
+        if (etag && w304 && etag_matches(req->if_none_match, req->if_none_match_len, etag)) {
+            unsigned n304 = 0;
+            out[n304++] = (pw_iov_t){ .base = (const uint8_t*)w304, .len = w304_len };
+            out[n304++] = (pw_iov_t){
+                .base = close_after ? (const uint8_t*)CONN_CLOSE : (const uint8_t*)CONN_KA,
+                .len  = close_after ? (sizeof(CONN_CLOSE) - 1) : (sizeof(CONN_KA) - 1)
+            };
+            *out_n = n304;
+            *out_close_after = close_after;
+            return 0;
+        }
+    }
+
+    const uint8_t* decoded_body = NULL;
+    size_t decoded_body_len = 0;
+    if (pr == HTTP_OK && !head_only && !variant &&
+        r->brotli_primary && r->brotli) {
+        size_t need = r->identity_len ? r->identity_len : r->brotli->decoded_len;
+        if (!w->br_identity_scratch || need > w->br_identity_scratch_len) {
+            metal_log("brotli identity scratch too small: need=%zu have=%zu",
+                      need, w->br_identity_scratch_len);
+            r = w->cfg->jt->err_500;
+            close_after = true;
+        } else {
+            size_t out_len = need;
+            BrotliDecoderResult brc = BrotliDecoderDecompress(
+                r->brotli->body_len,
+                (const uint8_t*)r->brotli->body,
+                &out_len,
+                w->br_identity_scratch);
+            if (brc != BROTLI_DECODER_RESULT_SUCCESS || out_len != need) {
+                metal_log("brotli identity decode failed: rc=%d out=%zu need=%zu",
+                          (int)brc, out_len, need);
+                r = w->cfg->jt->err_500;
+                close_after = true;
+            } else {
+                decoded_body = w->br_identity_scratch;
+                decoded_body_len = out_len;
+            }
+        }
     }
 
     unsigned n = 0;
@@ -401,6 +521,8 @@ static int build_http_response_iov(kconn_t* c,
     if (!head_only) {
         if (variant) {
             out[n++] = (pw_iov_t){ .base = (const uint8_t*)variant->body, .len = variant->body_len };
+        } else if (decoded_body) {
+            out[n++] = (pw_iov_t){ .base = decoded_body, .len = decoded_body_len };
         } else {
             if (r->chrome && r->chrome->hdr_len)
                 out[n++] = (pw_iov_t){ .base = (const uint8_t*)r->chrome->hdr, .len = r->chrome->hdr_len };
@@ -411,28 +533,45 @@ static int build_http_response_iov(kconn_t* c,
         }
     }
 
-    if (pr == HTTP_OK && req->if_none_match &&
-        (req->method == M_GET || req->method == M_HEAD)) {
-        const char* etag = NULL;
-        const char* w304 = NULL;
-        size_t w304_len  = 0;
-        if (variant) {
-            etag = variant->etag; w304 = variant->wire_304; w304_len = variant->wire_304_len;
-        } else if (r->etag[0] != '\0') {
-            etag = r->etag; w304 = r->wire_304; w304_len = r->wire_304_len;
-        }
-        if (etag && w304 && etag_matches(req->if_none_match, req->if_none_match_len, etag)) {
-            n = 0;
-            out[n++] = (pw_iov_t){ .base = (const uint8_t*)w304, .len = w304_len };
-            out[n++] = (pw_iov_t){
-                .base = close_after ? (const uint8_t*)CONN_CLOSE : (const uint8_t*)CONN_KA,
-                .len  = close_after ? (sizeof(CONN_CLOSE) - 1) : (sizeof(CONN_KA) - 1)
-            };
-        }
-    }
-
     *out_n = n;
     *out_close_after = close_after;
+    return 0;
+}
+
+static int build_api_response_iov(kconn_t* c, const http_request_t* req,
+                                  api_resp_t* api_resp,
+                                  pw_iov_t* out, unsigned* out_n,
+                                  bool* out_close_after) {
+    memset(api_resp, 0, sizeof(*api_resp));
+
+    const char* body = c->plain + req->consumed;
+    api_request_context_t req_ctx;
+    resolve_api_request_context_tls(req, &req_ctx);
+    if (c->peer_ip[0]) {
+        snprintf(req_ctx.client_ip, sizeof(req_ctx.client_ip), "%s", c->peer_ip);
+    }
+    api_dispatch(req->method, req->path, req->path_len,
+                 body, req->content_length,
+                 req->cookie, req->cookie_len,
+                 req->pw_auth_header,
+                 req->score_token, req->score_token_len,
+                 &req_ctx,
+                 api_resp);
+    api_apply_request_context_headers_tls(api_resp, &req_ctx);
+    api_apply_cors(api_resp,
+                   req->origin, req->origin_len,
+                   req->acr_headers, req->acr_headers_len);
+
+    c->req_count++;
+
+    unsigned n = 0;
+    out[n++] = (pw_iov_t){ .base = (const uint8_t*)api_resp->head, .len = api_resp->head_len };
+    out[n++] = (pw_iov_t){ .base = (const uint8_t*)CONN_CLOSE, .len = sizeof(CONN_CLOSE) - 1 };
+    if (req->method != M_HEAD && api_resp->body && api_resp->body_len > 0) {
+        out[n++] = (pw_iov_t){ .base = (const uint8_t*)api_resp->body, .len = api_resp->body_len };
+    }
+    *out_n = n;
+    *out_close_after = true;
     return 0;
 }
 
@@ -585,23 +724,46 @@ static int tls_drive_engine(kconn_t* c, bool* out_close_after_drain) {
 
             http_request_t req = b->req;
             http_result_t  pr  = (prc == 1) ? HTTP_OK : b->parse_status;
+            size_t request_bytes = req.consumed;
+
+            if (pr == HTTP_OK && api_path_matches(req.path, req.path_len)) {
+                if (req.content_length > api_max_request_body() ||
+                    req.consumed + req.content_length > sizeof(c->plain)) {
+                    pr = HTTP_ERR_413;
+                } else if (c->plain_len < req.consumed + req.content_length) {
+                    break;
+                } else {
+                    request_bytes = req.consumed + req.content_length;
+                }
+            }
+
             pw_iov_t resp[PW_IOV_MAX_FRAGS];
             unsigned rn = 0;
-            if (build_http_response_iov(c, pr, &req, resp, &rn, &close_after) != 0) {
-                return -1;
+            api_resp_t api_resp = {0};
+            bool is_api = (pr == HTTP_OK && api_path_matches(req.path, req.path_len));
+            if (is_api) {
+                if (build_api_response_iov(c, &req, &api_resp, resp, &rn, &close_after) != 0) {
+                    return -1;
+                }
+            } else {
+                if (build_http_response_iov(c, pr, &req, resp, &rn, &close_after) != 0) {
+                    return -1;
+                }
             }
             const uint64_t t_p2 = metal_tsc();
             metrics_stage_add(METRICS_STAGE_TLS_BUILD, t_p2 - t_p1);
 
-            maybe_seal_103(c, pr, &req);
+            if (!is_api) maybe_seal_103(c, pr, &req);
 
             if (pw_tls_app_seal_iov(&c->eng, resp, rn) != 0) {
+                api_resp_release(&api_resp);
                 /* TX buffer pressure with more pipelined requests
                  * still queued: flush what we have and close. */
                 close_after = true;
                 c->plain_len = 0;
                 break;
             }
+            api_resp_release(&api_resp);
             const uint64_t t_p3 = metal_tsc();
             metrics_stage_add(METRICS_STAGE_TLS_SEAL, t_p3 - t_p2);
 
@@ -609,9 +771,9 @@ static int tls_drive_engine(kconn_t* c, bool* out_close_after_drain) {
                 metrics_record(g_worker_metrics, t_p0, t_p3);
             }
 
-            if (pr == HTTP_OK && req.consumed > 0 && c->plain_len > req.consumed) {
-                size_t left = c->plain_len - req.consumed;
-                memmove(c->plain, c->plain + req.consumed, left);
+            if (pr == HTTP_OK && request_bytes > 0 && c->plain_len > request_bytes) {
+                size_t left = c->plain_len - request_bytes;
+                memmove(c->plain, c->plain + request_bytes, left);
                 c->plain_len = left;
             } else {
                 c->plain_len = 0;
@@ -711,7 +873,9 @@ static int try_recv_and_drive(kconn_t* c, bool* out_close_after_drain) {
 
 static void try_accept(tls_kworker_t* w, int64_t now_ms) {
     for (;;) {
-        int fd = accept4(w->listen_fd, NULL, NULL, SOCK_NONBLOCK | SOCK_CLOEXEC);
+        struct sockaddr_storage peer;
+        socklen_t peer_len = sizeof(peer);
+        int fd = accept4(w->listen_fd, (struct sockaddr*)&peer, &peer_len, SOCK_NONBLOCK | SOCK_CLOEXEC);
         if (fd < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) return;
             if (errno == EINTR) continue;
@@ -731,6 +895,14 @@ static void try_accept(tls_kworker_t* w, int64_t now_ms) {
             continue;
         }
         kconn_init(c, w, fd, now_ms);
+        c->peer_ip[0] = '\0';
+        if (peer.ss_family == AF_INET) {
+            struct sockaddr_in* in = (struct sockaddr_in*)&peer;
+            (void)inet_ntop(AF_INET, &in->sin_addr, c->peer_ip, sizeof(c->peer_ip));
+        } else if (peer.ss_family == AF_INET6) {
+            struct sockaddr_in6* in6 = (struct sockaddr_in6*)&peer;
+            (void)inet_ntop(AF_INET6, &in6->sin6_addr, c->peer_ip, sizeof(c->peer_ip));
+        }
         if (c->state != KCONN_LIVE) {
             /* engine configure failed in init */
             close(fd);
@@ -772,9 +944,60 @@ void* tls_worker_main(void* arg) {
     if (!w) metal_die("tls_worker_main: OOM allocating worker context");
     w->cfg = cfg;
     w->conns_cap = cfg->pool_cap ? cfg->pool_cap : MAX_CONNS_DEFAULT;
-    w->conns = (kconn_t*)calloc(w->conns_cap, sizeof(kconn_t));
-    if (!w->conns) metal_die("tls_worker_main: OOM allocating conn table (cap=%zu)",
-                             w->conns_cap);
+    /* kconn_t carries an inline 8 KiB plain-text scratch plus the full
+     * TLS engine state, so the per-conn slot is well past one page.
+     * calloc would only fault page 0 of each slot on construction,
+     * leaving the tail of every slot to fault lazily on the first
+     * burst of real traffic — that's where the post-load RSS climb
+     * we measured was coming from. mmap + POPULATE + memset + mlock
+     * makes the whole conn table resident and pinned at startup, so
+     * RSS at idle equals RSS at peak. */
+    size_t conn_bytes = w->conns_cap * sizeof(kconn_t);
+    void* conn_mem = mmap(NULL, conn_bytes, PROT_READ | PROT_WRITE,
+                          MAP_PRIVATE | MAP_ANONYMOUS
+#ifdef MAP_POPULATE
+                          | MAP_POPULATE
+#endif
+                          , -1, 0);
+    if (conn_mem == MAP_FAILED)
+        metal_die("tls_worker_main: OOM allocating conn table (cap=%zu): %s",
+                  w->conns_cap, strerror(errno));
+#ifdef MADV_HUGEPAGE
+    (void)madvise(conn_mem, conn_bytes, MADV_HUGEPAGE);
+#endif
+#ifdef MADV_POPULATE_WRITE
+    (void)madvise(conn_mem, conn_bytes, MADV_POPULATE_WRITE);
+#endif
+    memset(conn_mem, 0, conn_bytes);
+    if (mlock(conn_mem, conn_bytes) != 0) {
+        metal_log("tls_worker: mlock conn table (%zu B) failed: %s "
+                  "(add CAP_IPC_LOCK to pin)", conn_bytes, strerror(errno));
+    }
+    w->conns = (kconn_t*)conn_mem;
+
+    if (cfg->jt->brotli_identity_scratch_len > 0) {
+        size_t scratch_len = cfg->jt->brotli_identity_scratch_len;
+        void* scratch = mmap(NULL, scratch_len, PROT_READ | PROT_WRITE,
+                             MAP_PRIVATE | MAP_ANONYMOUS
+#ifdef MAP_POPULATE
+                             | MAP_POPULATE
+#endif
+                             , -1, 0);
+        if (scratch == MAP_FAILED) {
+            metal_die("tls_worker_main: OOM allocating brotli identity scratch (%zu B): %s",
+                      scratch_len, strerror(errno));
+        }
+#ifdef MADV_POPULATE_WRITE
+        (void)madvise(scratch, scratch_len, MADV_POPULATE_WRITE);
+#endif
+        memset(scratch, 0, scratch_len);
+        if (mlock(scratch, scratch_len) != 0) {
+            metal_log("tls_worker: mlock brotli identity scratch (%zu B) failed: %s",
+                      scratch_len, strerror(errno));
+        }
+        w->br_identity_scratch = (uint8_t*)scratch;
+        w->br_identity_scratch_len = scratch_len;
+    }
 
     pw_tls_ticket_store_init(&w->ticket_store);
 
@@ -792,13 +1015,13 @@ void* tls_worker_main(void* arg) {
     ep_add(w->epfd, w->listen_fd, &g_listen_marker, EPOLLIN);
 
     metal_log("worker %d ready: listen=:%d backend=tls io=kernel "
-              "cert=%s key=%s key_type=%s conns_cap=%zu",
+              "cert=%s key=%s key_type=%s conns_cap=%zu br_identity_scratch=%zu",
               cfg->worker_index, cfg->port,
               cfg->tls_cert_path, cfg->tls_key_path,
               w->key_type == CERT_KEY_ED25519    ? "ed25519" :
               w->key_type == CERT_KEY_RSA        ? "rsa-pss" :
               w->key_type == CERT_KEY_ECDSA_P256 ? "ecdsa-p256" : "?",
-              w->conns_cap);
+              w->conns_cap, w->br_identity_scratch_len);
 
     int64_t last_sweep_ms = metal_now_ms();
     struct epoll_event evs[EPOLL_BATCH];

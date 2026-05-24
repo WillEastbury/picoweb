@@ -1,6 +1,7 @@
 #include "pool.h"
 #include "util.h"
 
+#include <errno.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -18,6 +19,33 @@ bool pool_init(pool_t* p, size_t cap) {
      * working set TLB-resident. Best-effort hint. */
     (void)madvise(mem, bytes, MADV_HUGEPAGE);
 #endif
+#ifdef MADV_POPULATE_WRITE
+    /* Pre-fault every page now so RSS at startup equals RSS under
+     * peak load. Without this, anonymous mmap is demand-paged: the
+     * init loop below only writes the first few bytes of each conn_t
+     * (touching page 0 of each slot), so the 8 KiB read_buf and the
+     * scratch in pages 1-2 stay unfaulted until a real connection
+     * writes to them. That makes "preallocated" a lie at the RSS
+     * level — idle RSS understates working set, and peak RSS climbs
+     * the first time a burst arrives and never comes back down.
+     * MADV_POPULATE_WRITE faults the whole range now, in one call.
+     * Linux 5.14+; older kernels skip the hint and behave as before. */
+    (void)madvise(mem, bytes, MADV_POPULATE_WRITE);
+#endif
+    /* Belt-and-braces: dirty every byte so even kernels that map
+     * POPULATE_WRITE to the shared zero page give us real backing
+     * pages. Cheap (a single linear pass at boot). */
+    memset(mem, 0, bytes);
+    /* Pin the whole pool into RAM. With CAP_IPC_LOCK we are immune to
+     * swap and memory-pressure reclaim — RSS becomes a true ceiling,
+     * not a high-water mark the kernel can erode. Without the cap,
+     * mlock() returns EPERM/EAGAIN against the default 64KB
+     * RLIMIT_MEMLOCK; we log once and continue (MADV_POPULATE_WRITE
+     * still gave us residency, just not pinning). */
+    if (mlock(mem, bytes) != 0) {
+        metal_log("pool: mlock(%zu) failed: %s (add CAP_IPC_LOCK or raise "
+                  "RLIMIT_MEMLOCK to pin the pool)", bytes, strerror(errno));
+    }
     p->base = (conn_t*)mem;
     p->cap = cap;
     p->in_use = 0;

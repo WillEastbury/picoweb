@@ -14,7 +14,7 @@ kill "$(cat /tmp/picoweb-picowal-test.pid 2>/dev/null)" 2>/dev/null || true
 sleep 0.2
 
 start_server() {
-    ./picoweb --picowal-device="$VOL" --picowal-prefix=/wal/ --picowal-bytes=8388608 "$@" \
+    ./picoweb --picowal-device="$VOL" --picowal-prefix=/wal/ --picowal-bytes=8388608 --picowal-public-http "$@" \
         "$PORT" "$WWW" 1 100 0 64 > /tmp/picoweb-picowal-test.log 2>&1 &
     PID=$!
     echo "$PID" > /tmp/picoweb-picowal-test.pid

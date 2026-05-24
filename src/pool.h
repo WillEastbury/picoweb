@@ -84,6 +84,7 @@ typedef struct conn {
     uint16_t      api_acr_headers_len;  /* Access-Control-Request-Headers length */
     uint16_t      api_principal_len;    /* X-PW-Principal/X-Principal-Id length */
     uint16_t      api_tenant_len;       /* X-PW-Tenant length */
+    uint16_t      api_score_token_len;  /* X-Score-Token length */
     bool          api_has_pw_auth;      /* X-PW-Auth: 1 marker */
     uint8_t       api_path_len;
     char          api_path[256];        /* request-target copy (see above) */
@@ -93,6 +94,8 @@ typedef struct conn {
     char          api_acr_headers[256]; /* bounded ACR-Headers copy */
     char          api_principal[128];   /* bounded principal id copy */
     char          api_tenant[128];      /* bounded tenant hint copy */
+    char          api_score_token[160]; /* bounded score token copy */
+    char          peer_ip[64];          /* accept() peer IP for rate limits */
 } conn_t;
 
 /* A per-worker pool of connection slots, mmapped at startup. */

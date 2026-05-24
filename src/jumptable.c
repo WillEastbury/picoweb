@@ -36,6 +36,16 @@ static bool no_gzip_enabled(void) {
     return cached != 0;
 }
 
+static bool brotli_primary_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char* v = getenv("PICOWEB_BROTLI_PRIMARY");
+        cached = (v && (v[0] == '1' || v[0] == 't' || v[0] == 'T'
+                         || v[0] == 'y' || v[0] == 'Y')) ? 1 : 0;
+    }
+    return cached != 0;
+}
+
 /* ============================================================== */
 /* Flat hash table (single tier).                                 */
 /* The key is logically (host || '|' || path). Hash is computed   */
@@ -476,6 +486,8 @@ static resource_t* build_resource(arena_t* arena,
     r->chrome = NULL;
     r->compressed = NULL;
     r->brotli = NULL;
+    r->brotli_primary = false;
+    r->identity_len = body_len;
     r->head = build_head(arena, status_line, mime_type, body_len,
                          extra_header, &r->head_len);
     return r;
@@ -500,7 +512,27 @@ static resource_t* build_resource_chromed(arena_t* arena,
     r->chrome = chrome;
     r->compressed = NULL;
     r->brotli = NULL;
+    r->brotli_primary = false;
+    r->identity_len = total_payload;
     r->head = build_head(arena, status_line, mime_type, total_payload,
+                         extra_header, &r->head_len);
+    return r;
+}
+
+static resource_t* build_resource_brotli_primary(arena_t* arena,
+                                                 const char* status_line,
+                                                 const char* mime_type,
+                                                 size_t identity_len,
+                                                 const char* extra_header) {
+    resource_t* r = (resource_t*)arena_alloc(arena, sizeof(*r), 64);
+    r->body = NULL;
+    r->body_len = 0;
+    r->chrome = NULL;
+    r->compressed = NULL;
+    r->brotli = NULL;
+    r->brotli_primary = true;
+    r->identity_len = identity_len;
+    r->head = build_head(arena, status_line, mime_type, identity_len,
                          extra_header, &r->head_len);
     return r;
 }
@@ -563,6 +595,7 @@ static void attach_compressed_variant(arena_t* arena,
         arena_alloc(arena, sizeof(*rc), 64);
     rc->body = (const char*)body_pc;
     rc->body_len = (size_t)got;
+    rc->decoded_len = raw_len;
     memset(rc->etag, 0, sizeof(rc->etag));
 
     /* Compute ETag from compressed bytes. */
@@ -581,6 +614,51 @@ static void attach_compressed_variant(arena_t* arena,
 
 /* Build a Brotli-compressed variant of a resource. Same pattern as
  * attach_compressed_variant but uses our micro-brotli encoder. */
+static bool attach_brotli_payload(arena_t* arena, resource_t* r,
+                                  const void* raw_payload, size_t raw_len,
+                                  const char* status_line,
+                                  const char* mime_type,
+                                  const char* cache_hdr) {
+    if (!r || !raw_payload || !raw_len) return false;
+    /* Compress */
+    size_t bound = brotli_bound(raw_len);
+    uint8_t* tmp = (uint8_t*)malloc(bound);
+    if (!tmp) return false;
+
+    int got = brotli_encode((const uint8_t*)raw_payload, raw_len, tmp, bound);
+    if (got <= 0 || (size_t)got >= raw_len) {
+        free(tmp);
+        return false;
+    }
+
+    /* Copy into arena */
+    void* body_br = arena_dup(arena, tmp, (size_t)got);
+    free(tmp);
+    if (!body_br) return false;
+
+    /* Build variant headers with ETag */
+    resource_compress_t* rc = (resource_compress_t*)
+        arena_alloc(arena, sizeof(*rc), 64);
+    rc->body = (const char*)body_br;
+    rc->body_len = (size_t)got;
+    rc->decoded_len = raw_len;
+    memset(rc->etag, 0, sizeof(rc->etag));
+
+    compute_etag(rc->etag, sizeof(rc->etag), body_br, (size_t)got);
+
+    char extra[384];
+    snprintf(extra, sizeof(extra),
+             "Content-Encoding: br\r\n"
+             "Vary: Accept-Encoding\r\n"
+             "ETag: %s\r\n"
+             "%s", rc->etag, cache_hdr ? cache_hdr : "");
+
+    rc->head = build_head(arena, status_line, mime_type, (size_t)got,
+                          extra, &rc->head_len);
+    r->brotli = rc;
+    return true;
+}
+
 static void attach_brotli_variant(arena_t* arena, resource_t* r,
                                   const char* status_line,
                                   const char* mime_type,
@@ -600,42 +678,9 @@ static void attach_brotli_variant(arena_t* arena, resource_t* r,
     memcpy(raw + off, r->body, r->body_len); off += r->body_len;
     if (ftr_len) { memcpy(raw + off, r->chrome->ftr, ftr_len); }
 
-    /* Compress */
-    size_t bound = brotli_bound(raw_len);
-    uint8_t* tmp = (uint8_t*)malloc(bound);
-    if (!tmp) { free(raw); return; }
-
-    int got = brotli_encode(raw, raw_len, tmp, bound);
+    (void)attach_brotli_payload(arena, r, raw, raw_len,
+                                status_line, mime_type, cache_hdr);
     free(raw);
-    if (got <= 0 || (size_t)got >= raw_len) {
-        free(tmp);
-        return;
-    }
-
-    /* Copy into arena */
-    void* body_br = arena_dup(arena, tmp, (size_t)got);
-    free(tmp);
-    if (!body_br) return;
-
-    /* Build variant headers with ETag */
-    resource_compress_t* rc = (resource_compress_t*)
-        arena_alloc(arena, sizeof(*rc), 64);
-    rc->body = (const char*)body_br;
-    rc->body_len = (size_t)got;
-    memset(rc->etag, 0, sizeof(rc->etag));
-
-    compute_etag(rc->etag, sizeof(rc->etag), body_br, (size_t)got);
-
-    char extra[384];
-    snprintf(extra, sizeof(extra),
-             "Content-Encoding: br\r\n"
-             "Vary: Accept-Encoding\r\n"
-             "ETag: %s\r\n"
-             "%s", rc->etag, cache_hdr ? cache_hdr : "");
-
-    rc->head = build_head(arena, status_line, mime_type, (size_t)got,
-                          extra, &rc->head_len);
-    r->brotli = rc;
 }
 
 static const char kBody400[] = "<!doctype html><title>400</title><h1>400 Bad Request</h1>";
@@ -644,6 +689,7 @@ static const char kBody405[] = "<!doctype html><title>405</title><h1>405 Method 
 static const char kBody409[] = "<!doctype html><title>409</title><h1>409 Conflict</h1><p>Unknown or missing Host</p>";
 static const char kBody413[] = "<!doctype html><title>413</title><h1>413 Payload Too Large</h1>";
 static const char kBody414[] = "<!doctype html><title>414</title><h1>414 URI Too Long</h1>";
+static const char kBody500[] = "<!doctype html><title>500</title><h1>500 Internal Server Error</h1>";
 static const char kBody505[] = "<!doctype html><title>505</title><h1>505 HTTP Version Not Supported</h1>";
 
 /* Forward declarations for 304 buffer builders. */
@@ -660,6 +706,7 @@ static void build_canned_errors(jumptable_t* jt) {
     const char* b409 = (const char*)arena_dup(a, kBody409, sizeof(kBody409) - 1);
     const char* b413 = (const char*)arena_dup(a, kBody413, sizeof(kBody413) - 1);
     const char* b414 = (const char*)arena_dup(a, kBody414, sizeof(kBody414) - 1);
+    const char* b500 = (const char*)arena_dup(a, kBody500, sizeof(kBody500) - 1);
     const char* b505 = (const char*)arena_dup(a, kBody505, sizeof(kBody505) - 1);
     jt->err_400 = build_resource(a, "HTTP/1.1 400 Bad Request",
         "text/html; charset=utf-8", b400, sizeof(kBody400) - 1, kNoCache);
@@ -674,6 +721,8 @@ static void build_canned_errors(jumptable_t* jt) {
         "text/html; charset=utf-8", b413, sizeof(kBody413) - 1, kNoCache);
     jt->err_414 = build_resource(a, "HTTP/1.1 414 URI Too Long",
         "text/html; charset=utf-8", b414, sizeof(kBody414) - 1, kNoCache);
+    jt->err_500 = build_resource(a, "HTTP/1.1 500 Internal Server Error",
+        "text/html; charset=utf-8", b500, sizeof(kBody500) - 1, kNoCache);
     jt->err_505 = build_resource(a, "HTTP/1.1 505 HTTP Version Not Supported",
         "text/html; charset=utf-8", b505, sizeof(kBody505) - 1, kNoCache);
 }
@@ -692,6 +741,35 @@ static const char* slurp(arena_t* arena, const char* path, off_t expected, size_
             if (errno == EINTR) continue;
             metal_log("warn: read %s: %s", path, strerror(errno));
             close(fd);
+            return NULL;
+        }
+        if (r == 0) break;
+        got += (size_t)r;
+    }
+    close(fd);
+    *out_len = got;
+    return buf;
+}
+
+static char* slurp_heap(const char* path, off_t expected, size_t* out_len) {
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        metal_log("warn: open %s: %s", path, strerror(errno));
+        return NULL;
+    }
+    char* buf = (char*)malloc((size_t)expected ? (size_t)expected : 1);
+    if (!buf) {
+        close(fd);
+        return NULL;
+    }
+    size_t got = 0;
+    while (got < (size_t)expected) {
+        ssize_t r = read(fd, buf + got, (size_t)expected - got);
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            metal_log("warn: read %s: %s", path, strerror(errno));
+            close(fd);
+            free(buf);
             return NULL;
         }
         if (r == 0) break;
@@ -883,18 +961,26 @@ bool jumptable_build(jumptable_t* jt, const char* wwwroot) {
         for (build_dir_t* d = h->dirs; d; d = d->next) {
             for (build_file_t* f = d->files; f; f = f->next) {
                 size_t got = 0;
-                const char* body = slurp(&jt->arena, f->fs_path, f->size, &got);
-                if (!body) continue;
                 const char* mime = mime_lookup(f->name, f->name_len);
+                bool is_html = (host_chrome != NULL)
+                            && strncmp(mime, "text/html", 9) == 0;
+                bool compressible = mime_is_compressible(mime);
+                bool br_primary = compressible && brotli_primary_enabled();
+
+                char* heap_body = NULL;
+                const char* body = NULL;
+                if (br_primary) {
+                    heap_body = slurp_heap(f->fs_path, f->size, &got);
+                    body = heap_body;
+                } else {
+                    body = slurp(&jt->arena, f->fs_path, f->size, &got);
+                }
+                if (!body) continue;
 
                 /* Cache-Control policy:
                  * HTML pages: 1 hour (content may change)
                  * Other static assets: 1 day
                  * Compressible resources also get Vary for identity responses. */
-                bool is_html = (host_chrome != NULL)
-                            && strncmp(mime, "text/html", 9) == 0;
-                bool compressible = mime_is_compressible(mime);
-
                 const char* extra_hdr;
                 const char* cache_hdr;  /* just the Cache-Control line for variants */
                 if (is_html) {
@@ -909,41 +995,52 @@ bool jumptable_build(jumptable_t* jt, const char* wwwroot) {
                                 "Vary: Accept-Encoding\r\n";
                     cache_hdr = "Cache-Control: public, max-age=86400\r\n";
                 } else {
-                    extra_hdr = "Cache-Control: public, max-age=86400\r\n";
+                        extra_hdr = "Cache-Control: public, max-age=86400\r\n";
                     cache_hdr = "Cache-Control: public, max-age=86400\r\n";
                 }
 
-                resource_t* r = is_html
-                    ? build_resource_chromed(&jt->arena, "HTTP/1.1 200 OK",
-                                             mime, body, got, host_chrome, extra_hdr)
-                    : build_resource(&jt->arena, "HTTP/1.1 200 OK",
-                                     mime, body, got, extra_hdr);
-
-                /* Compute ETag from body payload (chrome+body if chromed).
-                 * This is stored in the struct and also needs to be in the
-                 * response headers — but headers are already built above.
-                 * We'll rebuild them with the ETag included. */
-                {
-                    size_t payload_len = got;
-                    const void* payload_ptr = body;
-                    if (is_html && host_chrome) {
-                        compute_etag_parts(r->etag, sizeof(r->etag),
-                                           host_chrome->hdr, host_chrome->hdr_len,
-                                           body, got,
-                                           host_chrome->ftr, host_chrome->ftr_len);
-                        payload_len = got + host_chrome->hdr_len + host_chrome->ftr_len;
-                    } else {
-                        compute_etag(r->etag, sizeof(r->etag), payload_ptr, payload_len);
-                    }
-
-                    /* Rebuild heads with ETag included. */
-                    char etag_extra[384];
-                    snprintf(etag_extra, sizeof(etag_extra), "ETag: %s\r\n%s",
-                             r->etag, extra_hdr);
-                    r->head = build_head(&jt->arena, "HTTP/1.1 200 OK",
-                                              mime, is_html ? (got + (host_chrome ? host_chrome->hdr_len + host_chrome->ftr_len : 0)) : got,
-                                              etag_extra, &r->head_len);
+                size_t hdr_len = is_html && host_chrome ? host_chrome->hdr_len : 0;
+                size_t ftr_len = is_html && host_chrome ? host_chrome->ftr_len : 0;
+                size_t payload_len = hdr_len + got + ftr_len;
+                if (payload_len < got || payload_len < hdr_len) {
+                    free(heap_body);
+                    continue;
                 }
+                uint8_t* payload_buf = NULL;
+                const void* payload_ptr = body;
+                if (hdr_len || ftr_len) {
+                    payload_buf = (uint8_t*)malloc(payload_len ? payload_len : 1);
+                    if (!payload_buf) {
+                        free(heap_body);
+                        continue;
+                    }
+                    size_t p = 0;
+                    if (hdr_len) { memcpy(payload_buf + p, host_chrome->hdr, hdr_len); p += hdr_len; }
+                    memcpy(payload_buf + p, body, got); p += got;
+                    if (ftr_len) { memcpy(payload_buf + p, host_chrome->ftr, ftr_len); }
+                    payload_ptr = payload_buf;
+                }
+
+                resource_t* r = br_primary
+                    ? build_resource_brotli_primary(&jt->arena, "HTTP/1.1 200 OK",
+                                                    mime, payload_len, extra_hdr)
+                    : (is_html
+                        ? build_resource_chromed(&jt->arena, "HTTP/1.1 200 OK",
+                                                 mime, body, got, host_chrome, extra_hdr)
+                        : build_resource(&jt->arena, "HTTP/1.1 200 OK",
+                                         mime, body, got, extra_hdr));
+
+                compute_etag(r->etag, sizeof(r->etag), payload_ptr, payload_len);
+
+                /* Rebuild identity head with ETag included. The identity
+                 * representation still advertises Vary so shared caches
+                 * cannot mix it with the Brotli representation. */
+                char etag_extra[384];
+                snprintf(etag_extra, sizeof(etag_extra), "ETag: %s\r\n%s",
+                         r->etag, extra_hdr);
+                r->head = build_head(&jt->arena, "HTTP/1.1 200 OK",
+                                     mime, payload_len,
+                                     etag_extra, &r->head_len);
 
                 /* Auto-derive HTTP 103 Early Hints `Link:` headers from
                  * subresources referenced in the HTML body (chrome+body+
@@ -952,50 +1049,33 @@ bool jumptable_build(jumptable_t* jt, const char* wwwroot) {
                  * also embedded in the 200 head for clients that don't
                  * speak 1xx. Per-resource so per-page assets are picked
                  * up; chrome-derived hints dominate via dedupe. */
-                if (is_html) {
-                    /* Reassemble full HTML for scanning. The chrome
-                     * pointers reference arena memory; the body is a
-                     * fresh slurp also in arena. We need a contiguous
-                     * buffer for the scanner. */
-                    size_t hdr_len = host_chrome ? host_chrome->hdr_len : 0;
-                    size_t ftr_len = host_chrome ? host_chrome->ftr_len : 0;
-                    size_t full_len = hdr_len + got + ftr_len;
-                    char* full = (char*)malloc(full_len);
-                    if (full) {
-                        size_t p = 0;
-                        if (hdr_len) { memcpy(full + p, host_chrome->hdr, hdr_len); p += hdr_len; }
-                        memcpy(full + p, body, got); p += got;
-                        if (ftr_len) { memcpy(full + p, host_chrome->ftr, ftr_len); }
+                if (is_html && payload_ptr && payload_len) {
+                    char tmp[PW_PRELOAD_HEADER_CAP];
+                    size_t link_len = pw_preload_extract(
+                        payload_ptr, payload_len,
+                        host_key, h->name_len,
+                        tmp, sizeof(tmp));
+                    if (link_len > 0) {
+                        char* link_buf = (char*)arena_dup(&jt->arena, tmp, link_len);
+                        r->link_hdr = link_buf;
+                        r->link_hdr_len = link_len;
 
-                        char tmp[PW_PRELOAD_HEADER_CAP];
-                        size_t link_len = pw_preload_extract(
-                            full, full_len,
-                            host_key, h->name_len,
-                            tmp, sizeof(tmp));
-                        free(full);
-                        if (link_len > 0) {
-                            char* link_buf = (char*)arena_dup(&jt->arena, tmp, link_len);
-                            r->link_hdr = link_buf;
-                            r->link_hdr_len = link_len;
-
-                            /* Embed Link headers in the 200 head too,
-                             * so clients that don't process 1xx still
-                             * get the hint via the final response. */
-                            size_t extra_room = strlen(extra_hdr) + link_len + 384;
-                            char* combined = (char*)malloc(extra_room);
-                            if (combined) {
-                                int n = snprintf(combined, extra_room,
-                                                 "ETag: %s\r\n%s%.*s",
-                                                 r->etag, extra_hdr,
-                                                 (int)link_len, link_buf);
-                                if (n > 0 && (size_t)n < extra_room) {
-                                    r->head = build_head(&jt->arena,
-                                        "HTTP/1.1 200 OK", mime,
-                                        got + hdr_len + ftr_len,
-                                        combined, &r->head_len);
-                                }
-                                free(combined);
+                        /* Embed Link headers in the 200 head too,
+                         * so clients that don't process 1xx still
+                         * get the hint via the final response. */
+                        size_t extra_room = strlen(extra_hdr) + link_len + 384;
+                        char* combined = (char*)malloc(extra_room);
+                        if (combined) {
+                            int n = snprintf(combined, extra_room,
+                                             "ETag: %s\r\n%s%.*s",
+                                             r->etag, extra_hdr,
+                                             (int)link_len, link_buf);
+                            if (n > 0 && (size_t)n < extra_room) {
+                                r->head = build_head(&jt->arena,
+                                    "HTTP/1.1 200 OK", mime,
+                                    payload_len, combined, &r->head_len);
                             }
+                            free(combined);
                         }
                     }
                 }
@@ -1005,13 +1085,38 @@ bool jumptable_build(jumptable_t* jt, const char* wwwroot) {
                  * compression doesn't shrink the payload. Computed
                  * once at startup; never mutated on the hot path. */
                 if (compressible) {
-                    if (!no_gzip_enabled()) {
+                    bool br_ok = false;
+                    if (br_primary) {
+                        br_ok = attach_brotli_payload(&jt->arena, r,
+                                                      payload_ptr, payload_len,
+                                                      "HTTP/1.1 200 OK",
+                                                      mime, cache_hdr);
+                        if (br_ok) {
+                            r->chrome = NULL;
+                            r->body = NULL;
+                            r->body_len = 0;
+                            r->identity_len = payload_len;
+                            if (payload_len > jt->brotli_identity_scratch_len)
+                                jt->brotli_identity_scratch_len = payload_len;
+                        } else {
+                            r->brotli_primary = false;
+                            r->chrome = is_html ? host_chrome : NULL;
+                            r->body = (const char*)arena_dup(&jt->arena, body, got);
+                            r->body_len = got;
+                        }
+                    }
+                    if (!br_primary && !no_gzip_enabled()) {
                         attach_compressed_variant(&jt->arena, r,
                                                   "HTTP/1.1 200 OK", mime);
                     }
-                    attach_brotli_variant(&jt->arena, r,
-                                          "HTTP/1.1 200 OK", mime, cache_hdr);
+                    if (!br_primary) {
+                        attach_brotli_variant(&jt->arena, r,
+                                              "HTTP/1.1 200 OK", mime, cache_hdr);
+                    }
                 }
+
+                if (payload_buf) free(payload_buf);
+                free(heap_body);
 
                 /* Build 304 Not Modified wire buffers for conditional requests. */
                 {
@@ -1232,4 +1337,62 @@ bool jumptable_host_exists(const jumptable_t* jt,
             return true;
     }
     return false;
+}
+
+/* Touch every page of a buffer so the kernel faults it in. Reads only,
+ * accumulating into a volatile sink to keep the optimiser honest. */
+static volatile uint64_t g_prewarm_sink;
+__attribute__((cold))
+static void prewarm_touch(const void* p, size_t len) {
+    if (!p || len == 0) return;
+    const unsigned char* b = (const unsigned char*)p;
+    uint64_t acc = g_prewarm_sink;
+    for (size_t i = 0; i < len; i += 4096) acc ^= b[i];
+    acc ^= b[len - 1];
+    g_prewarm_sink = acc;
+}
+
+__attribute__((cold))
+static void prewarm_resource(const resource_t* r) {
+    if (!r) return;
+    prewarm_touch(r->head, r->head_len);
+    prewarm_touch(r->body, r->body_len);
+    if (r->compressed) {
+        prewarm_touch(r->compressed->head, r->compressed->head_len);
+        prewarm_touch(r->compressed->body, r->compressed->body_len);
+    }
+    if (r->brotli) {
+        prewarm_touch(r->brotli->head, r->brotli->head_len);
+        prewarm_touch(r->brotli->body, r->brotli->body_len);
+    }
+    if (r->chrome) {
+        prewarm_touch(r->chrome->hdr, r->chrome->hdr_len);
+        prewarm_touch(r->chrome->ftr, r->chrome->ftr_len);
+    }
+    prewarm_touch(r->wire_304, r->wire_304_len);
+    prewarm_touch(r->link_hdr, r->link_hdr_len);
+}
+
+__attribute__((cold))
+void jumptable_prewarm(const jumptable_t* jt) {
+    if (!jt) return;
+    uint64_t acc = g_prewarm_sink;
+    size_t walked = 0;
+    for (size_t i = 0; i < jt->cap; i++) {
+        const flat_slot_t* s = &jt->slots[i];
+        acc ^= s->hash ^ s->lens;
+        if (!s->value) continue;
+        prewarm_resource(s->value);
+        walked++;
+    }
+    g_prewarm_sink = acc;
+    prewarm_resource(jt->err_400);
+    prewarm_resource(jt->err_404);
+    prewarm_resource(jt->err_405);
+    prewarm_resource(jt->err_409);
+    prewarm_resource(jt->err_413);
+    prewarm_resource(jt->err_414);
+    prewarm_resource(jt->err_505);
+    metal_log("jumptable: prewarmed %zu resources across %zu slots",
+              walked, jt->cap);
 }
