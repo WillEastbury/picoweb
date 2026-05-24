@@ -56,6 +56,7 @@
 #define EPOLL_BATCH             128
 #define IDLE_SWEEP_MS           1000
 #define IDLE_TIMEOUT_MS_DEFAULT 30000   /* used if cfg->idle_ms == 0   */
+#define INCOMPLETE_REQ_TIMEOUT_MS_DEFAULT 5000
 #define PLAIN_BUF_BYTES         8192    /* per-conn plaintext scratch  */
 #define MAX_CONNS_DEFAULT       256     /* used if cfg->pool_cap == 0  */
 
@@ -85,6 +86,7 @@ typedef struct {
     int             fd;
     uint32_t        epoll_mask;
     int64_t         last_active_ms;
+    int64_t         incomplete_started_ms;
     uint32_t        req_count;
 
     tls_kworker_t*  w;
@@ -123,6 +125,25 @@ struct tls_kworker {
 
     pw_tls_ticket_store_t  ticket_store;
 };
+
+static int64_t env_ms_or_default(const char* name, int64_t fallback) {
+    const char* s = getenv(name);
+    if (!s || !*s) return fallback;
+
+    char* end = NULL;
+    errno = 0;
+    long long v = strtoll(s, &end, 10);
+    if (errno || end == s || *end != '\0' || v <= 0) {
+        metal_log("tls: ignoring invalid %s=%s", name, s);
+        return fallback;
+    }
+    return (int64_t)v;
+}
+
+static int64_t incomplete_request_timeout_ms(void) {
+    return env_ms_or_default("PICOWEB_INCOMPLETE_REQUEST_TIMEOUT_MS",
+                             INCOMPLETE_REQ_TIMEOUT_MS_DEFAULT);
+}
 
 /* Marker used to identify the listen-fd event vs per-conn events
  * via epoll_event.data.ptr. */
@@ -324,6 +345,7 @@ static void kconn_init(kconn_t* c, tls_kworker_t* w, int fd, int64_t now_ms) {
     c->fd             = fd;
     c->epoll_mask     = 0;
     c->last_active_ms = now_ms;
+    c->incomplete_started_ms = 0;
     c->req_count      = 0;
     c->w              = w;
     c->plain_len      = 0;
@@ -361,6 +383,7 @@ static void kconn_close(tls_kworker_t* w, kconn_t* c) {
     memset(&c->eng, 0, sizeof(c->eng));
     c->state = KCONN_FREE;
     c->plain_len = 0;
+    c->incomplete_started_ms = 0;
     c->ticket_emitted = 0;
     c->want_close = 0;
 }
@@ -542,6 +565,9 @@ static int tls_drive_engine(kconn_t* c, bool* out_close_after_drain) {
      * 0-RTT early data may arrive while still in HANDSHAKE; we accept
      * it now and defer sealing until APP. */
     if (app_len > 0) {
+        if (c->plain_len == 0) {
+            c->incomplete_started_ms = metal_now_ms();
+        }
         if (c->plain_len + app_len > sizeof(c->plain)) {
             if (pw_tls_state(&c->eng) != PW_TLS_ST_APP) {
                 pw_tls_app_in_ack(&c->eng, app_len);
@@ -566,6 +592,7 @@ static int tls_drive_engine(kconn_t* c, bool* out_close_after_drain) {
             }
             metrics_stage_add(METRICS_STAGE_TLS_SEAL, metal_tsc() - t_s0);
             c->plain_len = 0;
+            c->incomplete_started_ms = 0;
         } else {
             memcpy(c->plain + c->plain_len, app, app_len);
             c->plain_len += app_len;
@@ -581,7 +608,12 @@ static int tls_drive_engine(kconn_t* c, bool* out_close_after_drain) {
             int prc = tls_bridge_parse_request(b, (const uint8_t*)c->plain, c->plain_len);
             const uint64_t t_p1 = metal_tsc();
             metrics_stage_add(METRICS_STAGE_TLS_PARSE, t_p1 - t_p0);
-            if (prc == 0) break;     /* incomplete request, wait for more */
+            if (prc == 0) {
+                if (c->incomplete_started_ms == 0) {
+                    c->incomplete_started_ms = metal_now_ms();
+                }
+                break;     /* incomplete request, wait for more */
+            }
 
             http_request_t req = b->req;
             http_result_t  pr  = (prc == 1) ? HTTP_OK : b->parse_status;
@@ -600,6 +632,7 @@ static int tls_drive_engine(kconn_t* c, bool* out_close_after_drain) {
                  * still queued: flush what we have and close. */
                 close_after = true;
                 c->plain_len = 0;
+                c->incomplete_started_ms = 0;
                 break;
             }
             const uint64_t t_p3 = metal_tsc();
@@ -613,8 +646,10 @@ static int tls_drive_engine(kconn_t* c, bool* out_close_after_drain) {
                 size_t left = c->plain_len - req.consumed;
                 memmove(c->plain, c->plain + req.consumed, left);
                 c->plain_len = left;
+                c->incomplete_started_ms = metal_now_ms();
             } else {
                 c->plain_len = 0;
+                c->incomplete_started_ms = 0;
             }
 
             if (close_after) break;
@@ -748,9 +783,17 @@ static void try_accept(tls_kworker_t* w, int64_t now_ms) {
 
 static void idle_sweep(tls_kworker_t* w, int64_t now_ms) {
     int64_t timeout = w->cfg->idle_ms > 0 ? w->cfg->idle_ms : IDLE_TIMEOUT_MS_DEFAULT;
+    int64_t incomplete_timeout = incomplete_request_timeout_ms();
     for (size_t i = 0; i < w->conns_cap; i++) {
         kconn_t* c = &w->conns[i];
         if (c->state != KCONN_LIVE) continue;
+        if (c->incomplete_started_ms > 0 &&
+            now_ms - c->incomplete_started_ms > incomplete_timeout) {
+            metal_log("tls: closing slow incomplete request fd=%d plain_len=%zu",
+                      c->fd, c->plain_len);
+            kconn_close(w, c);
+            continue;
+        }
         if (now_ms - c->last_active_ms > timeout) {
             kconn_close(w, c);
         }
