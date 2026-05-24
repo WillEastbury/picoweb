@@ -3,6 +3,8 @@
 
 #include <errno.h>
 #include <pthread.h>
+#include <stdbool.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -26,6 +28,31 @@ metric_stage_t g_stages[METRICS_STAGE_COUNT];
 
 const resource_t* metrics_health_resource = NULL;
 const resource_t* metrics_stats_resource  = NULL;
+
+typedef struct {
+    uint64_t requests;
+    uint64_t status_1xx;
+    uint64_t status_2xx;
+    uint64_t status_3xx;
+    uint64_t status_4xx;
+    uint64_t status_5xx;
+    uint64_t status_other;
+    uint64_t aborted;
+    uint64_t latency_us_sum;
+    uint64_t request_bytes;
+    uint64_t response_plaintext_bytes;
+} metrics_route_counter_t;
+
+typedef struct {
+    uint64_t ops;
+    uint64_t errors;
+    uint64_t lock_wait_us_sum;
+    uint64_t storage_us_sum;
+} metrics_wal_counter_t;
+
+static metrics_route_counter_t g_route_counters[METRICS_ROUTE_COUNT];
+static metrics_wal_counter_t g_wal_counters[METRICS_WAL_COUNT];
+static bool g_access_log_enabled = false;
 
 /* ===========================================================
  * /stats writable response buffer
@@ -211,6 +238,11 @@ void metrics_init(int n_workers) {
     }
     g_metrics = (metrics_t*)p;
     g_n_workers = n_workers;
+    const char* access_log = getenv("PICOWEB_ACCESS_LOG");
+    g_access_log_enabled = access_log &&
+        (strcmp(access_log, "1") == 0 ||
+         strcmp(access_log, "true") == 0 ||
+         strcmp(access_log, "yes") == 0);
 
     /* Allocate the writable /stats body buffer (single page is plenty). */
     void* sp = mmap(NULL, 4096, PROT_READ | PROT_WRITE,
@@ -384,6 +416,204 @@ static uint64_t ticks_to_us(uint64_t ticks) {
     if (us < 0) us = 0;
     if (us > (long double)9999999999ULL) us = 9999999999ULL;
     return (uint64_t)us;
+}
+
+const char* metrics_route_name(metrics_route_t route) {
+    switch (route) {
+    case METRICS_ROUTE_STATIC:       return "static";
+    case METRICS_ROUTE_HEALTHZ:      return "healthz";
+    case METRICS_ROUTE_READYZ:       return "readyz";
+    case METRICS_ROUTE_STATS:        return "stats";
+    case METRICS_ROUTE_METRICSZ:     return "metricsz";
+    case METRICS_ROUTE_SCORES_START: return "scores_start";
+    case METRICS_ROUTE_SCORES:       return "scores";
+    case METRICS_ROUTE_API:          return "api";
+    case METRICS_ROUTE_PICOWAL:      return "picowal";
+    case METRICS_ROUTE_OTHER:        return "other";
+    default:                         return "unknown";
+    }
+}
+
+static const char* method_name(http_method_t method) {
+    switch (method) {
+    case M_GET:     return "GET";
+    case M_HEAD:    return "HEAD";
+    case M_POST:    return "POST";
+    case M_PUT:     return "PUT";
+    case M_DELETE:  return "DELETE";
+    case M_OPTIONS: return "OPTIONS";
+    default:        return "UNKNOWN";
+    }
+}
+
+metrics_route_t metrics_route_for_path(const char* path, size_t path_len) {
+    if (!path) return METRICS_ROUTE_OTHER;
+    if (path_len == 8 && memcmp(path, "/healthz", 8) == 0) return METRICS_ROUTE_HEALTHZ;
+    if (path_len == 7 && memcmp(path, "/readyz", 7) == 0) return METRICS_ROUTE_READYZ;
+    if (path_len == 6 && memcmp(path, "/stats", 6) == 0) return METRICS_ROUTE_STATS;
+    if (path_len == 9 && memcmp(path, "/metricsz", 9) == 0) return METRICS_ROUTE_METRICSZ;
+    if (path_len >= 17 && memcmp(path, "/api/scores/start", 17) == 0) return METRICS_ROUTE_SCORES_START;
+    if (path_len >= 11 && memcmp(path, "/api/scores", 11) == 0) return METRICS_ROUTE_SCORES;
+    if (path_len >= 5 && memcmp(path, "/api/", 5) == 0) return METRICS_ROUTE_API;
+    if (path_len >= 5 && memcmp(path, "/wal/", 5) == 0) return METRICS_ROUTE_PICOWAL;
+    return METRICS_ROUTE_STATIC;
+}
+
+static void route_status_add(metrics_route_counter_t* c, int status) {
+    if (status >= 100 && status < 200) {
+        __atomic_add_fetch(&c->status_1xx, 1, __ATOMIC_RELAXED);
+    } else if (status >= 200 && status < 300) {
+        __atomic_add_fetch(&c->status_2xx, 1, __ATOMIC_RELAXED);
+    } else if (status >= 300 && status < 400) {
+        __atomic_add_fetch(&c->status_3xx, 1, __ATOMIC_RELAXED);
+    } else if (status >= 400 && status < 500) {
+        __atomic_add_fetch(&c->status_4xx, 1, __ATOMIC_RELAXED);
+    } else if (status >= 500 && status < 600) {
+        __atomic_add_fetch(&c->status_5xx, 1, __ATOMIC_RELAXED);
+    } else {
+        __atomic_add_fetch(&c->status_other, 1, __ATOMIC_RELAXED);
+    }
+}
+
+void metrics_observe_request(metrics_route_t route,
+                             http_method_t method,
+                             int status,
+                             uint64_t latency_tsc,
+                             size_t request_bytes,
+                             size_t response_plaintext_bytes,
+                             const char* client_ip,
+                             bool aborted) {
+    if ((unsigned)route >= METRICS_ROUTE_COUNT) route = METRICS_ROUTE_OTHER;
+    uint64_t latency_us = ticks_to_us(latency_tsc);
+    metrics_route_counter_t* c = &g_route_counters[route];
+    __atomic_add_fetch(&c->requests, 1, __ATOMIC_RELAXED);
+    route_status_add(c, status);
+    if (aborted) __atomic_add_fetch(&c->aborted, 1, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&c->latency_us_sum, latency_us, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&c->request_bytes, (uint64_t)request_bytes, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&c->response_plaintext_bytes, (uint64_t)response_plaintext_bytes,
+                       __ATOMIC_RELAXED);
+
+    if (!g_access_log_enabled) return;
+    char line[512];
+    int64_t now_ms = metal_now_ms();
+    const char* ip = (client_ip && client_ip[0]) ? client_ip : "-";
+    int n = snprintf(line, sizeof(line),
+        "{\"event\":\"access\",\"ts_ms\":%lld,\"method\":\"%s\","
+        "\"route\":\"%s\",\"status\":%d,\"latency_us\":%llu,"
+        "\"request_bytes\":%zu,\"response_plaintext_bytes\":%zu,"
+        "\"client_ip\":\"%s\",\"aborted\":%s}\n",
+        (long long)now_ms, method_name(method), metrics_route_name(route), status,
+        (unsigned long long)latency_us, request_bytes, response_plaintext_bytes,
+        ip, aborted ? "true" : "false");
+    if (n > 0) {
+        size_t len = (size_t)n < sizeof(line) ? (size_t)n : sizeof(line) - 1;
+        ssize_t wr = write(STDERR_FILENO, line, len);
+        (void)wr;
+    }
+}
+
+void metrics_observe_picowal(metrics_wal_op_t op,
+                             uint64_t lock_wait_tsc,
+                             uint64_t storage_tsc,
+                             bool ok) {
+    if ((unsigned)op >= METRICS_WAL_COUNT) return;
+    metrics_wal_counter_t* c = &g_wal_counters[op];
+    __atomic_add_fetch(&c->ops, 1, __ATOMIC_RELAXED);
+    if (!ok) __atomic_add_fetch(&c->errors, 1, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&c->lock_wait_us_sum, ticks_to_us(lock_wait_tsc), __ATOMIC_RELAXED);
+    __atomic_add_fetch(&c->storage_us_sum, ticks_to_us(storage_tsc), __ATOMIC_RELAXED);
+}
+
+static const char* wal_op_name(metrics_wal_op_t op) {
+    switch (op) {
+    case METRICS_WAL_READ:   return "read";
+    case METRICS_WAL_WRITE:  return "write";
+    case METRICS_WAL_DELETE: return "delete";
+    case METRICS_WAL_LIST:   return "list";
+    default:                 return "unknown";
+    }
+}
+
+static void appendf(char** p, size_t* rem, const char* fmt, ...) {
+    if (*rem == 0) return;
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(*p, *rem, fmt, ap);
+    va_end(ap);
+    if (n <= 0) return;
+    size_t used = (size_t)n;
+    if (used >= *rem) {
+        *p += *rem - 1;
+        *rem = 1;
+        return;
+    }
+    *p += used;
+    *rem -= used;
+}
+
+char* metrics_render_text(size_t* out_len) {
+    size_t cap = 32768;
+    char* buf = (char*)malloc(cap);
+    if (!buf) {
+        if (out_len) *out_len = 0;
+        return NULL;
+    }
+    char* p = buf;
+    size_t rem = cap;
+    appendf(&p, &rem, "# TYPE picoweb_requests_total counter\n");
+    for (int i = 0; i < METRICS_ROUTE_COUNT; i++) {
+        metrics_route_counter_t* c = &g_route_counters[i];
+        uint64_t requests = __atomic_load_n(&c->requests, __ATOMIC_RELAXED);
+        uint64_t s1 = __atomic_load_n(&c->status_1xx, __ATOMIC_RELAXED);
+        uint64_t s2 = __atomic_load_n(&c->status_2xx, __ATOMIC_RELAXED);
+        uint64_t s3 = __atomic_load_n(&c->status_3xx, __ATOMIC_RELAXED);
+        uint64_t s4 = __atomic_load_n(&c->status_4xx, __ATOMIC_RELAXED);
+        uint64_t s5 = __atomic_load_n(&c->status_5xx, __ATOMIC_RELAXED);
+        uint64_t so = __atomic_load_n(&c->status_other, __ATOMIC_RELAXED);
+        uint64_t aborted = __atomic_load_n(&c->aborted, __ATOMIC_RELAXED);
+        uint64_t lat = __atomic_load_n(&c->latency_us_sum, __ATOMIC_RELAXED);
+        uint64_t reqb = __atomic_load_n(&c->request_bytes, __ATOMIC_RELAXED);
+        uint64_t respb = __atomic_load_n(&c->response_plaintext_bytes, __ATOMIC_RELAXED);
+        const char* route = metrics_route_name((metrics_route_t)i);
+        appendf(&p, &rem, "picoweb_requests_total{route=\"%s\"} %llu\n",
+                route, (unsigned long long)requests);
+        appendf(&p, &rem, "picoweb_request_status_total{route=\"%s\",class=\"1xx\"} %llu\n",
+                route, (unsigned long long)s1);
+        appendf(&p, &rem, "picoweb_request_status_total{route=\"%s\",class=\"2xx\"} %llu\n",
+                route, (unsigned long long)s2);
+        appendf(&p, &rem, "picoweb_request_status_total{route=\"%s\",class=\"3xx\"} %llu\n",
+                route, (unsigned long long)s3);
+        appendf(&p, &rem, "picoweb_request_status_total{route=\"%s\",class=\"4xx\"} %llu\n",
+                route, (unsigned long long)s4);
+        appendf(&p, &rem, "picoweb_request_status_total{route=\"%s\",class=\"5xx\"} %llu\n",
+                route, (unsigned long long)s5);
+        appendf(&p, &rem, "picoweb_request_status_total{route=\"%s\",class=\"other\"} %llu\n",
+                route, (unsigned long long)so);
+        appendf(&p, &rem, "picoweb_request_aborted_total{route=\"%s\"} %llu\n",
+                route, (unsigned long long)aborted);
+        appendf(&p, &rem, "picoweb_request_latency_us_sum{route=\"%s\"} %llu\n",
+                route, (unsigned long long)lat);
+        appendf(&p, &rem, "picoweb_request_bytes_total{route=\"%s\"} %llu\n",
+                route, (unsigned long long)reqb);
+        appendf(&p, &rem, "picoweb_response_plaintext_bytes_total{route=\"%s\"} %llu\n",
+                route, (unsigned long long)respb);
+    }
+    appendf(&p, &rem, "# TYPE picowal_operations_total counter\n");
+    for (int i = 0; i < METRICS_WAL_COUNT; i++) {
+        metrics_wal_counter_t* c = &g_wal_counters[i];
+        const char* op = wal_op_name((metrics_wal_op_t)i);
+        appendf(&p, &rem, "picowal_operations_total{op=\"%s\"} %llu\n",
+                op, (unsigned long long)__atomic_load_n(&c->ops, __ATOMIC_RELAXED));
+        appendf(&p, &rem, "picowal_operation_errors_total{op=\"%s\"} %llu\n",
+                op, (unsigned long long)__atomic_load_n(&c->errors, __ATOMIC_RELAXED));
+        appendf(&p, &rem, "picowal_lock_wait_us_sum{op=\"%s\"} %llu\n",
+                op, (unsigned long long)__atomic_load_n(&c->lock_wait_us_sum, __ATOMIC_RELAXED));
+        appendf(&p, &rem, "picowal_storage_latency_us_sum{op=\"%s\"} %llu\n",
+                op, (unsigned long long)__atomic_load_n(&c->storage_us_sum, __ATOMIC_RELAXED));
+    }
+    if (out_len) *out_len = (size_t)(p - buf);
+    return buf;
 }
 
 static void rebuild_stats_body(void) {

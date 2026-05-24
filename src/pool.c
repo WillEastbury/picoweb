@@ -80,6 +80,11 @@ void pool_free(pool_t* p, conn_t* c) {
     c->close_after = false;
     c->send_body = false;
     c->req_start_tsc = 0;
+    c->obs_route = METRICS_ROUTE_OTHER;
+    c->obs_method = M_UNKNOWN;
+    c->obs_status = 0;
+    c->obs_request_bytes = 0;
+    c->obs_response_bytes = 0;
     c->last_active_ms = 0;
     c->api_pending = false;
     c->api_method = M_UNKNOWN;
