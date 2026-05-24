@@ -4,6 +4,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
@@ -53,9 +54,11 @@ typedef struct picowal_index_entry {
 
 struct picowal_db {
     int fd;
+    int dir_fd;
     uint64_t volume_bytes;
     uint64_t write_off;
     uint64_t next_seq;
+    bool quiesced;
     pthread_mutex_t mu;
     picowal_index_entry_t* buckets[PICOWAL_INDEX_BUCKETS];
 };
@@ -104,6 +107,22 @@ static int pwrite_full(int fd, const void* in, size_t len, uint64_t off) {
         wrote += (size_t)w;
     }
     return 0;
+}
+
+static int open_parent_dir(const char* path) {
+    const char* slash = strrchr(path, '/');
+    if (!slash) return open(".", O_RDONLY | O_CLOEXEC | O_DIRECTORY);
+    if (slash == path) return open("/", O_RDONLY | O_CLOEXEC | O_DIRECTORY);
+
+    size_t len = (size_t)(slash - path);
+    if (len == 0 || len >= PATH_MAX) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    char parent[PATH_MAX];
+    memcpy(parent, path, len);
+    parent[len] = '\0';
+    return open(parent, O_RDONLY | O_CLOEXEC | O_DIRECTORY);
 }
 
 static uint64_t rec_checksum(uint32_t key, uint32_t len, uint32_t flags,
@@ -245,10 +264,18 @@ static bool load_or_format(picowal_db_t* db, const char* path,
         }
     }
 
+    int dir_fd = open_parent_dir(path);
+    if (dir_fd < 0) {
+        close(fd);
+        return false;
+    }
+
     db->fd = fd;
+    db->dir_fd = dir_fd;
     db->volume_bytes = want_bytes;
     db->write_off = PICOWAL_SECTOR_SIZE;
     db->next_seq = 1;
+    db->quiesced = false;
     return true;
 }
 
@@ -291,6 +318,10 @@ static int append_record_locked(picowal_db_t* db, uint32_t key,
                                 const uint8_t* data, uint32_t len, bool tombstone) {
     if (db->fd < 0) {
         errno = EBADF;
+        return -1;
+    }
+    if (db->quiesced) {
+        errno = EBUSY;
         return -1;
     }
     picowal_record_hdr_t h;
@@ -337,6 +368,7 @@ picowal_db_t* picowal_db_create(void) {
     picowal_db_t* db = (picowal_db_t*)calloc(1, sizeof(*db));
     if (!db) return NULL;
     db->fd = -1;
+    db->dir_fd = -1;
     pthread_mutex_init(&db->mu, NULL);
     return db;
 }
@@ -371,6 +403,11 @@ bool picowal_db_open(picowal_db_t* db, const char* device_path,
         close(db->fd);
         db->fd = -1;
     }
+    if (db->dir_fd >= 0) {
+        close(db->dir_fd);
+        db->dir_fd = -1;
+    }
+    db->quiesced = false;
     clear_index(db);
 
     bool ok = load_or_format(db, device_path, volume_bytes, format);
@@ -378,6 +415,10 @@ bool picowal_db_open(picowal_db_t* db, const char* device_path,
     if (!ok && db->fd >= 0) {
         close(db->fd);
         db->fd = -1;
+    }
+    if (!ok && db->dir_fd >= 0) {
+        close(db->dir_fd);
+        db->dir_fd = -1;
     }
     pthread_mutex_unlock(&db->mu);
     return ok;
@@ -390,6 +431,11 @@ void picowal_db_close(picowal_db_t* db) {
         close(db->fd);
         db->fd = -1;
     }
+    if (db->dir_fd >= 0) {
+        close(db->dir_fd);
+        db->dir_fd = -1;
+    }
+    db->quiesced = false;
     clear_index(db);
     db->write_off = PICOWAL_SECTOR_SIZE;
     db->next_seq = 1;
@@ -410,6 +456,49 @@ bool picowal_db_healthy(picowal_db_t* db) {
     return ok;
 }
 
+bool picowal_db_quiesce(picowal_db_t* db) {
+    if (!db) {
+        errno = EINVAL;
+        return false;
+    }
+    pthread_mutex_lock(&db->mu);
+    if (db->fd < 0) {
+        pthread_mutex_unlock(&db->mu);
+        errno = EBADF;
+        return false;
+    }
+    if (db->quiesced) {
+        pthread_mutex_unlock(&db->mu);
+        return true;
+    }
+
+    db->quiesced = true;
+    if (fdatasync(db->fd) != 0 || (db->dir_fd >= 0 && fsync(db->dir_fd) != 0)) {
+        int saved = errno;
+        db->quiesced = false;
+        pthread_mutex_unlock(&db->mu);
+        errno = saved;
+        return false;
+    }
+    pthread_mutex_unlock(&db->mu);
+    return true;
+}
+
+void picowal_db_resume(picowal_db_t* db) {
+    if (!db) return;
+    pthread_mutex_lock(&db->mu);
+    db->quiesced = false;
+    pthread_mutex_unlock(&db->mu);
+}
+
+bool picowal_db_is_quiesced(picowal_db_t* db) {
+    if (!db) return false;
+    pthread_mutex_lock(&db->mu);
+    bool quiesced = db->quiesced;
+    pthread_mutex_unlock(&db->mu);
+    return quiesced;
+}
+
 int picowal_db_put_key(picowal_db_t* db, uint32_t key,
                        const void* data, uint32_t len, bool create_only) {
     if (!db || !data || len == 0 || len > PICOWAL_DATA_MAX) {
@@ -417,6 +506,11 @@ int picowal_db_put_key(picowal_db_t* db, uint32_t key,
         return -1;
     }
     pthread_mutex_lock(&db->mu);
+    if (db->quiesced) {
+        pthread_mutex_unlock(&db->mu);
+        errno = EBUSY;
+        return -1;
+    }
     if (create_only) {
         picowal_index_entry_t* e = index_find(db, key);
         if (e && !e->tombstone) {
@@ -481,6 +575,11 @@ int picowal_db_delete_key(picowal_db_t* db, uint32_t key) {
         return -1;
     }
     pthread_mutex_lock(&db->mu);
+    if (db->quiesced) {
+        pthread_mutex_unlock(&db->mu);
+        errno = EBUSY;
+        return -1;
+    }
     picowal_index_entry_t* e = index_find(db, key);
     if (!e || e->tombstone) {
         pthread_mutex_unlock(&db->mu);

@@ -13,6 +13,7 @@ picowal_api_status_t picowal_api_put(picowal_db_t* db, uint16_t card, uint32_t r
     if (!picowal_db_pack_key(card, record, &key)) return PICOWAL_API_INVALID;
     if (picowal_db_put_key(db, key, data, len, create_only) == 0) return PICOWAL_API_OK;
     if (errno == EEXIST) return PICOWAL_API_EXISTS;
+    if (errno == EBUSY) return PICOWAL_API_BUSY;
     return PICOWAL_API_IO;
 }
 
@@ -41,6 +42,7 @@ picowal_api_status_t picowal_api_delete(picowal_db_t* db, uint16_t card, uint32_
     if (!picowal_db_pack_key(card, record, &key)) return PICOWAL_API_INVALID;
     if (picowal_db_delete_key(db, key) == 0) return PICOWAL_API_OK;
     if (errno == ENOENT) return PICOWAL_API_NOT_FOUND;
+    if (errno == EBUSY) return PICOWAL_API_BUSY;
     return PICOWAL_API_IO;
 }
 

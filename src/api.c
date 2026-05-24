@@ -235,6 +235,18 @@ void api_picowal_set_public(bool public_routes) {
     g_picowal_public_http = public_routes;
 }
 
+bool api_picowal_quiesce(void) {
+    return g_picowal_enabled && g_picowal && picowal_db_quiesce(g_picowal);
+}
+
+void api_picowal_resume(void) {
+    if (g_picowal_enabled && g_picowal) picowal_db_resume(g_picowal);
+}
+
+bool api_picowal_is_quiesced(void) {
+    return g_picowal_enabled && g_picowal && picowal_db_is_quiesced(g_picowal);
+}
+
 bool api_oidc_init(bool cookie_auth_enabled, uint32_t cookie_ttl_sec,
                    const char* google_client_id,
                    const char* entra_client_id,
@@ -1517,8 +1529,14 @@ static void dispatch_health(http_method_t method,
             return;
         }
         if (g_picowal_enabled && picowal_db_healthy(g_picowal)) {
+            if (picowal_db_is_quiesced(g_picowal)) {
+                resp_json_literal(resp, 200, "OK",
+                                  "{\"status\":\"ready\",\"picowal\":\"ready\",\"writes\":\"quiesced\"}\n",
+                                  head_only);
+                return;
+            }
             resp_json_literal(resp, 200, "OK",
-                              "{\"status\":\"ready\",\"picowal\":\"ready\"}\n",
+                              "{\"status\":\"ready\",\"picowal\":\"ready\",\"writes\":\"enabled\"}\n",
                               head_only);
             return;
         }
@@ -1843,6 +1861,10 @@ scores_oom:
         picowal_api_status_t st = picowal_api_create_random(g_picowal, SCORE_CARD_ID,
                                                              doc, (uint32_t)dn, &rec);
         if (st != PICOWAL_API_OK) {
+            if (st == PICOWAL_API_BUSY) {
+                resp_text_error(resp, 503, "Service Unavailable", "storage quiesced\n");
+                return;
+            }
             resp_text_error(resp, 500, "Internal Server Error", "score write failed\n");
             return;
         }
@@ -2106,6 +2128,10 @@ static void dispatch_picowal_pack_record(http_method_t method, uint16_t meta_pac
         bool create_only = (method == M_POST);
         if (picowal_db_put_key(g_picowal, key, body, (uint32_t)body_len, create_only) != 0) {
             if (errno == EEXIST) { resp_status_only(resp, 409, "Conflict"); return; }
+            if (errno == EBUSY) {
+                resp_text_error(resp, 503, "Service Unavailable", "wal quiesced\n");
+                return;
+            }
             if (errno == ENOSPC) {
                 resp_text_error(resp, 507, "Insufficient Storage", "wal volume full\n");
                 return;
@@ -2124,6 +2150,10 @@ static void dispatch_picowal_pack_record(http_method_t method, uint16_t meta_pac
     if (method == M_DELETE) {
         if (picowal_db_delete_key(g_picowal, key) != 0) {
             if (errno == ENOENT) { resp_status_only(resp, 404, "Not Found"); return; }
+            if (errno == EBUSY) {
+                resp_text_error(resp, 503, "Service Unavailable", "wal quiesced\n");
+                return;
+            }
             resp_text_error(resp, 500, "Internal Server Error", "metadata delete failed\n");
             return;
         }
@@ -2459,6 +2489,10 @@ static void dispatch_picowal(http_method_t method,
             return;
         }
         if (picowal_db_put_key(g_picowal, key, body, (uint32_t)body_len, false) != 0) {
+            if (errno == EBUSY) {
+                resp_text_error(resp, 503, "Service Unavailable", "wal quiesced\n");
+                return;
+            }
             if (errno == ENOSPC) {
                 resp_text_error(resp, 507, "Insufficient Storage", "wal volume full\n");
                 return;
@@ -2512,6 +2546,10 @@ static void dispatch_picowal(http_method_t method,
                     resp_text_error(resp, 507, "Insufficient Storage", "wal volume full\n");
                     return;
                 }
+                if (errno == EBUSY) {
+                    resp_text_error(resp, 503, "Service Unavailable", "wal quiesced\n");
+                    return;
+                }
                 if (errno != EEXIST) {
                     resp_text_error(resp, 500, "Internal Server Error", "wal write failed\n");
                     return;
@@ -2540,6 +2578,10 @@ static void dispatch_picowal(http_method_t method,
         }
         if (picowal_db_put_key(g_picowal, key, body, (uint32_t)body_len, true) != 0) {
             if (errno == EEXIST) { resp_status_only(resp, 409, "Conflict"); return; }
+            if (errno == EBUSY) {
+                resp_text_error(resp, 503, "Service Unavailable", "wal quiesced\n");
+                return;
+            }
             if (errno == ENOSPC) {
                 resp_text_error(resp, 507, "Insufficient Storage", "wal volume full\n");
                 return;
@@ -2575,6 +2617,10 @@ static void dispatch_picowal(http_method_t method,
         }
         if (picowal_db_delete_key(g_picowal, key) != 0) {
             if (errno == ENOENT) { resp_status_only(resp, 404, "Not Found"); return; }
+            if (errno == EBUSY) {
+                resp_text_error(resp, 503, "Service Unavailable", "wal quiesced\n");
+                return;
+            }
             if (errno == ENOSPC) {
                 resp_text_error(resp, 507, "Insufficient Storage", "wal volume full\n");
                 return;

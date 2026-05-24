@@ -82,6 +82,9 @@ size_t api_max_request_body(void);
 bool api_picowal_init(const char* device_path, uint64_t volume_bytes,
                       const char* prefix, bool format);
 void api_picowal_set_public(bool public_routes);
+bool api_picowal_quiesce(void);
+void api_picowal_resume(void);
+bool api_picowal_is_quiesced(void);
 
 /* Optional OIDC-backed cookie auth for picowal routes. When enabled,
  * non-auth picowal endpoints require an authenticated session cookie.

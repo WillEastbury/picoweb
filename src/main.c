@@ -18,6 +18,34 @@
 #include "util.h"
 #include "../userspace/crypto/ecdsa.h"
 
+static void* picowal_signal_thread(void* arg) {
+    (void)arg;
+    sigset_t set;
+    sigemptyset(&set);
+    sigaddset(&set, SIGUSR1);
+    sigaddset(&set, SIGUSR2);
+
+    for (;;) {
+        int sig = 0;
+        int rc = sigwait(&set, &sig);
+        if (rc != 0) {
+            metal_log("picowal signal waiter: sigwait: %s", strerror(rc));
+            continue;
+        }
+        if (sig == SIGUSR1) {
+            if (api_picowal_quiesce()) {
+                metal_log("picowal: quiesced for snapshot (SIGUSR1)");
+            } else {
+                metal_log("picowal: quiesce failed: %s", strerror(errno));
+            }
+        } else if (sig == SIGUSR2) {
+            api_picowal_resume();
+            metal_log("picowal: resumed writes (SIGUSR2)");
+        }
+    }
+    return NULL;
+}
+
 static void usage(const char* argv0) {
     fprintf(stderr,
         "usage: %s [--io_uring | --dpdk | --tls] [--sqpoll [--sqpoll-cpu=N]] [--api-root=DIR [--api-prefix=/api/]] [--picowal-device=PATH [--picowal-prefix=/wal/] [--picowal-bytes=N] [--picowal-format] [--picowal-public-http] [--oidc-cookie-auth --oidc-cookie-ttl-sec=N --oidc-google-client-id=ID --oidc-entra-client-id=ID [--oidc-entra-tenant=TENANT]]] [--tls-cert=PATH --tls-key=PATH --tls-ifname=IFACE [--tls-peer-mac=MAC] [--tls-xdp [--tls-xdp-queue=N]]] [PORT] [WWWROOT] [WORKERS] [MAXREQS] [ZC_MIN] [POOL_CAP]\n"
@@ -464,6 +492,14 @@ int main(int argc, char** argv) {
      * sendmsg, so this is belt and braces.) */
     signal(SIGPIPE, SIG_IGN);
 
+    sigset_t picowal_sigset;
+    sigemptyset(&picowal_sigset);
+    sigaddset(&picowal_sigset, SIGUSR1);
+    sigaddset(&picowal_sigset, SIGUSR2);
+    if (pthread_sigmask(SIG_BLOCK, &picowal_sigset, NULL) != 0) {
+        metal_log("picoweb: failed to block picowal control signals");
+    }
+
     /* Initialize per-worker metrics state. MUST happen before
      * jumptable_build (which calls metrics_build_resources for /stats). */
     metrics_init((int)workers);
@@ -620,6 +656,16 @@ int main(int argc, char** argv) {
     if (oidc_cookie_auth) {
         metal_log("picoweb: OIDC cookie auth enabled (ttl=%us, providers=google+entra)",
                   oidc_cookie_ttl_sec);
+    }
+
+    if (api_picowal_enabled()) {
+        pthread_t sig_thread;
+        if (pthread_create(&sig_thread, NULL, picowal_signal_thread, NULL) == 0) {
+            pthread_detach(sig_thread);
+            metal_log("picoweb: SIGUSR1 quiesces picowal writes; SIGUSR2 resumes them");
+        } else {
+            metal_log("picoweb: failed to start picowal signal thread");
+        }
     }
 
     for (long i = 0; i < workers; i++) {
