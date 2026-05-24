@@ -226,6 +226,17 @@ bool api_picowal_init(const char* device_path, uint64_t volume_bytes,
                 device_path, strerror(errno));
         return false;
     }
+    picowal_recovery_info_t ri;
+    if (picowal_db_recovery_info(g_picowal, &ri)) {
+        metrics_set_picowal_recovery((uint64_t)ri.status,
+                                     ri.records_scanned,
+                                     ri.records_recovered,
+                                     ri.corrupt_records,
+                                     ri.truncated_records,
+                                     ri.truncated_bytes,
+                                     ri.write_offset,
+                                     ri.volume_bytes);
+    }
     size_t pl = strlen(prefix);
     memcpy(g_picowal_prefix, prefix, pl + 1);
     g_picowal_prefix_len = pl;
@@ -1536,6 +1547,32 @@ static void resp_metrics_text(api_resp_t* r, bool head_only) {
     r->body_owned = true;
 }
 
+static void resp_readyz_picowal(api_resp_t* r, const char* writes, bool head_only) {
+    picowal_recovery_info_t ri;
+    memset(&ri, 0, sizeof(ri));
+    ri.status = PICOWAL_RECOVERY_UNKNOWN;
+    if (g_picowal) {
+        (void)picowal_db_recovery_info(g_picowal, &ri);
+    }
+    char body[512];
+    int n = snprintf(body, sizeof(body),
+                     "{\"status\":\"ready\",\"picowal\":\"ready\",\"writes\":\"%s\","
+                     "\"recovery\":{\"status\":\"%s\",\"records_scanned\":%llu,"
+                     "\"records_recovered\":%llu,\"corrupt_records\":%llu,"
+                     "\"truncated_records\":%llu}}\n",
+                     writes,
+                     picowal_recovery_status_name(ri.status),
+                     (unsigned long long)ri.records_scanned,
+                     (unsigned long long)ri.records_recovered,
+                     (unsigned long long)ri.corrupt_records,
+                     (unsigned long long)ri.truncated_records);
+    if (n <= 0 || (size_t)n >= sizeof(body)) {
+        resp_status_only(r, 500, "Internal Server Error");
+        return;
+    }
+    resp_json_literal(r, 200, "OK", body, head_only);
+}
+
 static void dispatch_health(http_method_t method,
                             const char* path, size_t path_len,
                             api_resp_t* resp) {
@@ -1561,14 +1598,10 @@ static void dispatch_health(http_method_t method,
         }
         if (g_picowal_enabled && picowal_db_healthy(g_picowal)) {
             if (picowal_db_is_quiesced(g_picowal)) {
-                resp_json_literal(resp, 200, "OK",
-                                  "{\"status\":\"ready\",\"picowal\":\"ready\",\"writes\":\"quiesced\"}\n",
-                                  head_only);
+                resp_readyz_picowal(resp, "quiesced", head_only);
                 return;
             }
-            resp_json_literal(resp, 200, "OK",
-                              "{\"status\":\"ready\",\"picowal\":\"ready\",\"writes\":\"enabled\"}\n",
-                              head_only);
+            resp_readyz_picowal(resp, "enabled", head_only);
             return;
         }
         resp_json_literal(resp, 503, "Service Unavailable",

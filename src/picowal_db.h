@@ -12,6 +12,25 @@
 
 typedef struct picowal_db picowal_db_t;
 
+typedef enum {
+    PICOWAL_RECOVERY_UNKNOWN = 0,
+    PICOWAL_RECOVERY_CLEAN,
+    PICOWAL_RECOVERY_FRESH_FORMAT,
+    PICOWAL_RECOVERY_TAIL_TRUNCATED,
+    PICOWAL_RECOVERY_CORRUPT,
+} picowal_recovery_status_t;
+
+typedef struct {
+    picowal_recovery_status_t status;
+    uint64_t records_scanned;
+    uint64_t records_recovered;
+    uint64_t corrupt_records;
+    uint64_t truncated_records;
+    uint64_t truncated_bytes;
+    uint64_t write_offset;
+    uint64_t volume_bytes;
+} picowal_recovery_info_t;
+
 picowal_db_t* picowal_db_create(void);
 void picowal_db_destroy(picowal_db_t* db);
 
@@ -22,6 +41,8 @@ bool picowal_db_open(picowal_db_t* db, const char* device_path,
                      uint64_t volume_bytes, bool format);
 void picowal_db_close(picowal_db_t* db);
 bool picowal_db_healthy(picowal_db_t* db);
+bool picowal_db_recovery_info(picowal_db_t* db, picowal_recovery_info_t* out);
+const char* picowal_recovery_status_name(picowal_recovery_status_t status);
 bool picowal_db_quiesce(picowal_db_t* db);
 void picowal_db_resume(picowal_db_t* db);
 bool picowal_db_is_quiesced(picowal_db_t* db);

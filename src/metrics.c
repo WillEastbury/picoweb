@@ -50,8 +50,20 @@ typedef struct {
     uint64_t storage_us_sum;
 } metrics_wal_counter_t;
 
+typedef struct {
+    uint64_t status_code;
+    uint64_t records_scanned;
+    uint64_t records_recovered;
+    uint64_t corrupt_records;
+    uint64_t truncated_records;
+    uint64_t truncated_bytes;
+    uint64_t write_offset;
+    uint64_t volume_bytes;
+} metrics_wal_recovery_t;
+
 static metrics_route_counter_t g_route_counters[METRICS_ROUTE_COUNT];
 static metrics_wal_counter_t g_wal_counters[METRICS_WAL_COUNT];
+static metrics_wal_recovery_t g_wal_recovery;
 static bool g_access_log_enabled = false;
 
 /* ===========================================================
@@ -525,6 +537,24 @@ void metrics_observe_picowal(metrics_wal_op_t op,
     __atomic_add_fetch(&c->storage_us_sum, ticks_to_us(storage_tsc), __ATOMIC_RELAXED);
 }
 
+void metrics_set_picowal_recovery(uint64_t status_code,
+                                  uint64_t records_scanned,
+                                  uint64_t records_recovered,
+                                  uint64_t corrupt_records,
+                                  uint64_t truncated_records,
+                                  uint64_t truncated_bytes,
+                                  uint64_t write_offset,
+                                  uint64_t volume_bytes) {
+    __atomic_store_n(&g_wal_recovery.status_code, status_code, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_wal_recovery.records_scanned, records_scanned, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_wal_recovery.records_recovered, records_recovered, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_wal_recovery.corrupt_records, corrupt_records, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_wal_recovery.truncated_records, truncated_records, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_wal_recovery.truncated_bytes, truncated_bytes, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_wal_recovery.write_offset, write_offset, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_wal_recovery.volume_bytes, volume_bytes, __ATOMIC_RELAXED);
+}
+
 static const char* wal_op_name(metrics_wal_op_t op) {
     switch (op) {
     case METRICS_WAL_READ:   return "read";
@@ -612,6 +642,23 @@ char* metrics_render_text(size_t* out_len) {
         appendf(&p, &rem, "picowal_storage_latency_us_sum{op=\"%s\"} %llu\n",
                 op, (unsigned long long)__atomic_load_n(&c->storage_us_sum, __ATOMIC_RELAXED));
     }
+    appendf(&p, &rem, "# TYPE picowal_recovery_status gauge\n");
+    appendf(&p, &rem, "picowal_recovery_status %llu\n",
+            (unsigned long long)__atomic_load_n(&g_wal_recovery.status_code, __ATOMIC_RELAXED));
+    appendf(&p, &rem, "picowal_recovery_records_scanned %llu\n",
+            (unsigned long long)__atomic_load_n(&g_wal_recovery.records_scanned, __ATOMIC_RELAXED));
+    appendf(&p, &rem, "picowal_recovery_records_recovered %llu\n",
+            (unsigned long long)__atomic_load_n(&g_wal_recovery.records_recovered, __ATOMIC_RELAXED));
+    appendf(&p, &rem, "picowal_recovery_corrupt_records %llu\n",
+            (unsigned long long)__atomic_load_n(&g_wal_recovery.corrupt_records, __ATOMIC_RELAXED));
+    appendf(&p, &rem, "picowal_recovery_truncated_records %llu\n",
+            (unsigned long long)__atomic_load_n(&g_wal_recovery.truncated_records, __ATOMIC_RELAXED));
+    appendf(&p, &rem, "picowal_recovery_truncated_bytes %llu\n",
+            (unsigned long long)__atomic_load_n(&g_wal_recovery.truncated_bytes, __ATOMIC_RELAXED));
+    appendf(&p, &rem, "picowal_recovery_write_offset_bytes %llu\n",
+            (unsigned long long)__atomic_load_n(&g_wal_recovery.write_offset, __ATOMIC_RELAXED));
+    appendf(&p, &rem, "picowal_recovery_volume_bytes %llu\n",
+            (unsigned long long)__atomic_load_n(&g_wal_recovery.volume_bytes, __ATOMIC_RELAXED));
     if (out_len) *out_len = (size_t)(p - buf);
     return buf;
 }
