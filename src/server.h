@@ -63,4 +63,13 @@ void* uring_worker_main(void* arg);
 void* dpdk_worker_main(void* arg);
 void* tls_worker_main(void* arg);
 
+/* Process-wide graceful shutdown state. Signal waiters only set this flag;
+ * each worker closes its own listen socket after the lameduck window and
+ * exits after active connections drain or the hard drain deadline expires. */
+void server_request_shutdown(int signo);
+bool server_shutdown_requested(void);
+bool server_shutdown_lameduck_elapsed(void);
+bool server_shutdown_force_close(void);
+int  server_shutdown_signal(void);
+
 #endif

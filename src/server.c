@@ -41,6 +41,52 @@
  * is written exactly once before any work happens. */
 static size_t g_zc_threshold = 0;
 
+static uint64_t g_shutdown_requested = 0;
+static uint64_t g_shutdown_at_ms = 0;
+static int      g_shutdown_signal = 0;
+static int64_t  g_shutdown_lameduck_ms = 0;
+static int64_t  g_shutdown_drain_ms = 5000;
+
+static int64_t env_ms_or_default(const char* name, int64_t def) {
+    const char* s = getenv(name);
+    if (!s || !s[0]) return def;
+    char* end = NULL;
+    long long v = strtoll(s, &end, 10);
+    if (end == s || *end != '\0' || v < 0 || v > 300000) return def;
+    return (int64_t)v;
+}
+
+void server_request_shutdown(int signo) {
+    uint64_t already = __atomic_exchange_n(&g_shutdown_requested, 1, __ATOMIC_SEQ_CST);
+    if (!already) {
+        g_shutdown_at_ms = (uint64_t)metal_now_ms_coarse();
+        g_shutdown_signal = signo;
+        g_shutdown_lameduck_ms = env_ms_or_default("PICOWEB_SHUTDOWN_LAMEDUCK_MS", 0);
+        g_shutdown_drain_ms = env_ms_or_default("PICOWEB_SHUTDOWN_DRAIN_MS", 5000);
+    }
+}
+
+bool server_shutdown_requested(void) {
+    return __atomic_load_n(&g_shutdown_requested, __ATOMIC_SEQ_CST) != 0;
+}
+
+static int64_t shutdown_elapsed_ms(void) {
+    if (!server_shutdown_requested()) return 0;
+    return metal_now_ms_coarse() - (int64_t)__atomic_load_n(&g_shutdown_at_ms, __ATOMIC_SEQ_CST);
+}
+
+bool server_shutdown_lameduck_elapsed(void) {
+    return server_shutdown_requested() && shutdown_elapsed_ms() >= g_shutdown_lameduck_ms;
+}
+
+bool server_shutdown_force_close(void) {
+    return server_shutdown_requested() && shutdown_elapsed_ms() >= g_shutdown_drain_ms;
+}
+
+int server_shutdown_signal(void) {
+    return __atomic_load_n(&g_shutdown_signal, __ATOMIC_SEQ_CST);
+}
+
 static int status_for_parse_result(http_result_t pr) {
     switch (pr) {
     case HTTP_OK:      return 200;
@@ -992,6 +1038,7 @@ void* epoll_worker_main(void* arg) {
     }
 
     int listen_fd = make_listen_socket(cfg->port);
+    bool listen_closed = false;
     int ep = epoll_create1(EPOLL_CLOEXEC);
     if (ep < 0) metal_die("epoll_create1");
     ep_add(ep, listen_fd, &g_listen_marker, EPOLLIN);
@@ -1022,10 +1069,30 @@ void* epoll_worker_main(void* arg) {
          * used for idle timers and accept timestamps. */
         batch_now_ms = metal_now_ms_coarse();
 
+        if (!listen_closed && server_shutdown_lameduck_elapsed()) {
+            epoll_ctl(ep, EPOLL_CTL_DEL, listen_fd, NULL);
+            close(listen_fd);
+            listen_closed = true;
+            metal_log("worker %d draining: listen socket closed", cfg->worker_index);
+        }
+        if (listen_closed && pool.in_use == 0) {
+            metal_log("worker %d drained: no active connections", cfg->worker_index);
+            break;
+        }
+        if (server_shutdown_force_close()) {
+            for (size_t j = 0; j < pool.cap; j++) {
+                conn_t* c = &pool.base[j];
+                if (c->fd >= 0) close_conn(&pool, ep, c);
+            }
+            metal_log("worker %d drain deadline reached: closed active connections", cfg->worker_index);
+            break;
+        }
+
         for (int i = 0; i < n; i++) {
             void* ptr = events[i].data.ptr;
             uint32_t ev = events[i].events;
             if (ptr == &g_listen_marker) {
+                if (server_shutdown_lameduck_elapsed()) continue;
                 try_accept(listen_fd, ep, &pool, batch_now_ms);
                 continue;
             }
@@ -1080,5 +1147,7 @@ void* epoll_worker_main(void* arg) {
             last_sweep = batch_now_ms;
         }
     }
+    if (!listen_closed) close(listen_fd);
+    close(ep);
     return NULL;
 }
