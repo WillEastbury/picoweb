@@ -127,6 +127,16 @@ static int open_parent_dir(const char* path) {
     return open(parent, O_RDONLY | O_CLOEXEC | O_DIRECTORY);
 }
 
+static bool lock_volume_exclusive(int fd) {
+    struct flock lk;
+    memset(&lk, 0, sizeof(lk));
+    lk.l_type = F_WRLCK;
+    lk.l_whence = SEEK_SET;
+    lk.l_start = 0;
+    lk.l_len = 0;
+    return fcntl(fd, F_SETLK, &lk) == 0;
+}
+
 static uint64_t rec_checksum(uint32_t key, uint32_t len, uint32_t flags,
                              uint64_t seq, const uint8_t* payload) {
     uint64_t h = metal_fnv1a_init();
@@ -216,6 +226,12 @@ static bool load_or_format(picowal_db_t* db, const char* path,
     if (!S_ISREG(st.st_mode) && !S_ISBLK(st.st_mode)) {
         close(fd);
         errno = EINVAL;
+        return false;
+    }
+    if (!lock_volume_exclusive(fd)) {
+        int saved = errno;
+        close(fd);
+        errno = saved;
         return false;
     }
 
