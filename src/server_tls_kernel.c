@@ -143,6 +143,32 @@ static bool is_ctx_token_char(char c) {
            c == '-' || c == '_';
 }
 
+static int tls_status_for_parse_result(http_result_t pr) {
+    switch (pr) {
+    case HTTP_OK:      return 200;
+    case HTTP_ERR_400: return 400;
+    case HTTP_ERR_405: return 405;
+    case HTTP_ERR_409: return 409;
+    case HTTP_ERR_413: return 413;
+    case HTTP_ERR_414: return 414;
+    case HTTP_ERR_505: return 505;
+    default:           return 500;
+    }
+}
+
+static int tls_status_for_resource(const jumptable_t* jt, http_result_t pr, const resource_t* r) {
+    if (!jt || !r) return tls_status_for_parse_result(pr);
+    if (r == jt->err_400) return 400;
+    if (r == jt->err_404) return 404;
+    if (r == jt->err_405) return 405;
+    if (r == jt->err_409) return 409;
+    if (r == jt->err_413) return 413;
+    if (r == jt->err_414) return 414;
+    if (r == jt->err_500) return 500;
+    if (r == jt->err_505) return 505;
+    return tls_status_for_parse_result(pr);
+}
+
 static void resolve_api_request_context_tls(const http_request_t* req,
                                             api_request_context_t* ctx) {
     memset(ctx, 0, sizeof(*ctx));
@@ -442,7 +468,8 @@ static void kconn_close(tls_kworker_t* w, kconn_t* c) {
 static int build_http_response_iov(kconn_t* c,
                                    http_result_t pr, http_request_t* req,
                                    pw_iov_t* out, unsigned* out_n,
-                                   bool* out_close_after) {
+                                   bool* out_close_after,
+                                   int* out_status) {
     tls_kworker_t* w = c->w;
     bool close_after = false, head_only = false;
     const resource_t* r = http_select(w->cfg->jt, pr, req, &close_after, &head_only);
@@ -475,6 +502,7 @@ static int build_http_response_iov(kconn_t* c,
             };
             *out_n = n304;
             *out_close_after = close_after;
+            if (out_status) *out_status = 304;
             return 0;
         }
     }
@@ -535,6 +563,7 @@ static int build_http_response_iov(kconn_t* c,
 
     *out_n = n;
     *out_close_after = close_after;
+    if (out_status) *out_status = tls_status_for_resource(w->cfg->jt, pr, r);
     return 0;
 }
 
@@ -691,9 +720,10 @@ static int tls_drive_engine(kconn_t* c, bool* out_close_after_drain) {
             http_request_t dummy = {0};
             pw_iov_t resp[PW_IOV_MAX_FRAGS];
             unsigned rn = 0;
+            int status = 500;
             const uint64_t t_b0 = metal_tsc();
             if (build_http_response_iov(c, HTTP_ERR_413, &dummy,
-                                        resp, &rn, &close_after) != 0) {
+                                        resp, &rn, &close_after, &status) != 0) {
                 pw_tls_app_in_ack(&c->eng, app_len);
                 return -1;
             }
@@ -741,12 +771,14 @@ static int tls_drive_engine(kconn_t* c, bool* out_close_after_drain) {
             unsigned rn = 0;
             api_resp_t api_resp = {0};
             bool is_api = (pr == HTTP_OK && api_path_matches(req.path, req.path_len));
+            int status = tls_status_for_parse_result(pr);
             if (is_api) {
                 if (build_api_response_iov(c, &req, &api_resp, resp, &rn, &close_after) != 0) {
                     return -1;
                 }
+                status = api_resp.status;
             } else {
-                if (build_http_response_iov(c, pr, &req, resp, &rn, &close_after) != 0) {
+                if (build_http_response_iov(c, pr, &req, resp, &rn, &close_after, &status) != 0) {
                     return -1;
                 }
             }
@@ -767,6 +799,12 @@ static int tls_drive_engine(kconn_t* c, bool* out_close_after_drain) {
             const uint64_t t_p3 = metal_tsc();
             metrics_stage_add(METRICS_STAGE_TLS_SEAL, t_p3 - t_p2);
 
+            size_t response_plaintext_bytes = 0;
+            for (unsigned i = 0; i < rn; i++) response_plaintext_bytes += resp[i].len;
+            metrics_observe_request(metrics_route_for_path(req.path, req.path_len),
+                                    req.method, status, t_p3 - t_p0,
+                                    request_bytes, response_plaintext_bytes,
+                                    c->peer_ip, false);
             if (g_worker_metrics) {
                 metrics_record(g_worker_metrics, t_p0, t_p3);
             }

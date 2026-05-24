@@ -5,6 +5,7 @@
 #include "picowal_db.h"
 #include "picowal_query.h"
 #include "picowal_validate.h"
+#include "metrics.h"
 #include "../userspace/crypto/hmac.h"
 
 #include <ctype.h>
@@ -94,7 +95,8 @@ size_t api_max_request_body(void)   { return API_REQ_BODY_CAP; }
 bool api_health_path_matches(const char* path, size_t path_len) {
     return path &&
            ((path_len == 8 && memcmp(path, "/healthz", 8) == 0) ||
-            (path_len == 7 && memcmp(path, "/readyz", 7) == 0));
+            (path_len == 7 && memcmp(path, "/readyz", 7) == 0) ||
+            (path_len == 9 && memcmp(path, "/metricsz", 9) == 0));
 }
 
 static const char* public_api_prefix(size_t* out_len) {
@@ -1509,6 +1511,31 @@ static void resp_json_literal(api_resp_t* r, int status, const char* reason,
     r->body_owned = true;
 }
 
+static void resp_metrics_text(api_resp_t* r, bool head_only) {
+    size_t blen = 0;
+    char* body = metrics_render_text(&blen);
+    if (!body) {
+        resp_status_only(r, 500, "Internal Server Error");
+        return;
+    }
+    r->status = 200;
+    int n = snprintf(r->head, sizeof(r->head),
+                     "HTTP/1.1 200 OK\r\n"
+                     "Server: picoweb\r\n"
+                     "Content-Type: text/plain; version=0.0.4; charset=utf-8\r\n"
+                     "Content-Length: %zu\r\n"
+                     "Cache-Control: no-store\r\n",
+                     blen);
+    r->head_len = (n > 0) ? (size_t)n : 0;
+    if (head_only) {
+        free(body);
+        return;
+    }
+    r->body = body;
+    r->body_len = blen;
+    r->body_owned = true;
+}
+
 static void dispatch_health(http_method_t method,
                             const char* path, size_t path_len,
                             api_resp_t* resp) {
@@ -1519,6 +1546,10 @@ static void dispatch_health(http_method_t method,
     bool head_only = (method == M_HEAD);
     if (path_len == 8 && memcmp(path, "/healthz", 8) == 0) {
         resp_json_literal(resp, 200, "OK", "{\"status\":\"live\"}\n", head_only);
+        return;
+    }
+    if (path_len == 9 && memcmp(path, "/metricsz", 9) == 0) {
+        resp_metrics_text(resp, head_only);
         return;
     }
     if (path_len == 7 && memcmp(path, "/readyz", 7) == 0) {

@@ -1,5 +1,6 @@
 #include "picowal_db.h"
 
+#include "metrics.h"
 #include "util.h"
 
 #include <errno.h>
@@ -505,9 +506,13 @@ int picowal_db_put_key(picowal_db_t* db, uint32_t key,
         errno = EINVAL;
         return -1;
     }
+    uint64_t t_enter = metal_tsc();
     pthread_mutex_lock(&db->mu);
+    uint64_t t_locked = metal_tsc();
     if (db->quiesced) {
         pthread_mutex_unlock(&db->mu);
+        metrics_observe_picowal(METRICS_WAL_WRITE, t_locked - t_enter,
+                                metal_tsc() - t_locked, false);
         errno = EBUSY;
         return -1;
     }
@@ -515,12 +520,18 @@ int picowal_db_put_key(picowal_db_t* db, uint32_t key,
         picowal_index_entry_t* e = index_find(db, key);
         if (e && !e->tombstone) {
             pthread_mutex_unlock(&db->mu);
+            metrics_observe_picowal(METRICS_WAL_WRITE, t_locked - t_enter,
+                                    metal_tsc() - t_locked, false);
             errno = EEXIST;
             return -1;
         }
     }
     int rc = append_record_locked(db, key, (const uint8_t*)data, len, false);
+    int saved = errno;
     pthread_mutex_unlock(&db->mu);
+    metrics_observe_picowal(METRICS_WAL_WRITE, t_locked - t_enter,
+                            metal_tsc() - t_locked, rc == 0);
+    errno = saved;
     return rc;
 }
 
@@ -530,42 +541,62 @@ int picowal_db_get_key(picowal_db_t* db, uint32_t key, void* out, uint32_t out_l
         return -1;
     }
 
+    uint64_t t_enter = metal_tsc();
     pthread_mutex_lock(&db->mu);
+    uint64_t t_locked = metal_tsc();
     picowal_index_entry_t* e = index_find(db, key);
     if (!e || e->tombstone) {
         pthread_mutex_unlock(&db->mu);
+        metrics_observe_picowal(METRICS_WAL_READ, t_locked - t_enter,
+                                metal_tsc() - t_locked, false);
         errno = ENOENT;
         return -1;
     }
     if (e->len > out_len) {
         pthread_mutex_unlock(&db->mu);
+        metrics_observe_picowal(METRICS_WAL_READ, t_locked - t_enter,
+                                metal_tsc() - t_locked, false);
         errno = EMSGSIZE;
         return -1;
     }
 
     picowal_record_hdr_t h;
     if (pread_full(db->fd, &h, sizeof(h), e->offset) != 0) {
+        int saved = errno;
         pthread_mutex_unlock(&db->mu);
+        metrics_observe_picowal(METRICS_WAL_READ, t_locked - t_enter,
+                                metal_tsc() - t_locked, false);
+        errno = saved;
         return -1;
     }
     if (h.magic != PICOWAL_REC_MAGIC || h.key != key || h.len != e->len ||
         (h.flags & PICOWAL_REC_TOMBSTONE) != 0) {
         pthread_mutex_unlock(&db->mu);
+        metrics_observe_picowal(METRICS_WAL_READ, t_locked - t_enter,
+                                metal_tsc() - t_locked, false);
         errno = EIO;
         return -1;
     }
     if (pread_full(db->fd, out, e->len, e->offset + sizeof(h)) != 0) {
+        int saved = errno;
         pthread_mutex_unlock(&db->mu);
+        metrics_observe_picowal(METRICS_WAL_READ, t_locked - t_enter,
+                                metal_tsc() - t_locked, false);
+        errno = saved;
         return -1;
     }
     uint64_t chk = rec_checksum(h.key, h.len, h.flags, h.seq, (const uint8_t*)out);
     if (chk != h.checksum) {
         pthread_mutex_unlock(&db->mu);
+        metrics_observe_picowal(METRICS_WAL_READ, t_locked - t_enter,
+                                metal_tsc() - t_locked, false);
         errno = EIO;
         return -1;
     }
     int ret = (int)e->len;
     pthread_mutex_unlock(&db->mu);
+    metrics_observe_picowal(METRICS_WAL_READ, t_locked - t_enter,
+                            metal_tsc() - t_locked, true);
     return ret;
 }
 
@@ -574,20 +605,30 @@ int picowal_db_delete_key(picowal_db_t* db, uint32_t key) {
         errno = EINVAL;
         return -1;
     }
+    uint64_t t_enter = metal_tsc();
     pthread_mutex_lock(&db->mu);
+    uint64_t t_locked = metal_tsc();
     if (db->quiesced) {
         pthread_mutex_unlock(&db->mu);
+        metrics_observe_picowal(METRICS_WAL_DELETE, t_locked - t_enter,
+                                metal_tsc() - t_locked, false);
         errno = EBUSY;
         return -1;
     }
     picowal_index_entry_t* e = index_find(db, key);
     if (!e || e->tombstone) {
         pthread_mutex_unlock(&db->mu);
+        metrics_observe_picowal(METRICS_WAL_DELETE, t_locked - t_enter,
+                                metal_tsc() - t_locked, false);
         errno = ENOENT;
         return -1;
     }
     int rc = append_record_locked(db, key, NULL, 0, true);
+    int saved = errno;
     pthread_mutex_unlock(&db->mu);
+    metrics_observe_picowal(METRICS_WAL_DELETE, t_locked - t_enter,
+                            metal_tsc() - t_locked, rc == 0);
+    errno = saved;
     return rc;
 }
 
@@ -604,7 +645,9 @@ uint32_t picowal_db_list_records(picowal_db_t* db, uint16_t card,
                                  uint32_t* out_records, uint32_t max_records) {
     if (!db || !out_records || max_records == 0 || card > PICOWAL_CARD_MAX) return 0;
     uint32_t n = 0;
+    uint64_t t_enter = metal_tsc();
     pthread_mutex_lock(&db->mu);
+    uint64_t t_locked = metal_tsc();
     for (size_t bi = 0; bi < PICOWAL_INDEX_BUCKETS && n < max_records; bi++) {
         picowal_index_entry_t* e = db->buckets[bi];
         while (e && n < max_records) {
@@ -615,5 +658,7 @@ uint32_t picowal_db_list_records(picowal_db_t* db, uint16_t card,
         }
     }
     pthread_mutex_unlock(&db->mu);
+    metrics_observe_picowal(METRICS_WAL_LIST, t_locked - t_enter,
+                            metal_tsc() - t_locked, true);
     return n;
 }

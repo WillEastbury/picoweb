@@ -26,8 +26,10 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include <stdbool.h>
 
 #include "arena.h"
+#include "http.h"
 #include "jumptable.h"
 
 #define METRICS_WINDOW_SEC 300                /* 5-minute rolling window */
@@ -153,6 +155,47 @@ static inline void metrics_stage_add(int s, uint64_t delta_tsc) {
         /* prev was reloaded by CAS; loop. */
     }
 }
+
+typedef enum {
+        METRICS_ROUTE_STATIC = 0,
+        METRICS_ROUTE_HEALTHZ,
+        METRICS_ROUTE_READYZ,
+        METRICS_ROUTE_STATS,
+        METRICS_ROUTE_METRICSZ,
+        METRICS_ROUTE_SCORES_START,
+        METRICS_ROUTE_SCORES,
+        METRICS_ROUTE_API,
+        METRICS_ROUTE_PICOWAL,
+        METRICS_ROUTE_OTHER,
+        METRICS_ROUTE_COUNT,
+} metrics_route_t;
+
+typedef enum {
+        METRICS_WAL_READ = 0,
+        METRICS_WAL_WRITE,
+        METRICS_WAL_DELETE,
+        METRICS_WAL_LIST,
+        METRICS_WAL_COUNT,
+} metrics_wal_op_t;
+
+metrics_route_t metrics_route_for_path(const char* path, size_t path_len);
+const char* metrics_route_name(metrics_route_t route);
+
+void metrics_observe_request(metrics_route_t route,
+                             http_method_t method,
+                             int status,
+                             uint64_t latency_tsc,
+                             size_t request_bytes,
+                             size_t response_plaintext_bytes,
+                             const char* client_ip,
+                             bool aborted);
+
+void metrics_observe_picowal(metrics_wal_op_t op,
+                             uint64_t lock_wait_tsc,
+                             uint64_t storage_tsc,
+                             bool ok);
+
+char* metrics_render_text(size_t* out_len);
 
 /* Hot-path: record one request. Caller passes its per-worker metrics. */
 static inline void metrics_record(metrics_t* m,

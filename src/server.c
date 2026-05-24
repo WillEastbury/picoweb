@@ -41,6 +41,43 @@
  * is written exactly once before any work happens. */
 static size_t g_zc_threshold = 0;
 
+static int status_for_parse_result(http_result_t pr) {
+    switch (pr) {
+    case HTTP_OK:      return 200;
+    case HTTP_ERR_400: return 400;
+    case HTTP_ERR_405: return 405;
+    case HTTP_ERR_409: return 409;
+    case HTTP_ERR_413: return 413;
+    case HTTP_ERR_414: return 414;
+    case HTTP_ERR_505: return 505;
+    default:           return 500;
+    }
+}
+
+static int status_for_resource(const jumptable_t* jt, http_result_t pr, const resource_t* r) {
+    if (!jt || !r) return status_for_parse_result(pr);
+    if (r == jt->err_400) return 400;
+    if (r == jt->err_404) return 404;
+    if (r == jt->err_405) return 405;
+    if (r == jt->err_409) return 409;
+    if (r == jt->err_413) return 413;
+    if (r == jt->err_414) return 414;
+    if (r == jt->err_500) return 500;
+    if (r == jt->err_505) return 505;
+    return status_for_parse_result(pr);
+}
+
+static void conn_observe(conn_t* c, bool aborted) {
+    if (!c->req_start_tsc) return;
+    uint64_t end = metal_tsc();
+    metrics_observe_request(c->obs_route, c->obs_method, c->obs_status,
+                            end - c->req_start_tsc, c->obs_request_bytes,
+                            aborted ? c->bytes_sent : c->obs_response_bytes,
+                            c->peer_ip, aborted);
+    if (g_worker_metrics) metrics_record(g_worker_metrics, c->req_start_tsc, end);
+    c->req_start_tsc = 0;
+}
+
 /* ============================================================== */
 /* Listen socket per worker                                       */
 /* ============================================================== */
@@ -163,6 +200,7 @@ static int drain_zc_errqueue(int fd) {
 /* ============================================================== */
 
 static void close_conn(pool_t* pool, int ep, conn_t* c) {
+    conn_observe(c, c->req_start_tsc != 0);
     if (c->fd >= 0) {
         epoll_ctl(ep, EPOLL_CTL_DEL, c->fd, NULL);
         close(c->fd);
@@ -449,6 +487,8 @@ static void api_run(conn_t* c) {
     c->api_pending = true;
     api_finalise(c, /*head_only*/ c->api_method == M_HEAD,
                  /*close_after*/ true);
+    c->obs_status = c->api_resp.status;
+    c->obs_response_bytes = c->wire_total;
     c->read_off = 0;  /* request fully consumed; no leftover */
 }
 
@@ -476,12 +516,18 @@ static __attribute__((hot)) int dispatch_one(conn_t* c, const jumptable_t* jt, u
 
     /* Latency clock: from this point we will produce a response. */
     c->req_start_tsc = metal_tsc();
+    c->obs_route = metrics_route_for_path(req.path, req.path_len);
+    c->obs_method = req.method;
+    c->obs_status = status_for_parse_result(pr);
+    c->obs_request_bytes = req.consumed;
+    c->obs_response_bytes = 0;
 
     /* JSON-file API: route requests under the configured prefix
      * (regardless of method, including GET/HEAD that the static
      * jumptable would otherwise resolve). */
     if (pr == HTTP_OK && api_path_matches(req.path, req.path_len)) {
         c->req_count++;
+        c->obs_request_bytes = req.consumed + req.content_length;
         if (req.path_len > sizeof(c->api_path)) {
             /* Should be impossible — http_parse caps path at MAX_URI_LEN
              * (2048), but our api_path stash is smaller. Treat as 414. */
@@ -499,6 +545,8 @@ static __attribute__((hot)) int dispatch_one(conn_t* c, const jumptable_t* jt, u
             c->api_resp.head_len = (n > 0) ? (size_t)n : 0;
             c->api_pending = true;
             api_finalise(c, /*head_only*/ false, /*close_after*/ true);
+            c->obs_status = 413;
+            c->obs_response_bytes = c->wire_total;
             c->read_off = 0;
             return 1;
         }
@@ -594,6 +642,8 @@ static __attribute__((hot)) int dispatch_one(conn_t* c, const jumptable_t* jt, u
             c->api_resp.head_len = (n > 0) ? (size_t)n : 0;
             c->api_pending = true;
             api_finalise(c, /*head_only*/ false, /*close_after*/ true);
+            c->obs_status = 413;
+            c->obs_response_bytes = c->wire_total;
             c->read_off = 0;
             return 1;
         }
@@ -614,6 +664,7 @@ fallback_static:
 
     bool close_after, head_only;
     const resource_t* r = http_select(jt, pr, &req, &close_after, &head_only);
+    c->obs_status = status_for_resource(jt, pr, r);
 
     /* Apply hard cap: serve at most max_req requests per connection.
      * Increment first so the Nth response carries Connection: close. */
@@ -716,11 +767,13 @@ fallback_static:
             c->seg_count = 2;
             c->wire_total = w304_len + c->segs[1].len;
             head_only = true;
+            c->obs_status = 304;
         }
     }
 
     c->send_body   = !head_only;
     c->bytes_sent  = 0;
+    c->obs_response_bytes = c->wire_total;
     c->close_after = close_after;
     c->state       = ST_WRITING;
 
@@ -749,10 +802,7 @@ static __attribute__((hot)) bool post_send(conn_t* c, int ep, pool_t* pool,
         /* Record latency for the request that just completed. Per-worker
          * metrics: zero atomics, zero contention. Skipped if no in-flight
          * request to record (e.g. first iter before any dispatch). */
-        if (c->req_start_tsc && g_worker_metrics) {
-            metrics_record(g_worker_metrics, c->req_start_tsc, metal_tsc());
-            c->req_start_tsc = 0;
-        }
+        conn_observe(c, false);
 
         if (c->close_after) {
             close_conn(pool, ep, c);

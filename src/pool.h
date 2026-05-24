@@ -7,6 +7,7 @@
 
 #include "jumptable.h"
 #include "api.h"
+#include "metrics.h"
 
 #define METAL_READ_BUF 8192
 
@@ -49,6 +50,11 @@ typedef struct conn {
      * 0 means "no in-flight request to record". TSC ticks
      * (rdtsc / cntvct_el0). */
     uint64_t req_start_tsc;
+    metrics_route_t obs_route;
+    http_method_t   obs_method;
+    int             obs_status;
+    size_t          obs_request_bytes;
+    size_t          obs_response_bytes;
 
     /* Bookkeeping. last_active_ms is refreshed ONLY at request/response
      * boundaries (NOT on every byte) so a slow drip-feeder cannot keep
