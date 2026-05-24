@@ -967,6 +967,20 @@ static void idle_sweep(tls_kworker_t* w, int64_t now_ms) {
     }
 }
 
+static size_t live_conn_count(tls_kworker_t* w) {
+    size_t n = 0;
+    for (size_t i = 0; i < w->conns_cap; i++) {
+        if (w->conns[i].state == KCONN_LIVE) n++;
+    }
+    return n;
+}
+
+static void close_all_live(tls_kworker_t* w) {
+    for (size_t i = 0; i < w->conns_cap; i++) {
+        if (w->conns[i].state == KCONN_LIVE) kconn_close(w, &w->conns[i]);
+    }
+}
+
 /* -----------------------------------------------------------------
  * Worker entrypoint
  * ----------------------------------------------------------------- */
@@ -1048,6 +1062,7 @@ void* tls_worker_main(void* arg) {
     }
 
     w->listen_fd = make_listen_socket(cfg->port);
+    bool listen_closed = false;
     w->epfd = epoll_create1(EPOLL_CLOEXEC);
     if (w->epfd < 0) metal_die("epoll_create1: %s", strerror(errno));
     ep_add(w->epfd, w->listen_fd, &g_listen_marker, EPOLLIN);
@@ -1073,11 +1088,29 @@ void* tls_worker_main(void* arg) {
         }
         int64_t now_ms = metal_now_ms();
 
+        if (!listen_closed && server_shutdown_lameduck_elapsed()) {
+            epoll_ctl(w->epfd, EPOLL_CTL_DEL, w->listen_fd, NULL);
+            close(w->listen_fd);
+            w->listen_fd = -1;
+            listen_closed = true;
+            metal_log("worker %d draining: listen socket closed", cfg->worker_index);
+        }
+        if (listen_closed && live_conn_count(w) == 0) {
+            metal_log("worker %d drained: no active TLS connections", cfg->worker_index);
+            break;
+        }
+        if (server_shutdown_force_close()) {
+            close_all_live(w);
+            metal_log("worker %d drain deadline reached: closed active TLS connections", cfg->worker_index);
+            break;
+        }
+
         for (int i = 0; i < n; i++) {
             void* p = evs[i].data.ptr;
             uint32_t ev = evs[i].events;
 
             if (p == &g_listen_marker) {
+                if (server_shutdown_lameduck_elapsed()) continue;
                 try_accept(w, now_ms);
                 continue;
             }
@@ -1128,6 +1161,7 @@ void* tls_worker_main(void* arg) {
             last_sweep_ms = now_ms;
         }
     }
-    /* not reached */
+    if (!listen_closed && w->listen_fd >= 0) close(w->listen_fd);
+    if (w->epfd >= 0) close(w->epfd);
     return NULL;
 }

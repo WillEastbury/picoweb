@@ -18,12 +18,14 @@
 #include "util.h"
 #include "../userspace/crypto/ecdsa.h"
 
-static void* picowal_signal_thread(void* arg) {
+static void* control_signal_thread(void* arg) {
     (void)arg;
     sigset_t set;
     sigemptyset(&set);
     sigaddset(&set, SIGUSR1);
     sigaddset(&set, SIGUSR2);
+    sigaddset(&set, SIGTERM);
+    sigaddset(&set, SIGINT);
 
     for (;;) {
         int sig = 0;
@@ -41,6 +43,13 @@ static void* picowal_signal_thread(void* arg) {
         } else if (sig == SIGUSR2) {
             api_picowal_resume();
             metal_log("picowal: resumed writes (SIGUSR2)");
+        } else if (sig == SIGTERM || sig == SIGINT) {
+            bool first = !server_shutdown_requested();
+            server_request_shutdown(sig);
+            if (first) {
+                metal_log("picoweb: shutdown requested by %s; readiness draining",
+                          sig == SIGTERM ? "SIGTERM" : "SIGINT");
+            }
         }
     }
     return NULL;
@@ -496,6 +505,8 @@ int main(int argc, char** argv) {
     sigemptyset(&picowal_sigset);
     sigaddset(&picowal_sigset, SIGUSR1);
     sigaddset(&picowal_sigset, SIGUSR2);
+    sigaddset(&picowal_sigset, SIGTERM);
+    sigaddset(&picowal_sigset, SIGINT);
     if (pthread_sigmask(SIG_BLOCK, &picowal_sigset, NULL) != 0) {
         metal_log("picoweb: failed to block picowal control signals");
     }
@@ -658,18 +669,23 @@ int main(int argc, char** argv) {
                   oidc_cookie_ttl_sec);
     }
 
-    if (api_picowal_enabled()) {
-        pthread_t sig_thread;
-        if (pthread_create(&sig_thread, NULL, picowal_signal_thread, NULL) == 0) {
-            pthread_detach(sig_thread);
-            metal_log("picoweb: SIGUSR1 quiesces picowal writes; SIGUSR2 resumes them");
-        } else {
-            metal_log("picoweb: failed to start picowal signal thread");
-        }
+    pthread_t sig_thread;
+    if (pthread_create(&sig_thread, NULL, control_signal_thread, NULL) == 0) {
+        pthread_detach(sig_thread);
+        metal_log("picoweb: SIGUSR1 quiesces picowal writes; SIGUSR2 resumes them; SIGTERM/SIGINT drain");
+    } else {
+        metal_log("picoweb: failed to start signal thread");
     }
 
     for (long i = 0; i < workers; i++) {
         pthread_join(threads[i], NULL);
+    }
+    if (server_shutdown_requested() && api_picowal_enabled()) {
+        if (api_picowal_quiesce()) {
+            metal_log("picoweb: picowal flushed during shutdown");
+        } else {
+            metal_log("picoweb: picowal shutdown flush failed: %s", strerror(errno));
+        }
     }
     return 0;
 }

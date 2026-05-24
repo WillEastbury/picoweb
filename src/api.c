@@ -6,6 +6,7 @@
 #include "picowal_query.h"
 #include "picowal_validate.h"
 #include "metrics.h"
+#include "server.h"
 #include "../userspace/crypto/hmac.h"
 
 #include <ctype.h>
@@ -1547,20 +1548,22 @@ static void resp_metrics_text(api_resp_t* r, bool head_only) {
     r->body_owned = true;
 }
 
-static void resp_readyz_picowal(api_resp_t* r, const char* writes, bool head_only) {
+static void resp_readyz_picowal(api_resp_t* r, int status, const char* reason,
+                                const char* writes, bool head_only) {
     picowal_recovery_info_t ri;
     memset(&ri, 0, sizeof(ri));
     ri.status = PICOWAL_RECOVERY_UNKNOWN;
     if (g_picowal) {
         (void)picowal_db_recovery_info(g_picowal, &ri);
     }
+    const char* state = (status == 200) ? "ready" : "draining";
     char body[512];
     int n = snprintf(body, sizeof(body),
-                     "{\"status\":\"ready\",\"picowal\":\"ready\",\"writes\":\"%s\","
+                     "{\"status\":\"%s\",\"picowal\":\"ready\",\"writes\":\"%s\","
                      "\"recovery\":{\"status\":\"%s\",\"records_scanned\":%llu,"
                      "\"records_recovered\":%llu,\"corrupt_records\":%llu,"
                      "\"truncated_records\":%llu}}\n",
-                     writes,
+                     state, writes,
                      picowal_recovery_status_name(ri.status),
                      (unsigned long long)ri.records_scanned,
                      (unsigned long long)ri.records_recovered,
@@ -1570,7 +1573,7 @@ static void resp_readyz_picowal(api_resp_t* r, const char* writes, bool head_onl
         resp_status_only(r, 500, "Internal Server Error");
         return;
     }
-    resp_json_literal(r, 200, "OK", body, head_only);
+    resp_json_literal(r, status, reason, body, head_only);
 }
 
 static void dispatch_health(http_method_t method,
@@ -1590,6 +1593,15 @@ static void dispatch_health(http_method_t method,
         return;
     }
     if (path_len == 7 && memcmp(path, "/readyz", 7) == 0) {
+        if (server_shutdown_requested()) {
+            if (g_picowal_enabled && g_picowal) {
+                resp_readyz_picowal(resp, 503, "Service Unavailable", "draining", head_only);
+            } else {
+                resp_json_literal(resp, 503, "Service Unavailable",
+                                  "{\"status\":\"draining\"}\n", head_only);
+            }
+            return;
+        }
         if (!g_picowal) {
             resp_json_literal(resp, 200, "OK",
                               "{\"status\":\"ready\",\"picowal\":\"disabled\"}\n",
@@ -1598,10 +1610,10 @@ static void dispatch_health(http_method_t method,
         }
         if (g_picowal_enabled && picowal_db_healthy(g_picowal)) {
             if (picowal_db_is_quiesced(g_picowal)) {
-                resp_readyz_picowal(resp, "quiesced", head_only);
+                resp_readyz_picowal(resp, 200, "OK", "quiesced", head_only);
                 return;
             }
-            resp_readyz_picowal(resp, "enabled", head_only);
+            resp_readyz_picowal(resp, 200, "OK", "enabled", head_only);
             return;
         }
         resp_json_literal(resp, 503, "Service Unavailable",
@@ -1819,6 +1831,10 @@ static void dispatch_scores(http_method_t method,
             resp_status_only(resp, 405, "Method Not Allowed");
             return;
         }
+        if (server_shutdown_requested()) {
+            resp_text_error(resp, 503, "Service Unavailable", "server draining\n");
+            return;
+        }
         char token[128];
         if (!score_issue_token(token, now)) {
             resp_text_error(resp, 500, "Internal Server Error", "token issue failed\n");
@@ -1890,6 +1906,10 @@ scores_oom:
     }
 
     if (method == M_POST) {
+        if (server_shutdown_requested()) {
+            resp_text_error(resp, 503, "Service Unavailable", "server draining\n");
+            return;
+        }
         if (body_len == 0 || body_len > 512) {
             resp_status_only(resp, 413, "Payload Too Large");
             return;
