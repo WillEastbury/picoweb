@@ -60,6 +60,7 @@ struct picowal_db {
     uint64_t write_off;
     uint64_t next_seq;
     bool quiesced;
+    picowal_recovery_info_t recovery;
     pthread_mutex_t mu;
     picowal_index_entry_t* buckets[PICOWAL_INDEX_BUCKETS];
 };
@@ -135,6 +136,22 @@ static uint64_t rec_checksum(uint32_t key, uint32_t len, uint32_t flags,
     h = metal_fnv1a_step(h, &seq, sizeof(seq));
     if (payload && len) h = metal_fnv1a_step(h, payload, len);
     return h;
+}
+
+const char* picowal_recovery_status_name(picowal_recovery_status_t status) {
+    switch (status) {
+    case PICOWAL_RECOVERY_CLEAN:          return "clean";
+    case PICOWAL_RECOVERY_FRESH_FORMAT:   return "fresh_format";
+    case PICOWAL_RECOVERY_TAIL_TRUNCATED: return "tail_truncated";
+    case PICOWAL_RECOVERY_CORRUPT:        return "corrupt";
+    case PICOWAL_RECOVERY_UNKNOWN:
+    default:                              return "unknown";
+    }
+}
+
+static void recovery_reset(picowal_db_t* db) {
+    memset(&db->recovery, 0, sizeof(db->recovery));
+    db->recovery.status = PICOWAL_RECOVERY_UNKNOWN;
 }
 
 static void clear_index(picowal_db_t* db) {
@@ -263,6 +280,7 @@ static bool load_or_format(picowal_db_t* db, const char* path,
             close(fd);
             return false;
         }
+        db->recovery.status = PICOWAL_RECOVERY_FRESH_FORMAT;
     }
 
     int dir_fd = open_parent_dir(path);
@@ -280,38 +298,120 @@ static bool load_or_format(picowal_db_t* db, const char* path,
     return true;
 }
 
+static bool read_valid_record(picowal_db_t* db, uint64_t off,
+                              uint64_t* out_span, uint64_t* out_seq) {
+    if (off + sizeof(picowal_record_hdr_t) > db->volume_bytes) return false;
+
+    picowal_record_hdr_t h;
+    uint8_t payload[PICOWAL_DATA_MAX];
+    if (pread_full(db->fd, &h, sizeof(h), off) != 0) return false;
+    if (h.magic != PICOWAL_REC_MAGIC) return false;
+    if (h.len > PICOWAL_DATA_MAX) return false;
+    if ((h.flags & ~PICOWAL_REC_TOMBSTONE) != 0) return false;
+
+    uint64_t span = align_up_512(sizeof(h) + h.len);
+    if (off + span > db->volume_bytes) return false;
+    if (h.len > 0 && pread_full(db->fd, payload, h.len, off + sizeof(h)) != 0) {
+        return false;
+    }
+
+    uint64_t chk = rec_checksum(h.key, h.len, h.flags, h.seq, h.len ? payload : NULL);
+    if (chk != h.checksum) return false;
+    if (out_span) *out_span = span;
+    if (out_seq) *out_seq = h.seq;
+    return true;
+}
+
+static bool has_valid_record_after(picowal_db_t* db, uint64_t off,
+                                   uint64_t* max_seq_out) {
+    bool found = false;
+    uint64_t max_seq = max_seq_out ? *max_seq_out : 0;
+    uint64_t pos = align_up_512(off + 1);
+    while (pos + sizeof(picowal_record_hdr_t) <= db->volume_bytes) {
+        uint64_t span = 0;
+        uint64_t seq = 0;
+        if (read_valid_record(db, pos, &span, &seq)) {
+            if (seq > max_seq) max_seq = seq;
+            found = true;
+            pos += span;
+            continue;
+        }
+        pos += PICOWAL_SECTOR_SIZE;
+    }
+    if (max_seq_out) *max_seq_out = max_seq;
+    return found;
+}
+
 static bool scan_volume(picowal_db_t* db) {
     uint64_t off = PICOWAL_SECTOR_SIZE;
     uint64_t max_seq = 0;
     uint8_t payload[PICOWAL_DATA_MAX];
+    picowal_recovery_info_t info = db->recovery;
+    picowal_recovery_status_t initial_status = info.status;
+    memset(&info, 0, sizeof(info));
+    info.status = (initial_status == PICOWAL_RECOVERY_FRESH_FORMAT)
+        ? PICOWAL_RECOVERY_FRESH_FORMAT
+        : PICOWAL_RECOVERY_CLEAN;
+    info.volume_bytes = db->volume_bytes;
 
     while (off + sizeof(picowal_record_hdr_t) <= db->volume_bytes) {
         picowal_record_hdr_t h;
         if (pread_full(db->fd, &h, sizeof(h), off) != 0) return false;
         if (is_zeroed(&h, sizeof(h))) break;
-        if (h.magic != PICOWAL_REC_MAGIC) break;
-        if (h.len > PICOWAL_DATA_MAX) break;
-        if ((h.flags & ~PICOWAL_REC_TOMBSTONE) != 0) break;
+        if (h.magic != PICOWAL_REC_MAGIC ||
+            h.len > PICOWAL_DATA_MAX ||
+            (h.flags & ~PICOWAL_REC_TOMBSTONE) != 0) {
+            info.status = PICOWAL_RECOVERY_TAIL_TRUNCATED;
+            info.corrupt_records = 1;
+            break;
+        }
 
         uint64_t span = align_up_512(sizeof(h) + h.len);
-        if (off + span > db->volume_bytes) break;
+        if (off + span > db->volume_bytes) {
+            info.status = PICOWAL_RECOVERY_TAIL_TRUNCATED;
+            info.truncated_records = 1;
+            break;
+        }
 
         if (h.len > 0) {
             if (pread_full(db->fd, payload, h.len, off + sizeof(h)) != 0) return false;
         }
         uint64_t chk = rec_checksum(h.key, h.len, h.flags, h.seq, h.len ? payload : NULL);
-        if (chk != h.checksum) break;
+        if (chk != h.checksum) {
+            info.status = PICOWAL_RECOVERY_TAIL_TRUNCATED;
+            info.corrupt_records = 1;
+            break;
+        }
 
         if (index_upsert(db, h.key, off, h.len, h.seq, (h.flags & PICOWAL_REC_TOMBSTONE) != 0) != 0) {
             errno = ENOMEM;
             return false;
         }
+        info.records_scanned++;
+        info.records_recovered++;
         if (h.seq > max_seq) max_seq = h.seq;
         off += span;
     }
 
+    if (info.status == PICOWAL_RECOVERY_TAIL_TRUNCATED) {
+        uint64_t future_max_seq = max_seq;
+        if (has_valid_record_after(db, off, &future_max_seq)) {
+            info.status = PICOWAL_RECOVERY_CORRUPT;
+            info.truncated_bytes = db->volume_bytes - off;
+            info.write_offset = off;
+            db->recovery = info;
+            errno = EIO;
+            return false;
+        }
+    }
+
+    if (info.status == PICOWAL_RECOVERY_TAIL_TRUNCATED) {
+        info.truncated_bytes = db->volume_bytes - off;
+    }
+    info.write_offset = off;
     db->write_off = off;
     db->next_seq = max_seq + 1;
+    db->recovery = info;
     return true;
 }
 
@@ -370,6 +470,7 @@ picowal_db_t* picowal_db_create(void) {
     if (!db) return NULL;
     db->fd = -1;
     db->dir_fd = -1;
+    recovery_reset(db);
     pthread_mutex_init(&db->mu, NULL);
     return db;
 }
@@ -410,9 +511,31 @@ bool picowal_db_open(picowal_db_t* db, const char* device_path,
     }
     db->quiesced = false;
     clear_index(db);
+    recovery_reset(db);
 
     bool ok = load_or_format(db, device_path, volume_bytes, format);
     if (ok) ok = scan_volume(db);
+    if (ok) {
+        metal_log("picowal: recovery status=%s records_scanned=%llu records_recovered=%llu corrupt_records=%llu truncated_records=%llu truncated_bytes=%llu write_offset=%llu volume_bytes=%llu",
+                  picowal_recovery_status_name(db->recovery.status),
+                  (unsigned long long)db->recovery.records_scanned,
+                  (unsigned long long)db->recovery.records_recovered,
+                  (unsigned long long)db->recovery.corrupt_records,
+                  (unsigned long long)db->recovery.truncated_records,
+                  (unsigned long long)db->recovery.truncated_bytes,
+                  (unsigned long long)db->recovery.write_offset,
+                  (unsigned long long)db->recovery.volume_bytes);
+    } else if (db->recovery.status != PICOWAL_RECOVERY_UNKNOWN) {
+        metal_log("picowal: recovery failed status=%s records_scanned=%llu records_recovered=%llu corrupt_records=%llu truncated_records=%llu truncated_bytes=%llu write_offset=%llu volume_bytes=%llu",
+                  picowal_recovery_status_name(db->recovery.status),
+                  (unsigned long long)db->recovery.records_scanned,
+                  (unsigned long long)db->recovery.records_recovered,
+                  (unsigned long long)db->recovery.corrupt_records,
+                  (unsigned long long)db->recovery.truncated_records,
+                  (unsigned long long)db->recovery.truncated_bytes,
+                  (unsigned long long)db->recovery.write_offset,
+                  (unsigned long long)db->recovery.volume_bytes);
+    }
     if (!ok && db->fd >= 0) {
         close(db->fd);
         db->fd = -1;
@@ -441,6 +564,7 @@ void picowal_db_close(picowal_db_t* db) {
     db->write_off = PICOWAL_SECTOR_SIZE;
     db->next_seq = 1;
     db->volume_bytes = 0;
+    recovery_reset(db);
     pthread_mutex_unlock(&db->mu);
 }
 
@@ -455,6 +579,14 @@ bool picowal_db_healthy(picowal_db_t* db) {
     }
     pthread_mutex_unlock(&db->mu);
     return ok;
+}
+
+bool picowal_db_recovery_info(picowal_db_t* db, picowal_recovery_info_t* out) {
+    if (!db || !out) return false;
+    pthread_mutex_lock(&db->mu);
+    *out = db->recovery;
+    pthread_mutex_unlock(&db->mu);
+    return true;
 }
 
 bool picowal_db_quiesce(picowal_db_t* db) {

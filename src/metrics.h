@@ -195,6 +195,15 @@ void metrics_observe_picowal(metrics_wal_op_t op,
                              uint64_t storage_tsc,
                              bool ok);
 
+void metrics_set_picowal_recovery(uint64_t status_code,
+                                  uint64_t records_scanned,
+                                  uint64_t records_recovered,
+                                  uint64_t corrupt_records,
+                                  uint64_t truncated_records,
+                                  uint64_t truncated_bytes,
+                                  uint64_t write_offset,
+                                  uint64_t volume_bytes);
+
 char* metrics_render_text(size_t* out_len);
 
 /* Hot-path: record one request. Caller passes its per-worker metrics. */
