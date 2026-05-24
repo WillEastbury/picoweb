@@ -71,6 +71,7 @@ bool api_path_matches(const char* path, size_t path_len);
 /* True iff the API is enabled (root configured). */
 bool api_enabled(void);
 bool api_picowal_enabled(void);
+bool api_health_path_matches(const char* path, size_t path_len);
 
 /* Largest request body the API will accept. Useful for the dispatcher
  * to short-circuit oversize uploads before reading them. */

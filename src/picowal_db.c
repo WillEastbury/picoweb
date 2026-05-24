@@ -397,6 +397,19 @@ void picowal_db_close(picowal_db_t* db) {
     pthread_mutex_unlock(&db->mu);
 }
 
+bool picowal_db_healthy(picowal_db_t* db) {
+    if (!db) return false;
+    pthread_mutex_lock(&db->mu);
+    bool ok = false;
+    if (db->fd >= 0) {
+        struct stat st;
+        ok = (fstat(db->fd, &st) == 0) &&
+             (S_ISREG(st.st_mode) || S_ISBLK(st.st_mode));
+    }
+    pthread_mutex_unlock(&db->mu);
+    return ok;
+}
+
 int picowal_db_put_key(picowal_db_t* db, uint32_t key,
                        const void* data, uint32_t len, bool create_only) {
     if (!db || !data || len == 0 || len > PICOWAL_DATA_MAX) {

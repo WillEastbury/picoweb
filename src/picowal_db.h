@@ -21,6 +21,7 @@ void picowal_db_unpack_key(uint32_t key, uint16_t* card_out, uint32_t* record_ou
 bool picowal_db_open(picowal_db_t* db, const char* device_path,
                      uint64_t volume_bytes, bool format);
 void picowal_db_close(picowal_db_t* db);
+bool picowal_db_healthy(picowal_db_t* db);
 
 /* 0 on success; -1 on failure with errno set. */
 int picowal_db_put_key(picowal_db_t* db, uint32_t key,
