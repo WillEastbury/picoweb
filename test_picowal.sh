@@ -21,8 +21,13 @@ start_server() {
     sleep 0.4
 }
 
+stop_server() {
+    kill "$PID" 2>/dev/null || true
+    wait "$PID" 2>/dev/null || true
+}
+
 start_server --picowal-format
-trap 'kill "$PID" 2>/dev/null; rm -f "$VOL"; rm -rf "$WWW"' EXIT
+trap 'stop_server; rm -f "$VOL"; rm -rf "$WWW"' EXIT
 
 fail=0
 
@@ -187,15 +192,13 @@ assert_code 204 "DELETE existing" -X DELETE "http://127.0.0.1:$PORT/wal/12/345"
 assert_code 404 "GET deleted" "http://127.0.0.1:$PORT/wal/12/345"
 
 # Persistence check: restart without format and ensure previous key survives.
-kill "$PID" 2>/dev/null
-sleep 0.3
+stop_server
 start_server
 assert_code 200 "GET persists after restart" "http://127.0.0.1:$PORT/wal/12/999"
 
 # Auth gate check: when OIDC cookie auth is enabled, /wal routes require
 # both X-PW-Auth header and a valid short-lived session cookie.
-kill "$PID" 2>/dev/null
-sleep 0.3
+stop_server
 start_server --oidc-cookie-auth --oidc-google-client-id=test-google --oidc-entra-client-id=test-entra
 assert_code 403 "auth gate missing header" "http://127.0.0.1:$PORT/wal/12/999"
 assert_code 401 "auth gate missing cookie" -H 'X-PW-Auth: 1' \
