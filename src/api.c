@@ -41,6 +41,7 @@ static size_t g_picowal_prefix_len = 0;
 #define SCORE_CARD_ID             42u
 #define SCORE_TOKEN_TTL_SEC       900
 #define SCORE_NONCES_MAX          4096
+#define SCORE_KEYS_MAX            4
 #define SCORE_RATE_BUCKETS        256
 #define SCORE_RATE_CAPACITY       12
 #define SCORE_RATE_REFILL_PER_SEC 0.2
@@ -60,7 +61,8 @@ typedef struct {
 } score_rate_bucket_t;
 
 static pthread_mutex_t g_score_mu = PTHREAD_MUTEX_INITIALIZER;
-static uint8_t g_score_secret[32];
+static uint8_t g_score_keys[SCORE_KEYS_MAX][32];
+static size_t g_score_key_count = 0;
 static bool g_score_secret_ready = false;
 static score_nonce_t g_score_nonces[SCORE_NONCES_MAX];
 static score_rate_bucket_t g_score_rate[SCORE_RATE_BUCKETS];
@@ -376,7 +378,36 @@ static bool score_secret_ready(void) {
     if (g_score_secret_ready) return true;
     pthread_mutex_lock(&g_score_mu);
     if (!g_score_secret_ready) {
-        g_score_secret_ready = fill_random(g_score_secret, sizeof(g_score_secret));
+        const char* env = getenv("PICOWEB_SCORE_TOKEN_KEYS_HEX");
+        bool configured = env && env[0];
+        if (configured) {
+            char buf[512];
+            snprintf(buf, sizeof(buf), "%s", env);
+            char* save = NULL;
+            for (char* part = strtok_r(buf, ",", &save);
+                 part && g_score_key_count < SCORE_KEYS_MAX;
+                 part = strtok_r(NULL, ",", &save)) {
+                while (*part == ' ' || *part == '\t') part++;
+                size_t len = strlen(part);
+                while (len > 0 && (part[len - 1] == ' ' || part[len - 1] == '\t' ||
+                                   part[len - 1] == '\r' || part[len - 1] == '\n')) {
+                    part[--len] = '\0';
+                }
+                if (!hex_decode(part, len, g_score_keys[g_score_key_count], 32)) {
+                    g_score_key_count = 0;
+                    break;
+                }
+                g_score_key_count++;
+            }
+        }
+        if (g_score_key_count == 0 && configured) {
+            g_score_secret_ready = false;
+        } else if (g_score_key_count == 0) {
+            g_score_secret_ready = fill_random(g_score_keys[0], sizeof(g_score_keys[0]));
+            if (g_score_secret_ready) g_score_key_count = 1;
+        } else {
+            g_score_secret_ready = true;
+        }
     }
     bool ok = g_score_secret_ready;
     pthread_mutex_unlock(&g_score_mu);
@@ -1714,7 +1745,7 @@ static bool score_issue_token(char out[128], int64_t now_sec) {
     int mn = snprintf(msg, sizeof(msg), "%s.%lld", nonce_hex, (long long)exp);
     if (mn <= 0 || (size_t)mn >= sizeof(msg)) return false;
     uint8_t tag[HMAC_SHA256_TAG_LEN];
-    hmac_sha256(g_score_secret, sizeof(g_score_secret), msg, (size_t)mn, tag);
+    hmac_sha256(g_score_keys[0], sizeof(g_score_keys[0]), msg, (size_t)mn, tag);
     char tag_hex[HMAC_SHA256_TAG_LEN * 2 + 1];
     hex_encode(tag, sizeof(tag), tag_hex);
     int tn = snprintf(out, 128, "%s.%lld.%s", nonce_hex, (long long)exp, tag_hex);
@@ -1761,9 +1792,13 @@ static bool score_consume_token(const char* token, size_t token_len, int64_t now
     char msg[64];
     int mn = snprintf(msg, sizeof(msg), "%s.%lld", nonce_hex, exp_ll);
     if (mn <= 0 || (size_t)mn >= sizeof(msg)) return false;
+    bool valid_tag = false;
     uint8_t expected[HMAC_SHA256_TAG_LEN];
-    hmac_sha256(g_score_secret, sizeof(g_score_secret), msg, (size_t)mn, expected);
-    if (!constant_time_eq(tag, expected, sizeof(tag))) return false;
+    for (size_t i = 0; i < g_score_key_count; i++) {
+        hmac_sha256(g_score_keys[i], sizeof(g_score_keys[i]), msg, (size_t)mn, expected);
+        valid_tag = valid_tag || constant_time_eq(tag, expected, sizeof(tag));
+    }
+    if (!valid_tag) return false;
 
     bool ok = false;
     pthread_mutex_lock(&g_score_mu);
@@ -1814,6 +1849,7 @@ static void dispatch_scores(http_method_t method,
                             const api_request_context_t* req_ctx,
                             api_resp_t* resp) {
     if (!g_picowal_enabled || !g_picowal) {
+        metrics_score_reject(METRICS_SCORE_REJECT_UNAVAILABLE);
         resp_status_only(resp, 404, "Not Found");
         return;
     }
@@ -1823,20 +1859,29 @@ static void dispatch_scores(http_method_t method,
     bool is_start = path_len == prefix_len + 12 &&
                     memcmp(path + prefix_len, "scores/start", 12) == 0;
     if (!score_rate_allow(req_ctx, is_start ? "start" : "scores", now)) {
+        metrics_score_reject(METRICS_SCORE_REJECT_RATE_LIMITED);
         resp_text_error(resp, 429, "Too Many Requests", "rate limit exceeded\n");
         return;
     }
     if (is_start) {
         if (method != M_POST) {
+            metrics_score_reject(METRICS_SCORE_REJECT_METHOD);
             resp_status_only(resp, 405, "Method Not Allowed");
             return;
         }
+        if (body_len != 0) {
+            metrics_score_reject(METRICS_SCORE_REJECT_INVALID_BODY);
+            resp_text_error(resp, 400, "Bad Request", "request body not allowed\n");
+            return;
+        }
         if (server_shutdown_requested()) {
+            metrics_score_reject(METRICS_SCORE_REJECT_DRAINING);
             resp_text_error(resp, 503, "Service Unavailable", "server draining\n");
             return;
         }
         char token[128];
         if (!score_issue_token(token, now)) {
+            metrics_score_reject(METRICS_SCORE_REJECT_TOKEN_ISSUE_FAILED);
             resp_text_error(resp, 500, "Internal Server Error", "token issue failed\n");
             return;
         }
@@ -1852,6 +1897,11 @@ static void dispatch_scores(http_method_t method,
     }
 
     if (method == M_GET || method == M_HEAD) {
+        if (body_len != 0) {
+            metrics_score_reject(METRICS_SCORE_REJECT_INVALID_BODY);
+            resp_text_error(resp, 400, "Bad Request", "request body not allowed\n");
+            return;
+        }
         uint32_t records[2048];
         uint32_t nrec = picowal_api_list(g_picowal, SCORE_CARD_ID, records,
                                          (uint32_t)(sizeof(records) / sizeof(records[0])));
@@ -1907,14 +1957,17 @@ scores_oom:
 
     if (method == M_POST) {
         if (server_shutdown_requested()) {
+            metrics_score_reject(METRICS_SCORE_REJECT_DRAINING);
             resp_text_error(resp, 503, "Service Unavailable", "server draining\n");
             return;
         }
         if (body_len == 0 || body_len > 512) {
+            metrics_score_reject(METRICS_SCORE_REJECT_INVALID_BODY);
             resp_status_only(resp, 413, "Payload Too Large");
             return;
         }
         if (!score_consume_token(score_token, score_token_len, now)) {
+            metrics_score_reject(METRICS_SCORE_REJECT_INVALID_TOKEN);
             resp_text_error(resp, 401, "Unauthorized", "invalid score token\n");
             return;
         }
@@ -1926,6 +1979,7 @@ scores_oom:
         if (!json_extract_string_field(tmp, "name", name_raw, sizeof(name_raw)) ||
             !json_extract_u32_field(tmp, "score", 1000000000u, &score) ||
             score == 0) {
+            metrics_score_reject(METRICS_SCORE_REJECT_INVALID_BODY);
             resp_text_error(resp, 400, "Bad Request", "invalid score\n");
             return;
         }
@@ -1938,6 +1992,7 @@ scores_oom:
                           "{\"name\":\"%s\",\"score\":%u,\"ts\":\"%s\",\"day\":\"%s\"}\n",
                           name, score, ts, day);
         if (dn <= 0 || (size_t)dn >= sizeof(doc)) {
+            metrics_score_reject(METRICS_SCORE_REJECT_INVALID_BODY);
             resp_text_error(resp, 400, "Bad Request", "invalid score\n");
             return;
         }
@@ -1946,9 +2001,11 @@ scores_oom:
                                                              doc, (uint32_t)dn, &rec);
         if (st != PICOWAL_API_OK) {
             if (st == PICOWAL_API_BUSY) {
+                metrics_score_reject(METRICS_SCORE_REJECT_UNAVAILABLE);
                 resp_text_error(resp, 503, "Service Unavailable", "storage quiesced\n");
                 return;
             }
+            metrics_score_reject(METRICS_SCORE_REJECT_WRITE_FAILED);
             resp_text_error(resp, 500, "Internal Server Error", "score write failed\n");
             return;
         }
@@ -1956,6 +2013,7 @@ scores_oom:
         return;
     }
 
+    metrics_score_reject(METRICS_SCORE_REJECT_METHOD);
     resp_status_only(resp, 405, "Method Not Allowed");
 }
 

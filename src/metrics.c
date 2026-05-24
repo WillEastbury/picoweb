@@ -64,6 +64,7 @@ typedef struct {
 static metrics_route_counter_t g_route_counters[METRICS_ROUTE_COUNT];
 static metrics_wal_counter_t g_wal_counters[METRICS_WAL_COUNT];
 static metrics_wal_recovery_t g_wal_recovery;
+static uint64_t g_score_rejects[METRICS_SCORE_REJECT_COUNT];
 static bool g_access_log_enabled = false;
 
 /* ===========================================================
@@ -537,6 +538,11 @@ void metrics_observe_picowal(metrics_wal_op_t op,
     __atomic_add_fetch(&c->storage_us_sum, ticks_to_us(storage_tsc), __ATOMIC_RELAXED);
 }
 
+void metrics_score_reject(metrics_score_reject_t reason) {
+    if ((unsigned)reason >= METRICS_SCORE_REJECT_COUNT) return;
+    __atomic_add_fetch(&g_score_rejects[reason], 1, __ATOMIC_RELAXED);
+}
+
 void metrics_set_picowal_recovery(uint64_t status_code,
                                   uint64_t records_scanned,
                                   uint64_t records_recovered,
@@ -562,6 +568,20 @@ static const char* wal_op_name(metrics_wal_op_t op) {
     case METRICS_WAL_DELETE: return "delete";
     case METRICS_WAL_LIST:   return "list";
     default:                 return "unknown";
+    }
+}
+
+static const char* score_reject_name(metrics_score_reject_t reason) {
+    switch (reason) {
+    case METRICS_SCORE_REJECT_RATE_LIMITED:        return "rate_limited";
+    case METRICS_SCORE_REJECT_INVALID_TOKEN:       return "invalid_token";
+    case METRICS_SCORE_REJECT_INVALID_BODY:        return "invalid_body";
+    case METRICS_SCORE_REJECT_METHOD:              return "method";
+    case METRICS_SCORE_REJECT_UNAVAILABLE:         return "unavailable";
+    case METRICS_SCORE_REJECT_DRAINING:            return "draining";
+    case METRICS_SCORE_REJECT_WRITE_FAILED:        return "write_failed";
+    case METRICS_SCORE_REJECT_TOKEN_ISSUE_FAILED:  return "token_issue_failed";
+    default:                                       return "unknown";
     }
 }
 
@@ -659,6 +679,12 @@ char* metrics_render_text(size_t* out_len) {
             (unsigned long long)__atomic_load_n(&g_wal_recovery.write_offset, __ATOMIC_RELAXED));
     appendf(&p, &rem, "picowal_recovery_volume_bytes %llu\n",
             (unsigned long long)__atomic_load_n(&g_wal_recovery.volume_bytes, __ATOMIC_RELAXED));
+    appendf(&p, &rem, "# TYPE picoweb_score_rejects_total counter\n");
+    for (int i = 0; i < METRICS_SCORE_REJECT_COUNT; i++) {
+        appendf(&p, &rem, "picoweb_score_rejects_total{reason=\"%s\"} %llu\n",
+                score_reject_name((metrics_score_reject_t)i),
+                (unsigned long long)__atomic_load_n(&g_score_rejects[i], __ATOMIC_RELAXED));
+    }
     if (out_len) *out_len = (size_t)(p - buf);
     return buf;
 }
