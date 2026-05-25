@@ -14,6 +14,7 @@
 #include "tls_certs.h"
 #include "util.h"
 #include "api.h"
+#include "proxy.h"
 
 static void usage(const char* argv0) {
     fprintf(stderr,
@@ -40,6 +41,9 @@ static void usage(const char* argv0) {
         "  --api-prefix=PFX path prefix for the API (default /api/, must end with /)\n"
         "  --http-early-hints  enable HTTP/1.1 103 Early Hints with auto-derived\n"
         "                      Link: rel=preload headers (off by default)\n"
+        "  --proxy=SPEC run TCP/UDP proxy mode instead of HTTP serving. Repeatable.\n"
+        "               Example: --proxy=tcp/0.0.0.0:443=127.0.0.1:444\n"
+        "               Use --proxy-help for proxy-specific syntax.\n"
         "  --sqpoll     enable IORING_SETUP_SQPOLL: kernel polls our SQ,\n"
         "               eliminating io_uring_enter() syscalls on the submit\n"
         "               path. Costs one kernel thread per worker. Requires\n"
@@ -61,6 +65,14 @@ static void usage(const char* argv0) {
 }
 
 int main(int argc, char** argv) {
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--proxy") == 0 ||
+            strncmp(argv[i], "--proxy=", 8) == 0 ||
+            strcmp(argv[i], "--proxy-help") == 0) {
+            return proxy_main(argc, argv);
+        }
+    }
+
     int port = 8080;
     const char* wwwroot = "wwwroot";
     long workers = sysconf(_SC_NPROCESSORS_ONLN);
