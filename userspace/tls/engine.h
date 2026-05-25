@@ -23,13 +23,14 @@
  * pipeline (NIC RX -> TCP -> TLS -> HTTP -> TLS -> TCP -> NIC TX) wants
  * because every layer becomes a bytes-in/bytes-out box.
  *
- * SPIKE NOTE: real handshake completion needs Ed25519 (gating item).
- * To prove the engine state machine works *for application data*,
- * `pw_tls_engine_install_app_keys()` lets a caller (typically a test)
- * inject pre-derived application traffic secrets directly. Once the
- * real handshake lands, the engine walks itself from HANDSHAKE -> APP
- * after exchanging Finished messages, and `install_app_keys` becomes
- * a test-only shortcut.
+ * SPIKE NOTE (historical): an earlier revision marked Ed25519 as a
+ * gating item for real handshake completion. Ed25519 is now wired
+ * end-to-end (handshake.c builds CertificateVerify with ed25519_sign,
+ * engine.c plumbs the seed through configure_server, cert.c extracts
+ * the seed from PKCS#8 v1 / RFC 8410). The state machine reaches
+ * PW_TLS_ST_APP via a real handshake; `pw_tls_engine_install_app_keys`
+ * remains as a test-only shortcut for exercising APP-state paths
+ * without a handshake.
  */
 
 #ifndef PICOWEB_USERSPACE_TLS_ENGINE_H

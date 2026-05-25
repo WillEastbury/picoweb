@@ -24,7 +24,7 @@
 
 #include <string.h>
 
-#include "cpuid.h"
+#include "pw_cpuid.h"
 
 /* FIPS 180-4 §4.2.2 — first 32 bits of the fractional parts of the
  * cube roots of the first 64 primes (2..311). */
