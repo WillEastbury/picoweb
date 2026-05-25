@@ -127,6 +127,15 @@ const resource_t* jumptable_lookup(const jumptable_t* jt,
                                    const char* host, size_t host_len,
                                    const char* path, size_t path_len);
 
+/* Walk the entire table and read at least one byte from every response
+ * head, body, compressed/brotli variant and chrome buffer. Forces the
+ * kernel to fault every page that the static-serving hot path will
+ * eventually touch — so the first request after boot does not pay for
+ * a single minor page fault, and RSS at startup matches RSS under
+ * load. Cheap (microseconds) and runs once on the main thread after
+ * jumptable_build returns. */
+void jumptable_prewarm(const jumptable_t* jt);
+
 /* Check if a hostname is in the known-host set (case-sensitive,
  * host should already be lowercased by the parser). */
 bool jumptable_host_exists(const jumptable_t* jt,
