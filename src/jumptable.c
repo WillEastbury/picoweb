@@ -1199,3 +1199,66 @@ bool jumptable_host_exists(const jumptable_t* jt,
     }
     return false;
 }
+
+/* Touch every page of a buffer so the kernel faults it in. Reads only,
+ * accumulating into a volatile sink to keep the optimiser honest. */
+static volatile uint64_t g_prewarm_sink;
+__attribute__((cold))
+static void prewarm_touch(const void* p, size_t len) {
+    if (!p || len == 0) return;
+    const unsigned char* b = (const unsigned char*)p;
+    uint64_t acc = g_prewarm_sink;
+    /* Step by 4 KiB (smallest page size we'll see). Touching one byte
+     * per page is enough to force a fault. */
+    for (size_t i = 0; i < len; i += 4096) acc ^= b[i];
+    acc ^= b[len - 1];
+    g_prewarm_sink = acc;
+}
+
+__attribute__((cold))
+static void prewarm_resource(const resource_t* r) {
+    if (!r) return;
+    prewarm_touch(r->head, r->head_len);
+    prewarm_touch(r->body, r->body_len);
+    if (r->compressed) {
+        prewarm_touch(r->compressed->head, r->compressed->head_len);
+        prewarm_touch(r->compressed->body, r->compressed->body_len);
+    }
+    if (r->brotli) {
+        prewarm_touch(r->brotli->head, r->brotli->head_len);
+        prewarm_touch(r->brotli->body, r->brotli->body_len);
+    }
+    if (r->chrome) {
+        prewarm_touch(r->chrome->hdr, r->chrome->hdr_len);
+        prewarm_touch(r->chrome->ftr, r->chrome->ftr_len);
+    }
+    prewarm_touch(r->wire_304, r->wire_304_len);
+    prewarm_touch(r->link_hdr, r->link_hdr_len);
+    /* etag is inline in the struct; the slot read below covers it. */
+}
+
+__attribute__((cold))
+void jumptable_prewarm(const jumptable_t* jt) {
+    if (!jt) return;
+    /* Walk every flat-table slot — touches the slot array itself (one
+     * cache line per slot) and every reachable response. */
+    uint64_t acc = g_prewarm_sink;
+    size_t walked = 0;
+    for (size_t i = 0; i < jt->cap; i++) {
+        const flat_slot_t* s = &jt->slots[i];
+        acc ^= s->hash ^ s->lens;        /* fault the slot cache line */
+        if (!s->value) continue;
+        prewarm_resource(s->value);
+        walked++;
+    }
+    g_prewarm_sink = acc;
+    prewarm_resource(jt->err_400);
+    prewarm_resource(jt->err_404);
+    prewarm_resource(jt->err_405);
+    prewarm_resource(jt->err_409);
+    prewarm_resource(jt->err_413);
+    prewarm_resource(jt->err_414);
+    prewarm_resource(jt->err_505);
+    metal_log("jumptable: prewarmed %zu resources across %zu slots",
+              walked, jt->cap);
+}
