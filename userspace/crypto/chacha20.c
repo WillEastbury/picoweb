@@ -25,7 +25,7 @@
 
 #include <string.h>
 
-#include "cpuid.h"
+#include "pw_cpuid.h"
 
 static inline uint32_t rotl32(uint32_t x, unsigned n) {
     return (x << n) | (x >> (32u - n));

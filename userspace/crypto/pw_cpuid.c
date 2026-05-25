@@ -2,7 +2,7 @@
  * Runtime CPU feature detection — implementation.
  */
 
-#include "cpuid.h"
+#include "pw_cpuid.h"
 
 #include <string.h>
 
