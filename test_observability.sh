@@ -69,5 +69,10 @@ grep -Eq 'picowal_lock_wait_us_sum\{op="write"\} [0-9]+' "$BODY"
 grep -q '"event":"access"' "$LOG"
 grep -q '"route":"scores"' "$LOG"
 grep -q '"status":201' "$LOG"
+grep -q '"client_ip":"redacted"' "$LOG"
+if grep -q '"client_ip":"127.0.0.1"' "$LOG"; then
+    echo "observability leaked raw client IP" >&2
+    exit 1
+fi
 
 echo "observability ok"
