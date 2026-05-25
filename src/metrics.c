@@ -66,6 +66,12 @@ static metrics_wal_counter_t g_wal_counters[METRICS_WAL_COUNT];
 static metrics_wal_recovery_t g_wal_recovery;
 static uint64_t g_score_rejects[METRICS_SCORE_REJECT_COUNT];
 static bool g_access_log_enabled = false;
+typedef enum {
+    ACCESS_LOG_IP_REDACTED = 0,
+    ACCESS_LOG_IP_FULL,
+    ACCESS_LOG_IP_NONE,
+} access_log_ip_mode_t;
+static access_log_ip_mode_t g_access_log_ip_mode = ACCESS_LOG_IP_REDACTED;
 
 /* ===========================================================
  * /stats writable response buffer
@@ -256,6 +262,18 @@ void metrics_init(int n_workers) {
         (strcmp(access_log, "1") == 0 ||
          strcmp(access_log, "true") == 0 ||
          strcmp(access_log, "yes") == 0);
+    const char* access_log_ip = getenv("PICOWEB_ACCESS_LOG_IP");
+    if (access_log_ip) {
+        if (strcmp(access_log_ip, "full") == 0) {
+            g_access_log_ip_mode = ACCESS_LOG_IP_FULL;
+        } else if (strcmp(access_log_ip, "none") == 0 ||
+                   strcmp(access_log_ip, "0") == 0 ||
+                   strcmp(access_log_ip, "off") == 0) {
+            g_access_log_ip_mode = ACCESS_LOG_IP_NONE;
+        } else {
+            g_access_log_ip_mode = ACCESS_LOG_IP_REDACTED;
+        }
+    }
 
     /* Allocate the writable /stats body buffer (single page is plenty). */
     void* sp = mmap(NULL, 4096, PROT_READ | PROT_WRITE,
@@ -510,7 +528,12 @@ void metrics_observe_request(metrics_route_t route,
     if (!g_access_log_enabled) return;
     char line[512];
     int64_t now_ms = metal_now_ms();
-    const char* ip = (client_ip && client_ip[0]) ? client_ip : "-";
+    const char* ip = "redacted";
+    if (g_access_log_ip_mode == ACCESS_LOG_IP_FULL) {
+        ip = (client_ip && client_ip[0]) ? client_ip : "-";
+    } else if (g_access_log_ip_mode == ACCESS_LOG_IP_NONE) {
+        ip = "-";
+    }
     int n = snprintf(line, sizeof(line),
         "{\"event\":\"access\",\"ts_ms\":%lld,\"method\":\"%s\","
         "\"route\":\"%s\",\"status\":%d,\"latency_us\":%llu,"
