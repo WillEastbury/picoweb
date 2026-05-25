@@ -139,6 +139,8 @@ Produces a single statically-linked-against-libc binary called `picoweb`.
 ./picoweb 8080 wwwroot 4                 # port, root, worker count
 ./picoweb 8080 wwwroot 4 100             # ...with max requests per keep-alive conn
 ./picoweb 8080 wwwroot 4 100 16384       # ...with MSG_ZEROCOPY for sends >= 16KB
+./picoweb --proxy=tcp/0.0.0.0:443=127.0.0.1:444
+./picoweb --proxy=udp/0.0.0.0:3478=127.0.0.1:3478
 ./picoweb --help
 ```
 
@@ -174,6 +176,32 @@ sudo setcap 'cap_net_bind_service=+ep' ./picoweb
 ```
 
 `SIGINT` / `SIGTERM` cleanly stops all workers.
+
+### Proxy mode
+
+`--proxy` runs Picoweb as a small TCP/UDP forwarding proxy instead of the
+static HTTP server. This is intended for Swarmhost-style deployments where the
+proxy is the only exposed endpoint and apps listen privately.
+
+```sh
+./picoweb \
+  --proxy=tcp/203.0.113.10:443=127.0.0.1:444 \
+  --proxy=udp/203.0.113.10:3478=127.0.0.1:3478 \
+  --udp-idle-timeout=30s
+```
+
+Spec format:
+
+```text
+tcp/LISTEN_HOST:LISTEN_PORT=TARGET_HOST:TARGET_PORT
+udp/LISTEN_HOST:LISTEN_PORT=TARGET_HOST:TARGET_PORT
+```
+
+IPv6 addresses use brackets, for example `tcp/[::]:443=[::1]:444`. TCP
+forwarding uses nonblocking connect, bidirectional backpressure, and half-close
+propagation. UDP forwarding keeps a temporary client flow so replies from the
+private target return to the original client; flows expire after
+`--udp-idle-timeout`.
 
 ---
 
