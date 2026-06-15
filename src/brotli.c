@@ -394,7 +394,7 @@ static void write_prefix(bitw_t* w, const uint32_t* freq, uint8_t* lens,
     if (nu <= 4) {
         write_simple_code(w, lens, nsym, alpha_bits);
         /* Fix up codes to match the simple code's implicit structure */
-        int used[4], n = 0;
+        int used[4] = {0, 0, 0, 0}, n = 0;
         for (int i = 0; i < nsym && n < 4; i++)
             if (freq[i]) used[n++] = i;
         /* Sort ascending (write_simple_code also sorts, so this matches) */
@@ -417,7 +417,7 @@ static void write_prefix(bitw_t* w, const uint32_t* freq, uint8_t* lens,
             lens[used[0]] = 1; codes[used[0]] = (hcode_t){0, 1};
             lens[used[1]] = 2; codes[used[1]] = (hcode_t){2, 2};
             lens[used[2]] = 2; codes[used[2]] = (hcode_t){3, 2};
-        } else {
+        } else if (n == 4) {
             /* n == 4 */
             bool tree_sel = (lens[used[0]] == 1);
             if (tree_sel) {
