@@ -2,14 +2,14 @@
 #define METAL_BROTLI_H
 
 /*
- * micro-brotli: minimal RFC 7932 encoder for picoweb.
+ * micro-brotli: minimal RFC 7932 encoder + decoder for picoweb.
  *
  * Produces valid Brotli streams decodable by any browser.
  * Uses LZ77 + Huffman coding in a single meta-block.
  * Falls back to uncompressed meta-blocks when LZ77 doesn't help.
  *
- * Encoder only — browsers provide the decoder.
- * Zero external dependencies.
+ * Encoder plus a small decoder for the subset emitted by this encoder
+ * (and uncompressed meta-blocks). Zero external dependencies.
  */
 
 #include <stddef.h>
@@ -19,6 +19,11 @@
 /* Encode `input` into a valid Brotli stream in `output`.
  * Returns bytes written, or -1 on error. */
 int brotli_encode(const uint8_t* input, size_t input_len,
+                  uint8_t* output, size_t output_cap);
+
+/* Decode streams produced by brotli_encode().
+ * Returns bytes written, or -1 on unsupported/corrupt input or too-small output. */
+int brotli_decode(const uint8_t* input, size_t input_len,
                   uint8_t* output, size_t output_cap);
 
 /* Worst-case output size. */

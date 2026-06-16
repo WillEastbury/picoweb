@@ -1,11 +1,12 @@
 /*
- * micro-brotli: minimal RFC 7932 (Brotli) encoder for picoweb.
+ * micro-brotli: minimal RFC 7932 (Brotli) encoder + decoder for picoweb.
  *
  * Produces valid Brotli streams using LZ77 + canonical Huffman coding.
  * Single meta-block, no static dictionary, no context modeling.
  * Falls back to uncompressed meta-blocks for incompressible data.
  *
- * Only runs at startup (never on the hot path).
+ * The decoder reads the subset this encoder emits (plus uncompressed
+ * meta-blocks). The encoder only runs at startup (never on the hot path).
  */
 
 #include "brotli.h"
@@ -877,4 +878,311 @@ bool brotli_accepted(const char* ae, size_t len) {
         }
     }
     return false;
+}
+
+/* ================================================================
+ * Decoder for micro-brotli streams
+ * ================================================================ */
+
+typedef struct {
+    const uint8_t* p;
+    size_t len;
+    size_t bit;
+} bitr_t;
+
+typedef struct {
+    uint8_t len[704];
+    uint16_t code[704];
+    int nsym;
+    int single_symbol;
+} hdec_t;
+
+static int br_read(bitr_t* r, int n, uint32_t* out) {
+    uint32_t v = 0;
+    if (n < 0 || n > 24 || r->bit + (size_t)n > r->len * 8) return -1;
+    for (int i = 0; i < n; i++) {
+        size_t bi = r->bit++;
+        v |= (uint32_t)(((r->p[bi >> 3] >> (bi & 7)) & 1U) << i);
+    }
+    *out = v;
+    return 0;
+}
+
+static void br_align_byte(bitr_t* r) {
+    r->bit = (r->bit + 7u) & ~(size_t)7u;
+}
+
+static uint16_t bit_reverse(uint16_t v, int n) {
+    uint16_t r = 0;
+    for (int i = 0; i < n; i++) {
+        r = (uint16_t)((r << 1) | (v & 1U));
+        v >>= 1;
+    }
+    return r;
+}
+
+static int hdec_build(hdec_t* h, const uint8_t* lens, int nsym) {
+    int bl_count[16];
+    uint16_t next[16];
+    memset(h, 0, sizeof(*h));
+    h->single_symbol = -1;
+    memset(bl_count, 0, sizeof(bl_count));
+    h->nsym = nsym;
+    for (int i = 0; i < nsym; i++) {
+        if (lens[i] > 15) return -1;
+        h->len[i] = lens[i];
+        if (lens[i]) bl_count[lens[i]]++;
+    }
+    uint16_t c = 0;
+    next[0] = 0;
+    for (int b = 1; b <= 15; b++) {
+        c = (uint16_t)((c + bl_count[b - 1]) << 1);
+        next[b] = c;
+    }
+    for (int i = 0; i < nsym; i++) {
+        if (h->len[i]) {
+            uint16_t canon = next[h->len[i]]++;
+            h->code[i] = bit_reverse(canon, h->len[i]);
+        }
+    }
+    return 0;
+}
+
+static int hdec_symbol(bitr_t* r, const hdec_t* h) {
+    uint32_t bit;
+    uint16_t code = 0;
+    if (h->single_symbol >= 0)
+        return h->single_symbol;
+    for (int len = 1; len <= 15; len++) {
+        if (br_read(r, 1, &bit) != 0) return -1;
+        code |= (uint16_t)(bit << (len - 1));
+        for (int s = 0; s < h->nsym; s++) {
+            if (h->len[s] == len && h->code[s] == code)
+                return s;
+        }
+    }
+    return -1;
+}
+
+static int read_clcl_symbol(bitr_t* r) {
+    uint32_t bit;
+    uint16_t code = 0;
+    for (int len = 1; len <= 4; len++) {
+        if (br_read(r, 1, &bit) != 0) return -1;
+        code |= (uint16_t)(bit << (len - 1));
+        for (int v = 0; v <= 5; v++) {
+            if (kCLCL_len[v] == len && kCLCL_val[v] == code)
+                return v;
+        }
+    }
+    return -1;
+}
+
+static int read_prefix_code(bitr_t* r, hdec_t* h, int nsym, int alpha_bits) {
+    uint32_t hskip;
+    uint8_t lens[704];
+    memset(lens, 0, sizeof(lens));
+    if (nsym > (int)sizeof(lens)) return -1;
+    if (br_read(r, 2, &hskip) != 0) return -1;
+
+    if (hskip == 1) {
+        uint32_t nsym_m1;
+        if (br_read(r, 2, &nsym_m1) != 0) return -1;
+        int n = (int)nsym_m1 + 1;
+        int used[4] = {0, 0, 0, 0};
+        for (int i = 0; i < n; i++) {
+            uint32_t sym;
+            if (br_read(r, alpha_bits, &sym) != 0 || sym >= (uint32_t)nsym) return -1;
+            used[i] = (int)sym;
+        }
+        if (n == 1) {
+            if (hdec_build(h, lens, nsym) != 0) return -1;
+            h->single_symbol = used[0];
+            return 0;
+        } else if (n == 2) {
+            lens[used[0]] = 1; lens[used[1]] = 1;
+        } else if (n == 3) {
+            lens[used[0]] = 1; lens[used[1]] = 2; lens[used[2]] = 2;
+        } else {
+            uint32_t tree_sel;
+            if (br_read(r, 1, &tree_sel) != 0) return -1;
+            if (tree_sel) {
+                lens[used[0]] = 1; lens[used[1]] = 2; lens[used[2]] = 3; lens[used[3]] = 3;
+            } else {
+                lens[used[0]] = 2; lens[used[1]] = 2; lens[used[2]] = 2; lens[used[3]] = 2;
+            }
+        }
+        return hdec_build(h, lens, nsym);
+    }
+
+    if (hskip > 3) return -1;
+    uint8_t cl_lens[18];
+    memset(cl_lens, 0, sizeof(cl_lens));
+    int space = 0;
+    for (int i = (int)hskip; i < 18; i++) {
+        int v = read_clcl_symbol(r);
+        if (v < 0) return -1;
+        cl_lens[kCLOrder[i]] = (uint8_t)v;
+        if (v) space += 1 << (5 - v);
+        if (i + 1 >= 4 && space == 32) break;
+        if (space > 32) return -1;
+    }
+
+    hdec_t clh;
+    if (hdec_build(&clh, cl_lens, 18) != 0) return -1;
+
+    int pos = 0;
+    int code_space = 0;
+    while (pos < nsym && code_space < (1 << 15)) {
+        int sym = hdec_symbol(r, &clh);
+        if (sym < 0) return -1;
+        if (sym == 17) {
+            uint32_t extra;
+            if (br_read(r, 3, &extra) != 0) return -1;
+            int run = 3 + (int)extra;
+            if (pos + run > nsym) return -1;
+            pos += run;
+        } else if (sym >= 0 && sym <= 15) {
+            lens[pos++] = (uint8_t)sym;
+            if (sym) {
+                code_space += 1 << (15 - sym);
+                if (code_space > (1 << 15)) return -1;
+            }
+        } else {
+            return -1;
+        }
+    }
+    if (code_space != (1 << 15)) return -1;
+    return hdec_build(h, lens, nsym);
+}
+
+static int decode_ic_symbol(int sym, int* ic, int* cc, bool* explicit_dist) {
+    int base;
+    *explicit_dist = true;
+    if (sym < 0 || sym >= 704) return -1;
+    if (sym < 64) {
+        *explicit_dist = false; base = sym; *ic = base >> 3; *cc = base & 7; return 0;
+    }
+    if (sym < 128) {
+        *explicit_dist = false; base = sym - 64; *ic = base >> 3; *cc = 8 + (base & 7); return 0;
+    }
+    if (sym < 192) { base = sym - 128; *ic = base >> 3; *cc = base & 7; return 0; }
+    if (sym < 256) { base = sym - 192; *ic = base >> 3; *cc = 8 + (base & 7); return 0; }
+    if (sym < 320) { base = sym - 256; *ic = 8 + (base >> 3); *cc = base & 7; return 0; }
+    if (sym < 384) { base = sym - 320; *ic = 8 + (base >> 3); *cc = 8 + (base & 7); return 0; }
+    if (sym < 448) { base = sym - 384; *ic = base >> 3; *cc = 16 + (base & 7); return 0; }
+    if (sym < 512) { base = sym - 448; *ic = 16 + (base >> 3); *cc = base & 7; return 0; }
+    if (sym < 576) { base = sym - 512; *ic = 8 + (base >> 3); *cc = 16 + (base & 7); return 0; }
+    if (sym < 640) { base = sym - 576; *ic = 16 + (base >> 3); *cc = 8 + (base & 7); return 0; }
+    base = sym - 640; *ic = 16 + (base >> 3); *cc = 16 + (base & 7); return 0;
+}
+
+static int decode_distance(bitr_t* r, int dc, uint32_t* dist) {
+    if (dc < 16 || dc >= 64) return -1;
+    int hcode = dc - 16;
+    int nb = 1 + (hcode >> 1);
+    uint32_t extra;
+    uint32_t off = ((uint32_t)(2 + (hcode & 1)) << nb) - 4;
+    if (br_read(r, nb, &extra) != 0) return -1;
+    *dist = off + extra + 1;
+    return 0;
+}
+
+static int copy_match(uint8_t* out, size_t out_cap, size_t* pos, uint32_t dist, uint32_t len) {
+    if (dist == 0 || dist > *pos || *pos + len > out_cap) return -1;
+    size_t src = *pos - dist;
+    if (dist >= len) {
+        memcpy(out + *pos, out + src, len);
+        *pos += len;
+        return 0;
+    }
+    for (uint32_t i = 0; i < len; i++)
+        out[(*pos)++] = out[src + i];
+    return 0;
+}
+
+static int decode_compressed_meta(bitr_t* r, uint32_t mlen, uint8_t* out, size_t out_cap, size_t* out_pos) {
+    uint32_t v;
+    hdec_t lit_h, ic_h, dist_h;
+    if (br_read(r, 1, &v) != 0 || v != 0) return -1; /* NBLTYPESL */
+    if (br_read(r, 1, &v) != 0 || v != 0) return -1; /* NBLTYPESI */
+    if (br_read(r, 1, &v) != 0 || v != 0) return -1; /* NBLTYPESD */
+    if (br_read(r, 2, &v) != 0 || v != 0) return -1; /* NPOSTFIX */
+    if (br_read(r, 4, &v) != 0 || v != 0) return -1; /* NDIRECT */
+    if (br_read(r, 2, &v) != 0 || v != 0) return -1; /* context mode */
+    if (br_read(r, 1, &v) != 0 || v != 0) return -1; /* NTREESL */
+    if (br_read(r, 1, &v) != 0 || v != 0) return -1; /* NTREESD */
+    if (read_prefix_code(r, &lit_h, 256, 8) != 0) return -1;
+    if (read_prefix_code(r, &ic_h, 704, 10) != 0) return -1;
+    if (read_prefix_code(r, &dist_h, 64, 6) != 0) return -1;
+
+    size_t end = *out_pos + mlen;
+    if (end > out_cap || end < *out_pos) return -1;
+    while (*out_pos < end) {
+        int sym = hdec_symbol(r, &ic_h);
+        int ic, cc;
+        bool explicit_dist;
+        uint32_t extra, ins_len, copy_len = 0, dist = 0;
+        if (decode_ic_symbol(sym, &ic, &cc, &explicit_dist) != 0) return -1;
+        if (br_read(r, kInsLen[ic].extra, &extra) != 0) return -1;
+        ins_len = kInsLen[ic].base + extra;
+        if (explicit_dist) {
+            if (br_read(r, kCopyLen[cc].extra, &extra) != 0) return -1;
+            copy_len = kCopyLen[cc].base + extra;
+        }
+        if (*out_pos + ins_len > end) return -1;
+        for (uint32_t i = 0; i < ins_len; i++) {
+            int lit = hdec_symbol(r, &lit_h);
+            if (lit < 0 || lit > 255) return -1;
+            out[(*out_pos)++] = (uint8_t)lit;
+        }
+        if (explicit_dist) {
+            int dc = hdec_symbol(r, &dist_h);
+            if (decode_distance(r, dc, &dist) != 0) return -1;
+            if (copy_match(out, out_cap, out_pos, dist, copy_len) != 0) return -1;
+            if (*out_pos > end) return -1;
+        }
+    }
+    return *out_pos == end ? 0 : -1;
+}
+
+int brotli_decode(const uint8_t* input, size_t input_len,
+                  uint8_t* output, size_t output_cap) {
+    bitr_t r = { input, input_len, 0 };
+    size_t out_pos = 0;
+    uint32_t v;
+    if (!input || (!output && output_cap)) return -1;
+    if (br_read(&r, 1, &v) != 0 || v != 0) return -1; /* WBITS=16 */
+
+    for (;;) {
+        uint32_t islast, islastempty = 0, mn, mlen_m1;
+        if (br_read(&r, 1, &islast) != 0) return -1;
+        if (islast) {
+            if (br_read(&r, 1, &islastempty) != 0) return -1;
+            if (islastempty)
+                return (int)out_pos;
+        }
+        if (br_read(&r, 2, &mn) != 0 || mn > 2) return -1;
+        int nibbles = 4 + (int)mn;
+        if (br_read(&r, nibbles * 4, &mlen_m1) != 0) return -1;
+        uint32_t mlen = mlen_m1 + 1;
+
+        if (!islast) {
+            uint32_t isuncompressed;
+            if (br_read(&r, 1, &isuncompressed) != 0) return -1;
+            if (isuncompressed) {
+                br_align_byte(&r);
+                if ((r.bit >> 3) + mlen > input_len || out_pos + mlen > output_cap) return -1;
+                memcpy(output + out_pos, input + (r.bit >> 3), mlen);
+                r.bit += (size_t)mlen * 8u;
+                out_pos += mlen;
+                continue;
+            }
+        }
+
+        if (decode_compressed_meta(&r, mlen, output, output_cap, &out_pos) != 0)
+            return -1;
+        if (islast)
+            return (int)out_pos;
+    }
 }
