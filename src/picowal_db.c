@@ -56,6 +56,7 @@ struct picowal_db {
     uint64_t volume_bytes;
     uint64_t write_off;
     uint64_t next_seq;
+    bool read_only; /* true on a replica: reject local mutations with EROFS */
     pthread_mutex_t mu;
     picowal_index_entry_t* buckets[PICOWAL_INDEX_BUCKETS];
 };
@@ -252,12 +253,19 @@ static bool load_or_format(picowal_db_t* db, const char* path,
     return true;
 }
 
-static bool scan_volume(picowal_db_t* db) {
-    uint64_t off = PICOWAL_SECTOR_SIZE;
+/* Walks records in [start_off, stop_off), validating magic/len/flags/
+ * checksum exactly like startup recovery does, upserting each into the
+ * index as it goes. Stops at the first invalid/short record (crash-
+ * recovery semantics) rather than treating it as an error -- *out_end is
+ * always a valid resume point. Returns false only on a hard I/O/OOM
+ * error (errno set); a truncated/corrupt tail is not an error. */
+static bool scan_range_locked(picowal_db_t* db, uint64_t start_off, uint64_t stop_off,
+                              uint64_t* out_end, uint64_t* out_max_seq) {
+    uint64_t off = start_off;
     uint64_t max_seq = 0;
     uint8_t payload[PICOWAL_DATA_MAX];
 
-    while (off + sizeof(picowal_record_hdr_t) <= db->volume_bytes) {
+    while (off + sizeof(picowal_record_hdr_t) <= stop_off) {
         picowal_record_hdr_t h;
         if (pread_full(db->fd, &h, sizeof(h), off) != 0) return false;
         if (is_zeroed(&h, sizeof(h))) break;
@@ -266,7 +274,7 @@ static bool scan_volume(picowal_db_t* db) {
         if ((h.flags & ~PICOWAL_REC_TOMBSTONE) != 0) break;
 
         uint64_t span = align_up_512(sizeof(h) + h.len);
-        if (off + span > db->volume_bytes) break;
+        if (off + span > stop_off) break;
 
         if (h.len > 0) {
             if (pread_full(db->fd, payload, h.len, off + sizeof(h)) != 0) return false;
@@ -282,7 +290,15 @@ static bool scan_volume(picowal_db_t* db) {
         off += span;
     }
 
-    db->write_off = off;
+    *out_end = off;
+    *out_max_seq = max_seq;
+    return true;
+}
+
+static bool scan_volume(picowal_db_t* db) {
+    uint64_t end = 0, max_seq = 0;
+    if (!scan_range_locked(db, PICOWAL_SECTOR_SIZE, db->volume_bytes, &end, &max_seq)) return false;
+    db->write_off = end;
     db->next_seq = max_seq + 1;
     return true;
 }
@@ -404,6 +420,11 @@ int picowal_db_put_key(picowal_db_t* db, uint32_t key,
         return -1;
     }
     pthread_mutex_lock(&db->mu);
+    if (db->read_only) {
+        pthread_mutex_unlock(&db->mu);
+        errno = EROFS;
+        return -1;
+    }
     if (create_only) {
         picowal_index_entry_t* e = index_find(db, key);
         if (e && !e->tombstone) {
@@ -468,6 +489,11 @@ int picowal_db_delete_key(picowal_db_t* db, uint32_t key) {
         return -1;
     }
     pthread_mutex_lock(&db->mu);
+    if (db->read_only) {
+        pthread_mutex_unlock(&db->mu);
+        errno = EROFS;
+        return -1;
+    }
     picowal_index_entry_t* e = index_find(db, key);
     if (!e || e->tombstone) {
         pthread_mutex_unlock(&db->mu);
@@ -505,3 +531,109 @@ uint32_t picowal_db_list_records(picowal_db_t* db, uint16_t card,
     pthread_mutex_unlock(&db->mu);
     return n;
 }
+
+void picowal_db_set_read_only(picowal_db_t* db, bool read_only) {
+    if (!db) return;
+    pthread_mutex_lock(&db->mu);
+    db->read_only = read_only;
+    pthread_mutex_unlock(&db->mu);
+}
+
+void picowal_db_repl_status(picowal_db_t* db, uint64_t* out_write_off,
+                            uint64_t* out_volume_bytes, uint64_t* out_next_seq) {    if (!db) {
+        if (out_write_off) *out_write_off = 0;
+        if (out_volume_bytes) *out_volume_bytes = 0;
+        if (out_next_seq) *out_next_seq = 0;
+        return;
+    }
+    pthread_mutex_lock(&db->mu);
+    if (out_write_off) *out_write_off = db->write_off;
+    if (out_volume_bytes) *out_volume_bytes = db->volume_bytes;
+    if (out_next_seq) *out_next_seq = db->next_seq;
+    pthread_mutex_unlock(&db->mu);
+}
+
+int picowal_db_repl_read(picowal_db_t* db, uint64_t from_off,
+                         void* out, uint32_t* inout_len) {
+    if (!db || !out || !inout_len || (from_off % PICOWAL_SECTOR_SIZE) != 0 ||
+        from_off < PICOWAL_SECTOR_SIZE) {
+        errno = EINVAL;
+        return -1;
+    }
+    pthread_mutex_lock(&db->mu);
+    if (db->fd < 0) {
+        pthread_mutex_unlock(&db->mu);
+        errno = EBADF;
+        return -1;
+    }
+    if (from_off > db->write_off) {
+        pthread_mutex_unlock(&db->mu);
+        errno = ERANGE;
+        return -1;
+    }
+    uint64_t avail = db->write_off - from_off;
+    uint32_t want = *inout_len;
+    if ((uint64_t)want > avail) want = (uint32_t)avail;
+    if (want > 0 && pread_full(db->fd, out, want, from_off) != 0) {
+        pthread_mutex_unlock(&db->mu);
+        return -1;
+    }
+    pthread_mutex_unlock(&db->mu);
+    *inout_len = want;
+    return 0;
+}
+
+int picowal_db_repl_ingest(picowal_db_t* db, uint64_t at_off,
+                           const void* data, uint32_t len) {
+    if (!db || (!data && len > 0) || (at_off % PICOWAL_SECTOR_SIZE) != 0 ||
+        (len % PICOWAL_SECTOR_SIZE) != 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    pthread_mutex_lock(&db->mu);
+    if (db->fd < 0) {
+        pthread_mutex_unlock(&db->mu);
+        errno = EBADF;
+        return -1;
+    }
+    if (at_off != db->write_off) {
+        /* Replica is out of sync (gap or overlap) -- caller must re-fetch
+         * from db->write_off, not blindly retry at the same offset. */
+        pthread_mutex_unlock(&db->mu);
+        errno = EINVAL;
+        return -1;
+    }
+    if (at_off + len > db->volume_bytes) {
+        pthread_mutex_unlock(&db->mu);
+        errno = ENOSPC;
+        return -1;
+    }
+    if (len > 0 && pwrite_full(db->fd, data, len, at_off) != 0) {
+        pthread_mutex_unlock(&db->mu);
+        return -1;
+    }
+    if (len > 0 && fdatasync(db->fd) != 0) {
+        pthread_mutex_unlock(&db->mu);
+        return -1;
+    }
+
+    uint64_t end = at_off, max_seq = 0;
+    if (!scan_range_locked(db, at_off, at_off + len, &end, &max_seq)) {
+        pthread_mutex_unlock(&db->mu);
+        return -1;
+    }
+    db->write_off = end;
+    if (max_seq + 1 > db->next_seq) db->next_seq = max_seq + 1;
+    bool short_ingest = (end != at_off + len);
+    pthread_mutex_unlock(&db->mu);
+    if (short_ingest) {
+        /* Wrote bytes but some tail failed validation (shouldn't happen
+         * for a well-behaved primary, but possible on a torn transfer).
+         * write_off only advanced to the last valid record; caller should
+         * re-fetch from there. */
+        errno = EIO;
+        return -1;
+    }
+    return 0;
+}
+

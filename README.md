@@ -338,6 +338,66 @@ Example:
 
 ---
 
+## Log replication (multi-reader / single-writer)
+
+picowal's on-disk log is a fixed 512-byte superblock followed by a
+strictly append-only, sector-aligned sequence of records — nothing is
+ever rewritten in place. That makes a raw byte-range copy of
+`[offset, write_off)` a complete, self-describing, independently
+replayable log segment, so physical replication needs no separate wire
+format: a replica just streams new bytes and replays them through the
+same record scanner used at boot/crash-recovery.
+
+**Primary side** — `--picowal-repl` (or `--picowal-repl-prefix=/p/`,
+which implies it) exposes:
+
+- `GET {prefix}status` → `{"write_off":N,"volume_bytes":N,"next_seq":N,"sector_size":512}`
+- `GET {prefix}stream/N` → raw bytes `[N, min(N+4MiB, write_off))`,
+  `Content-Type: application/octet-stream`, with `X-Picowal-From` /
+  `X-Picowal-Chunk-Len` / `X-Picowal-Write-Off` response headers
+  (`N` is a path segment, not a query string — a query string would be
+  stripped before routing ever saw it)
+
+Both endpoints always require `--picowal-write-token`/`PICOWAL_WRITE_TOKEN`
+via `X-PW-Write-Token` — independent of `--oidc-cookie-auth`, since
+replication is a machine-to-machine trust boundary that streams the
+*entire* raw, schema-unvalidated log (much larger blast radius than a
+single static-pack write). The feed refuses to serve at all (503) if no
+token is configured.
+
+**Replica side** — `--picowal-replica-of=http://host:port/prefix/`
+spawns a background thread that polls the primary's `status`/`stream`
+endpoints over plain HTTP (no TLS — run this over a trusted network,
+e.g. a VPC or WireGuard mesh, or front it with a TLS-terminating
+sidecar) and replays new bytes into the local picowal volume. Once
+replication starts, the node marks its local picowal volume read-only:
+all `/wal/`, static-pack, and pico-route mutation routes return
+`503 Service Unavailable` ("read replica: writes must go to the
+primary") instead of writing locally, so replicas can never silently
+diverge from the primary's log. Reads (`GET`/`HEAD`) keep serving out
+of the continuously-updated local copy.
+
+Example (primary on `:8080`, replica on `:8081` polling it):
+
+```sh
+# primary
+./picoweb --picowal-device=/mnt/picowal/wal.img --picowal-format \
+          --picowal-write-token=change-me-to-a-real-secret \
+          --picowal-repl --picowal-repl-prefix=/repl/ \
+          8080 wwwroot
+
+# replica
+./picoweb --picowal-device=/mnt/picowal-replica/wal.img --picowal-format \
+          --picowal-write-token=change-me-to-a-real-secret \
+          --picowal-replica-of=http://primary-host:8080/repl/ \
+          8081 wwwroot
+```
+
+Point a load balancer's read traffic at replicas and all write traffic
+at the primary for a simple multi-reader/single-writer topology.
+
+---
+
 ## Performance flags
 
 picoweb is built around **calculation hit at startup, pointer copies at runtime**.

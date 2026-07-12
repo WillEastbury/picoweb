@@ -4,6 +4,8 @@
 #include "api_blob.h"
 #include "static_pack.h"
 #include "pico_route.h"
+#include "picowal_repl.h"
+#include "picowal_repl_client.h"
 #include "picowal_db.h"
 #include "picowal_query.h"
 #include "picowal_validate.h"
@@ -93,6 +95,7 @@ bool api_path_matches(const char* path, size_t path_len) {
     if (api_blob_path_matches(path, path_len)) return true;
     if (static_pack_path_matches(path, path_len)) return true;
     if (pico_route_path_matches(path, path_len)) return true;
+    if (picowal_repl_path_matches(path, path_len)) return true;
     return false;
 }
 
@@ -716,6 +719,32 @@ bool api_require_pw_auth(const char* cookie, size_t cookie_len,
         return false;
     }
     return true;
+}
+
+/* Independent of OIDC cookie auth: always requires an exact match against
+ * the configured shared write token. Used by picowal_repl.c to gate the
+ * replication feed (streams the raw, unvalidated log -- a distinct,
+ * machine-to-machine trust boundary from browser session cookies). Returns
+ * false with resp filled in (401/503) if no token is configured or it
+ * doesn't match. */
+bool api_require_write_token(const char* write_token, size_t write_token_len,
+                             api_resp_t* resp) {
+    if (g_write_token_len == 0) {
+        resp_text_error(resp, 503, "Service Unavailable",
+                        "replication is disabled: configure --picowal-write-token\n");
+        return false;
+    }
+    if (!write_token || write_token_len == 0 ||
+        !token_equal_ct(write_token, write_token_len, g_write_token, g_write_token_len)) {
+        resp_text_error(resp, 401, "Unauthorized", "missing or invalid X-PW-Write-Token header\n");
+        return false;
+    }
+    return true;
+}
+
+const char* api_write_token_value(size_t* out_len) {
+    if (out_len) *out_len = g_write_token_len;
+    return g_write_token;
 }
 
 static bool header_value_safe(const char* s, size_t n) {
@@ -1725,12 +1754,20 @@ static void dispatch_picowal_pack_record(http_method_t method, uint16_t meta_pac
     }
 
     if (method == M_PUT || method == M_POST) {
+        if (picowal_replica_mode_enabled()) {
+            resp_text_error(resp, 503, "Service Unavailable", "read replica: writes must go to the primary\n");
+            return;
+        }
         if (body_len == 0 || body_len > PICOWAL_DATA_MAX) {
             resp_status_only(resp, 413, "Payload Too Large");
             return;
         }
         bool create_only = (method == M_POST);
         if (picowal_db_put_key(g_picowal, key, body, (uint32_t)body_len, create_only) != 0) {
+            if (errno == EROFS) {
+                resp_text_error(resp, 503, "Service Unavailable", "read replica: writes must go to the primary\n");
+                return;
+            }
             if (errno == EEXIST) { resp_status_only(resp, 409, "Conflict"); return; }
             if (errno == ENOSPC) {
                 resp_text_error(resp, 507, "Insufficient Storage", "wal volume full\n");
@@ -1748,6 +1785,10 @@ static void dispatch_picowal_pack_record(http_method_t method, uint16_t meta_pac
     }
 
     if (method == M_DELETE) {
+        if (picowal_replica_mode_enabled()) {
+            resp_text_error(resp, 503, "Service Unavailable", "read replica: writes must go to the primary\n");
+            return;
+        }
         if (picowal_db_delete_key(g_picowal, key) != 0) {
             if (errno == ENOENT) { resp_status_only(resp, 404, "Not Found"); return; }
             resp_text_error(resp, 500, "Internal Server Error", "metadata delete failed\n");
@@ -2060,6 +2101,11 @@ static void dispatch_picowal(http_method_t method,
         resp_text_error(resp, 400, "Bad Request", "invalid wal path\n");
         return;
     }
+    if ((method == M_PUT || method == M_POST || method == M_DELETE) &&
+        picowal_replica_mode_enabled()) {
+        resp_text_error(resp, 503, "Service Unavailable", "read replica: writes must go to the primary\n");
+        return;
+    }
 
     switch (method) {
     case M_GET:
@@ -2276,6 +2322,10 @@ void api_dispatch(http_method_t method,
         pico_route_dispatch(method, path, path_len, body, body_len,
                             cookie, cookie_len, has_pw_auth_header,
                             write_token, write_token_len, resp);
+        return;
+    }
+    if (picowal_repl_path_matches(path, path_len)) {
+        picowal_repl_dispatch(method, path, path_len, write_token, write_token_len, resp);
         return;
     }
     if (method == M_OPTIONS) {

@@ -156,6 +156,10 @@ void static_pack_dispatch(http_method_t method,
             return;
         }
         if (picowal_db_put_key(api_picowal_db(), key, body, (uint32_t)body_len, false) != 0) {
+            if (errno == EROFS) {
+                resp_text_error(resp, 503, "Service Unavailable", "read replica: writes must go to the primary\n");
+                return;
+            }
             if (errno == ENOSPC) {
                 resp_text_error(resp, 507, "Insufficient Storage", "wal volume full\n");
                 return;
@@ -169,6 +173,10 @@ void static_pack_dispatch(http_method_t method,
 
     if (method == M_DELETE) {
         if (picowal_db_delete_key(api_picowal_db(), key) != 0) {
+            if (errno == EROFS) {
+                resp_text_error(resp, 503, "Service Unavailable", "read replica: writes must go to the primary\n");
+                return;
+            }
             if (errno == ENOENT) { resp_status_only(resp, 404, "Not Found"); return; }
             resp_text_error(resp, 500, "Internal Server Error", "static-pack delete failed\n");
             return;

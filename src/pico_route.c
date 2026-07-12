@@ -226,6 +226,10 @@ void pico_route_dispatch(http_method_t method,
             return;
         }
         if (picowal_db_put_key(db, key, body, (uint32_t)body_len, false) != 0) {
+            if (errno == EROFS) {
+                resp_text_error(resp, 503, "Service Unavailable", "read replica: writes must go to the primary\n");
+                return;
+            }
             if (errno == ENOSPC) {
                 resp_text_error(resp, 507, "Insufficient Storage", "wal volume full\n");
                 return;

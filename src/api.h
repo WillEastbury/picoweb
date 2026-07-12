@@ -95,6 +95,19 @@ bool api_require_pw_auth(const char* cookie, size_t cookie_len,
                           const char* write_token, size_t write_token_len,
                           api_resp_t* resp);
 
+/* Independent of --oidc-cookie-auth: always checks the request's write
+ * token against the configured shared secret. Used to gate the raw log
+ * replication feed (picowal_repl.c), which is a machine-to-machine trust
+ * boundary distinct from browser session cookies. */
+bool api_require_write_token(const char* write_token, size_t write_token_len,
+                             api_resp_t* resp);
+
+/* Accessor for the configured shared write token, so a replica-mode
+ * client (main.c) can attach the same credential to its outbound
+ * replication requests without re-parsing CLI args/env itself. Returns
+ * NULL/0-length if none configured. */
+const char* api_write_token_value(size_t* out_len);
+
 /* Configure the shared write token checked by api_require_pw_auth when
  * --oidc-cookie-auth is not enabled. Pass NULL/empty to disable (any raw
  * write is then refused with 503 until a token is set). */

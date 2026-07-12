@@ -13,6 +13,8 @@
 #include "api_blob.h"
 #include "static_pack.h"
 #include "pico_route.h"
+#include "picowal_repl.h"
+#include "picowal_repl_client.h"
 #include "metrics.h"
 #include "server.h"
 #include "simd.h"
@@ -57,6 +59,12 @@ static void usage(const char* argv0) {
         "                              raw static-pack/pico-route writes when OIDC\n"
         "                              auth is off (env PICOWAL_WRITE_TOKEN fallback;\n"
         "                              neither set -> such writes get 503)\n"
+        "  --picowal-repl               enable primary-side log replication feed\n"
+        "  --picowal-repl-prefix=/p/    replication feed prefix (default /repl/, implies --picowal-repl)\n"
+        "  --picowal-replica-of=http://HOST:PORT/PREFIX/   run as read replica, pulling\n"
+        "                              from a primary's replication feed (plain HTTP\n"
+        "                              only; needs --picowal-write-token matching the\n"
+        "                              primary); local picowal writes are refused (503)\n"
         "  --oidc-cookie-auth     require OIDC-backed short-lived cookie auth for /wal/ routes\n"
         "  --oidc-cookie-ttl-sec=N session cookie ttl in seconds (default 900)\n"
         "  --oidc-google-client-id=ID expected Google OAuth client id (aud)\n"
@@ -116,6 +124,9 @@ int main(int argc, char** argv) {
     const char* pico_route_prefix_cli = "/app/";
     long pico_route_card = -1;    /* -1 = disabled */
     const char* picowal_write_token_cli = NULL;
+    const char* picowal_repl_prefix_cli = "/repl/";
+    bool picowal_repl_enable = false;
+    const char* picowal_replica_of_cli = NULL;
     bool oidc_cookie_auth = false;
     uint32_t oidc_cookie_ttl_sec = 900;
     const char* oidc_google_client_id = NULL;
@@ -320,6 +331,27 @@ int main(int argc, char** argv) {
             }
             continue;
         }
+        if (strcmp(argv[i], "--picowal-repl") == 0) {
+            picowal_repl_enable = true;
+            continue;
+        }
+        if (strncmp(argv[i], "--picowal-repl-prefix=", 22) == 0) {
+            picowal_repl_prefix_cli = argv[i] + 22;
+            if (!picowal_repl_prefix_cli[0]) {
+                fprintf(stderr, "picoweb: --picowal-repl-prefix requires a non-empty prefix\n");
+                return 1;
+            }
+            picowal_repl_enable = true;
+            continue;
+        }
+        if (strncmp(argv[i], "--picowal-replica-of=", 21) == 0) {
+            picowal_replica_of_cli = argv[i] + 21;
+            if (!picowal_replica_of_cli[0]) {
+                fprintf(stderr, "picoweb: --picowal-replica-of requires a non-empty URL\n");
+                return 1;
+            }
+            continue;
+        }
         if (strcmp(argv[i], "--oidc-cookie-auth") == 0) {
             oidc_cookie_auth = true;
             continue;
@@ -461,6 +493,15 @@ int main(int argc, char** argv) {
         fprintf(stderr, "picoweb: --picowal-code-card requires --picowal-device\n");
         return 1;
     }
+    if ((picowal_repl_enable || picowal_replica_of_cli) && !picowal_device_cli) {
+        fprintf(stderr, "picoweb: --picowal-repl/--picowal-replica-of require --picowal-device\n");
+        return 1;
+    }
+    if (picowal_repl_enable && picowal_replica_of_cli) {
+        fprintf(stderr, "picoweb: --picowal-repl (primary feed) and --picowal-replica-of "
+                "(replica puller) are mutually exclusive on one node\n");
+        return 1;
+    }
     if (blob_root_cli &&
         (backend != PICOWEB_BACKEND_TLS || !tls_cert_cli || !tls_key_cli)) {
         fprintf(stderr,
@@ -518,6 +559,41 @@ int main(int argc, char** argv) {
                         "(card=%ld, prefix='%s')\n", pico_route_card, pico_route_prefix_cli);
                 return 1;
             }
+        }
+        if (picowal_repl_enable) {
+            const char* token = picowal_write_token_cli;
+            if (!token) token = getenv("PICOWAL_WRITE_TOKEN");
+            if (!token || !token[0]) {
+                fprintf(stderr, "picoweb: --picowal-repl requires --picowal-write-token/"
+                        "PICOWAL_WRITE_TOKEN (the replication feed streams the entire raw log "
+                        "and must always be token-gated)\n");
+                return 1;
+            }
+            api_set_write_token(token);
+            if (!picowal_repl_init(picowal_repl_prefix_cli)) {
+                fprintf(stderr, "picoweb: failed to enable picowal replication feed "
+                        "(prefix='%s')\n", picowal_repl_prefix_cli);
+                return 1;
+            }
+            fprintf(stderr, "picoweb: picowal replication feed enabled at prefix '%s' "
+                    "(plain HTTP, token-gated; run over a trusted network)\n", picowal_repl_prefix_cli);
+        }
+        if (picowal_replica_of_cli) {
+            const char* token = picowal_write_token_cli;
+            if (!token) token = getenv("PICOWAL_WRITE_TOKEN");
+            if (!token || !token[0]) {
+                fprintf(stderr, "picoweb: --picowal-replica-of requires --picowal-write-token/"
+                        "PICOWAL_WRITE_TOKEN (must match the primary's configured token)\n");
+                return 1;
+            }
+            if (!picowal_repl_client_start(picowal_replica_of_cli, token, api_picowal_db())) {
+                fprintf(stderr, "picoweb: failed to start replica client for '%s'\n",
+                        picowal_replica_of_cli);
+                return 1;
+            }
+            picowal_db_set_read_only(api_picowal_db(), true);
+            fprintf(stderr, "picoweb: running as read replica of '%s'; local picowal writes "
+                    "will be refused (503)\n", picowal_replica_of_cli);
         }
     }
     if (blob_root_cli) {
