@@ -396,6 +396,64 @@ Example (primary on `:8080`, replica on `:8081` polling it):
 Point a load balancer's read traffic at replicas and all write traffic
 at the primary for a simple multi-reader/single-writer topology.
 
+### Gossip-based leader election (`--picowal-node-id` / `--picowal-followers`)
+
+Layered on top of the replication feed above, a replica can optionally
+join a small **quorum-based leader election** so that a static set of
+replicas can auto-promote one of themselves to writer if the primary
+disappears, instead of requiring an operator to manually re-point a new
+primary.
+
+```sh
+# replica, additionally opted into gossip election
+./picoweb --picowal-device=/mnt/picowal-replica/wal.img --picowal-format \
+          --picowal-write-token=change-me-to-a-real-secret \
+          --picowal-replica-of=http://primary-host:8080/repl/ \
+          --picowal-node-id=replica-host:8081 \
+          --picowal-followers=replica-host:8081,replica2-host:8082,replica3-host:8083 \
+          8081 wwwroot
+```
+
+- `--picowal-node-id=HOST:PORT` — this node's own identity; must appear
+  in `--picowal-followers`.
+- `--picowal-followers=ID1,ID2,...` — the fixed, statically-configured
+  set of registered followers (replicas only — do not include the
+  primary). Every node in the set should be started with the same
+  `--picowal-followers` list.
+
+Each follower runs a background gossip tick (every ~500ms) that checks
+whether its primary looks healthy (a run of consecutive failed
+`/repl/status` polls). While the primary is healthy, nothing happens.
+Once a follower detects the primary is down, every healthy follower
+independently and deterministically nominates the same candidate (the
+lexicographically-smallest registered follower id) and gossips its vote
+to the others via `POST {prefix}vote` (fire-and-forget, short timeout,
+gated by the same `--picowal-write-token`). The moment any follower
+observes **more than 50% of the registered followers** have voted for a
+candidate that is itself, it self-promotes: it stops pulling from the
+dead primary, flips its own picowal volume back to read-write, and
+starts serving the primary-side replication feed so the remaining
+followers could in principle re-point at it.
+
+Check election state via `GET {prefix}status` (same token-gated auth):
+
+```sh
+curl -H 'X-PW-Write-Token: ...' http://replica-host:8081/gossip/status
+# {"self":"replica-host:8081","term":1,"candidate":"replica-host:8081","votes":3,"followers":3,"quorum":2,"promoted":true}
+```
+
+**This is deliberately not a full consensus protocol.** There is no
+log-matching, no fencing token, and no protection against split-brain
+if the old primary later comes back online while a new leader has
+already been promoted — both would accept writes simultaneously. It
+relies on: a static, operator-configured follower list (no dynamic
+membership changes), deterministic candidate selection so followers
+don't need a real campaign phase, and best-effort gossip over plain
+HTTP. Treat it as a pragmatic "mostly cooperative" failover aid, not a
+guarantee against split-brain — an operator (or an external fencing
+mechanism) should still confirm the old primary is truly dead before
+trusting a promoted node's writes as authoritative.
+
 ---
 
 ## Performance flags

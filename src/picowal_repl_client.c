@@ -35,6 +35,11 @@
                                           primary wedges the poller thread
                                           forever with no retry/log/recovery */
 
+#define REPL_HEALTH_FAIL_THRESHOLD 3  /* consecutive failed status polls
+                                          before the primary is considered
+                                          unhealthy (used by picowal_gossip
+                                          to trigger leader election) */
+
 typedef struct {
     char host[REPL_HOST_MAX];
     int  port;
@@ -44,8 +49,21 @@ typedef struct {
 } repl_client_ctx_t;
 
 static bool g_replica_mode = false;
+static volatile int g_consecutive_failures = 0;
+static volatile bool g_stop_requested = false;
 
 bool picowal_replica_mode_enabled(void) { return g_replica_mode; }
+
+bool picowal_repl_client_primary_healthy(void) {
+    /* Not running as a replica at all (e.g. we are the primary, or we've
+     * already been promoted) -- nothing to report as unhealthy. */
+    if (!g_replica_mode) return true;
+    return g_consecutive_failures < REPL_HEALTH_FAIL_THRESHOLD;
+}
+
+void picowal_repl_client_stop(void) {
+    g_stop_requested = true;
+}
 
 /* Parses "http://host[:port]/path/" into host/port/path_prefix. Rejects
  * https:// outright (no TLS client here) and requires a trailing '/'. */
@@ -248,6 +266,12 @@ static void* repl_client_thread(void* arg) {
     char path[REPL_PATH_MAX + 32];
 
     for (;;) {
+        if (g_stop_requested) {
+            g_replica_mode = false;
+            fprintf(stderr, "picowal_repl_client: stopped (promoted to writer)\n");
+            free(ctx);
+            return NULL;
+        }
         snprintf(path, sizeof(path), "%sstatus", ctx->path_prefix);
         char* body = NULL; size_t body_len = 0;
         int status = repl_http_get(ctx, path, &body, &body_len);
@@ -257,11 +281,14 @@ static void* repl_client_thread(void* arg) {
         free(body);
 
         if (!have_status) {
+            g_consecutive_failures++;
             fprintf(stderr, "picowal_repl_client: failed to reach primary status endpoint "
-                    "(http status=%d); retrying in %dms\n", status, REPL_RETRY_MS);
+                    "(http status=%d); retrying in %dms (consecutive failures=%d)\n",
+                    status, REPL_RETRY_MS, g_consecutive_failures);
             usleep(REPL_RETRY_MS * 1000);
             continue;
         }
+        g_consecutive_failures = 0;
 
         uint64_t local_write_off = 0;
         picowal_db_repl_status(ctx->db, &local_write_off, NULL, NULL);

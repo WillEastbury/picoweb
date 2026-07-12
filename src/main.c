@@ -15,6 +15,7 @@
 #include "pico_route.h"
 #include "picowal_repl.h"
 #include "picowal_repl_client.h"
+#include "picowal_gossip.h"
 #include "metrics.h"
 #include "server.h"
 #include "simd.h"
@@ -65,6 +66,11 @@ static void usage(const char* argv0) {
         "                              from a primary's replication feed (plain HTTP\n"
         "                              only; needs --picowal-write-token matching the\n"
         "                              primary); local picowal writes are refused (503)\n"
+        "  --picowal-node-id=HOST:PORT  this node's id for gossip leader election\n"
+        "                              (must appear in --picowal-followers)\n"
+        "  --picowal-followers=ID1,ID2,...  registered follower set for gossip-based\n"
+        "                              leader election (with --picowal-replica-of, promotes\n"
+        "                              a replica to writer once >50%% of followers vote for it)\n"
         "  --oidc-cookie-auth     require OIDC-backed short-lived cookie auth for /wal/ routes\n"
         "  --oidc-cookie-ttl-sec=N session cookie ttl in seconds (default 900)\n"
         "  --oidc-google-client-id=ID expected Google OAuth client id (aud)\n"
@@ -127,6 +133,8 @@ int main(int argc, char** argv) {
     const char* picowal_repl_prefix_cli = "/repl/";
     bool picowal_repl_enable = false;
     const char* picowal_replica_of_cli = NULL;
+    const char* picowal_node_id_cli = NULL;
+    const char* picowal_followers_cli = NULL;
     bool oidc_cookie_auth = false;
     uint32_t oidc_cookie_ttl_sec = 900;
     const char* oidc_google_client_id = NULL;
@@ -352,6 +360,22 @@ int main(int argc, char** argv) {
             }
             continue;
         }
+        if (strncmp(argv[i], "--picowal-node-id=", 18) == 0) {
+            picowal_node_id_cli = argv[i] + 18;
+            if (!picowal_node_id_cli[0]) {
+                fprintf(stderr, "picoweb: --picowal-node-id requires a non-empty value\n");
+                return 1;
+            }
+            continue;
+        }
+        if (strncmp(argv[i], "--picowal-followers=", 20) == 0) {
+            picowal_followers_cli = argv[i] + 20;
+            if (!picowal_followers_cli[0]) {
+                fprintf(stderr, "picoweb: --picowal-followers requires a non-empty list\n");
+                return 1;
+            }
+            continue;
+        }
         if (strcmp(argv[i], "--oidc-cookie-auth") == 0) {
             oidc_cookie_auth = true;
             continue;
@@ -502,6 +526,20 @@ int main(int argc, char** argv) {
                 "(replica puller) are mutually exclusive on one node\n");
         return 1;
     }
+    if (picowal_followers_cli && !picowal_node_id_cli) {
+        fprintf(stderr, "picoweb: --picowal-followers requires --picowal-node-id\n");
+        return 1;
+    }
+    if (picowal_node_id_cli && !picowal_followers_cli) {
+        fprintf(stderr, "picoweb: --picowal-node-id requires --picowal-followers\n");
+        return 1;
+    }
+    if (picowal_followers_cli && !picowal_replica_of_cli) {
+        fprintf(stderr, "picoweb: --picowal-followers requires --picowal-replica-of "
+                "(gossip-driven promotion only makes sense on a node that starts as "
+                "a replica)\n");
+        return 1;
+    }
     if (blob_root_cli &&
         (backend != PICOWEB_BACKEND_TLS || !tls_cert_cli || !tls_key_cli)) {
         fprintf(stderr,
@@ -591,9 +629,20 @@ int main(int argc, char** argv) {
                         picowal_replica_of_cli);
                 return 1;
             }
+            api_set_write_token(token);
             picowal_db_set_read_only(api_picowal_db(), true);
             fprintf(stderr, "picoweb: running as read replica of '%s'; local picowal writes "
                     "will be refused (503)\n", picowal_replica_of_cli);
+
+            if (picowal_followers_cli) {
+                if (!picowal_gossip_init(picowal_node_id_cli, picowal_followers_cli,
+                                        token, api_picowal_db(), picowal_repl_prefix_cli)) {
+                    fprintf(stderr, "picoweb: failed to enable gossip leader election "
+                            "(node-id='%s', followers='%s')\n",
+                            picowal_node_id_cli, picowal_followers_cli);
+                    return 1;
+                }
+            }
         }
     }
     if (blob_root_cli) {

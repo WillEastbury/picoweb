@@ -6,6 +6,7 @@
 #include "pico_route.h"
 #include "picowal_repl.h"
 #include "picowal_repl_client.h"
+#include "picowal_gossip.h"
 #include "picowal_db.h"
 #include "picowal_query.h"
 #include "picowal_validate.h"
@@ -96,6 +97,7 @@ bool api_path_matches(const char* path, size_t path_len) {
     if (static_pack_path_matches(path, path_len)) return true;
     if (pico_route_path_matches(path, path_len)) return true;
     if (picowal_repl_path_matches(path, path_len)) return true;
+    if (picowal_gossip_path_matches(path, path_len)) return true;
     return false;
 }
 
@@ -2326,6 +2328,11 @@ void api_dispatch(http_method_t method,
     }
     if (picowal_repl_path_matches(path, path_len)) {
         picowal_repl_dispatch(method, path, path_len, write_token, write_token_len, resp);
+        return;
+    }
+    if (picowal_gossip_path_matches(path, path_len)) {
+        picowal_gossip_dispatch(method, path, path_len, body, body_len,
+                                write_token, write_token_len, resp);
         return;
     }
     if (method == M_OPTIONS) {

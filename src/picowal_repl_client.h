@@ -32,4 +32,16 @@ bool picowal_repl_client_start(const char* primary_url, const char* write_token,
  * diverge from the primary's log). */
 bool picowal_replica_mode_enabled(void);
 
+/* False once REPL_HEALTH_FAIL_THRESHOLD consecutive status polls have
+ * failed in a row -- i.e. the configured primary looks unreachable or
+ * unresponsive. Used by picowal_gossip.c to decide when to start
+ * nominating a new leader. Always true if this node isn't a replica
+ * (picowal_replica_mode_enabled() == false). */
+bool picowal_repl_client_primary_healthy(void);
+
+/* Asks the poller thread to exit at its next iteration (used when a
+ * replica is promoted to writer via gossip quorum, so it stops polling
+ * its old primary). Idempotent; safe to call even if never started. */
+void picowal_repl_client_stop(void);
+
 #endif
