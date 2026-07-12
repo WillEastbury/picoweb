@@ -85,9 +85,11 @@ typedef struct conn {
     uint16_t      api_principal_len;    /* X-PW-Principal/X-Principal-Id length */
     uint16_t      api_tenant_len;       /* X-PW-Tenant length */
     bool          api_has_pw_auth;      /* X-PW-Auth: 1 marker */
+    uint16_t      api_write_token_len;  /* length of copied X-PW-Write-Token header */
     uint8_t       api_path_len;
     char          api_path[256];        /* request-target copy (see above) */
     char          api_cookie[512];      /* bounded Cookie copy */
+    char          api_write_token[128]; /* bounded X-PW-Write-Token copy */
     char          api_host[256];        /* bounded Host copy */
     char          api_origin[256];      /* bounded Origin copy */
     char          api_acr_headers[256]; /* bounded ACR-Headers copy */

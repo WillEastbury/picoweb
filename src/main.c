@@ -10,6 +10,9 @@
 
 #include "jumptable.h"
 #include "api.h"
+#include "api_blob.h"
+#include "static_pack.h"
+#include "pico_route.h"
 #include "metrics.h"
 #include "server.h"
 #include "simd.h"
@@ -43,6 +46,17 @@ static void usage(const char* argv0) {
         "  --picowal-prefix=/p/   route prefix for picowal API (default /wal/)\n"
         "  --picowal-bytes=N      raw-volume size in bytes (default 1073741824)\n"
         "  --picowal-format       initialize/format picowal volume when missing\n"
+        "  --blob-root=DIR      enable HTTPS-only content-addressed blob store under DIR\n"
+        "                       (requires --tls --tls-cert=PATH --tls-key=PATH)\n"
+        "  --blob-prefix=/p/    blob API route prefix (default /blob/)\n"
+        "  --picowal-static-card=N  serve static content from picowal card N\n"
+        "  --picowal-static-prefix=/p/  static-pack route prefix (default /site/)\n"
+        "  --picowal-code-card=N    run PicoScript bytecode from picowal card N\n"
+        "  --picowal-code-prefix=/p/   pico-route prefix (default /app/)\n"
+        "  --picowal-write-token=TOK   shared secret for X-PW-Write-Token gating of\n"
+        "                              raw static-pack/pico-route writes when OIDC\n"
+        "                              auth is off (env PICOWAL_WRITE_TOKEN fallback;\n"
+        "                              neither set -> such writes get 503)\n"
         "  --oidc-cookie-auth     require OIDC-backed short-lived cookie auth for /wal/ routes\n"
         "  --oidc-cookie-ttl-sec=N session cookie ttl in seconds (default 900)\n"
         "  --oidc-google-client-id=ID expected Google OAuth client id (aud)\n"
@@ -94,6 +108,14 @@ int main(int argc, char** argv) {
     bool picowal_prefix_set = false;
     unsigned long long picowal_bytes = 1073741824ULL;
     bool picowal_format = false;
+    const char* blob_root_cli = NULL;
+    const char* blob_prefix_cli = "/blob/";
+    bool blob_prefix_set = false;
+    const char* static_pack_prefix_cli = "/site/";
+    long static_pack_card = -1;   /* -1 = disabled */
+    const char* pico_route_prefix_cli = "/app/";
+    long pico_route_card = -1;    /* -1 = disabled */
+    const char* picowal_write_token_cli = NULL;
     bool oidc_cookie_auth = false;
     uint32_t oidc_cookie_ttl_sec = 900;
     const char* oidc_google_client_id = NULL;
@@ -237,6 +259,67 @@ int main(int argc, char** argv) {
             picowal_format = true;
             continue;
         }
+        if (strncmp(argv[i], "--blob-root=", 12) == 0) {
+            blob_root_cli = argv[i] + 12;
+            if (!blob_root_cli[0]) {
+                fprintf(stderr, "picoweb: --blob-root requires a non-empty path\n");
+                return 1;
+            }
+            continue;
+        }
+        if (strncmp(argv[i], "--blob-prefix=", 14) == 0) {
+            blob_prefix_cli = argv[i] + 14;
+            blob_prefix_set = true;
+            if (!blob_prefix_cli[0]) {
+                fprintf(stderr, "picoweb: --blob-prefix requires a non-empty prefix\n");
+                return 1;
+            }
+            continue;
+        }
+        if (strncmp(argv[i], "--picowal-static-card=", 22) == 0) {
+            char* end = NULL;
+            long v = strtol(argv[i] + 22, &end, 10);
+            if (end == argv[i] + 22 || *end != '\0' || v < 0 || v > (long)PICOWAL_CARD_MAX) {
+                fprintf(stderr, "picoweb: invalid --picowal-static-card value\n");
+                return 1;
+            }
+            static_pack_card = v;
+            continue;
+        }
+        if (strncmp(argv[i], "--picowal-static-prefix=", 24) == 0) {
+            static_pack_prefix_cli = argv[i] + 24;
+            if (!static_pack_prefix_cli[0]) {
+                fprintf(stderr, "picoweb: --picowal-static-prefix requires a non-empty prefix\n");
+                return 1;
+            }
+            continue;
+        }
+        if (strncmp(argv[i], "--picowal-code-card=", 20) == 0) {
+            char* end = NULL;
+            long v = strtol(argv[i] + 20, &end, 10);
+            if (end == argv[i] + 20 || *end != '\0' || v < 0 || v > (long)PICOWAL_CARD_MAX) {
+                fprintf(stderr, "picoweb: invalid --picowal-code-card value\n");
+                return 1;
+            }
+            pico_route_card = v;
+            continue;
+        }
+        if (strncmp(argv[i], "--picowal-code-prefix=", 22) == 0) {
+            pico_route_prefix_cli = argv[i] + 22;
+            if (!pico_route_prefix_cli[0]) {
+                fprintf(stderr, "picoweb: --picowal-code-prefix requires a non-empty prefix\n");
+                return 1;
+            }
+            continue;
+        }
+        if (strncmp(argv[i], "--picowal-write-token=", 22) == 0) {
+            picowal_write_token_cli = argv[i] + 22;
+            if (!picowal_write_token_cli[0]) {
+                fprintf(stderr, "picoweb: --picowal-write-token requires a non-empty value\n");
+                return 1;
+            }
+            continue;
+        }
         if (strcmp(argv[i], "--oidc-cookie-auth") == 0) {
             oidc_cookie_auth = true;
             continue;
@@ -366,6 +449,26 @@ int main(int argc, char** argv) {
         fprintf(stderr, "picoweb: --oidc-* provider flags require --oidc-cookie-auth\n");
         return 1;
     }
+    if (blob_prefix_set && !blob_root_cli) {
+        fprintf(stderr, "picoweb: --blob-prefix requires --blob-root\n");
+        return 1;
+    }
+    if (static_pack_card >= 0 && !picowal_device_cli) {
+        fprintf(stderr, "picoweb: --picowal-static-card requires --picowal-device\n");
+        return 1;
+    }
+    if (pico_route_card >= 0 && !picowal_device_cli) {
+        fprintf(stderr, "picoweb: --picowal-code-card requires --picowal-device\n");
+        return 1;
+    }
+    if (blob_root_cli &&
+        (backend != PICOWEB_BACKEND_TLS || !tls_cert_cli || !tls_key_cli)) {
+        fprintf(stderr,
+            "picoweb: --blob-root requires HTTPS: pass --tls --tls-cert=PATH "
+            "--tls-key=PATH --tls-ifname=IFACE (blob data is never served over "
+            "plaintext HTTP)\n");
+        return 1;
+    }
 
     /* Reject --dpdk early — before spawning workers and binding ports
      * — so operators get a clean error instead of partially-started
@@ -390,6 +493,37 @@ int main(int argc, char** argv) {
     if (picowal_device_cli) {
         if (!api_picowal_init(picowal_device_cli, (uint64_t)picowal_bytes,
                               picowal_prefix_cli, picowal_format)) {
+            return 1;
+        }
+        if (static_pack_card >= 0 || pico_route_card >= 0) {
+            const char* token = picowal_write_token_cli;
+            if (!token) token = getenv("PICOWAL_WRITE_TOKEN");
+            if (token && token[0]) {
+                api_set_write_token(token);
+            } else {
+                fprintf(stderr, "picoweb: warning: no --picowal-write-token/PICOWAL_WRITE_TOKEN set; "
+                        "raw picowal PUT/DELETE writes will be refused (503) unless --oidc-cookie-auth is enabled\n");
+            }
+        }
+        if (static_pack_card >= 0) {
+            if (!static_pack_init((uint16_t)static_pack_card, static_pack_prefix_cli)) {
+                fprintf(stderr, "picoweb: failed to enable static-pack routes "
+                        "(card=%ld, prefix='%s')\n", static_pack_card, static_pack_prefix_cli);
+                return 1;
+            }
+        }
+        if (pico_route_card >= 0) {
+            if (!pico_route_init((uint16_t)pico_route_card, pico_route_prefix_cli)) {
+                fprintf(stderr, "picoweb: failed to enable pico-route routes "
+                        "(card=%ld, prefix='%s')\n", pico_route_card, pico_route_prefix_cli);
+                return 1;
+            }
+        }
+    }
+    if (blob_root_cli) {
+        if (!api_blob_init(blob_root_cli, blob_prefix_cli)) {
+            fprintf(stderr, "picoweb: failed to enable blob API (root='%s', prefix='%s')\n",
+                    blob_root_cli, blob_prefix_cli);
             return 1;
         }
     }
@@ -563,6 +697,10 @@ int main(int argc, char** argv) {
     if (api_picowal_enabled()) {
         metal_log("picoweb: picowal enabled (device=%s, prefix=%s, bytes=%llu)",
                   picowal_device_cli, picowal_prefix_cli, picowal_bytes);
+    }
+    if (api_blob_enabled()) {
+        metal_log("picoweb: blob store enabled over HTTPS (root=%s, prefix=%s)",
+                  blob_root_cli, blob_prefix_cli);
     }
     if (oidc_cookie_auth) {
         metal_log("picoweb: OIDC cookie auth enabled (ttl=%us, providers=google+entra)",

@@ -1,6 +1,9 @@
 /* api.c — simple JSON-file CRUD for picoweb. See api.h for protocol. */
 
 #include "api.h"
+#include "api_blob.h"
+#include "static_pack.h"
+#include "pico_route.h"
 #include "picowal_db.h"
 #include "picowal_query.h"
 #include "picowal_validate.h"
@@ -57,10 +60,12 @@ static pthread_mutex_t g_auth_mu = PTHREAD_MUTEX_INITIALIZER;
 static auth_session_t  g_auth_sessions[AUTH_SESSIONS_MAX];
 
 static void resp_status_only(api_resp_t* r, int status, const char* reason);
+static void resp_text_error(api_resp_t* r, int status, const char* reason, const char* body);
 
 bool api_enabled(void)              { return g_enabled; }
 bool api_picowal_enabled(void)      { return g_picowal_enabled; }
 size_t api_max_request_body(void)   { return API_REQ_BODY_CAP; }
+picowal_db_t* api_picowal_db(void)  { return g_picowal; }
 
 static bool valid_prefix(const char* prefix, size_t cap, const char* label) {
     size_t pl = prefix ? strlen(prefix) : 0;
@@ -85,6 +90,9 @@ bool api_path_matches(const char* path, size_t path_len) {
     if (g_picowal_enabled &&
         path_len >= g_picowal_prefix_len &&
         memcmp(path, g_picowal_prefix, g_picowal_prefix_len) == 0) return true;
+    if (api_blob_path_matches(path, path_len)) return true;
+    if (static_pack_path_matches(path, path_len)) return true;
+    if (pico_route_path_matches(path, path_len)) return true;
     return false;
 }
 
@@ -647,6 +655,64 @@ static bool auth_require_cookie(const char* cookie, size_t cookie_len, api_resp_
     }
     if (!auth_is_valid_session(sid)) {
         resp_status_only(resp, 401, "Unauthorized");
+        return false;
+    }
+    return true;
+}
+
+/* Shared write token for raw picowal write routes (static_pack/pico_route)
+ * when OIDC cookie auth isn't configured. Set via api_set_write_token();
+ * empty/unset means these routes refuse all writes. */
+static char   g_write_token[128] = {0};
+static size_t g_write_token_len = 0;
+
+void api_set_write_token(const char* token) {
+    size_t n = token ? strlen(token) : 0;
+    if (n >= sizeof(g_write_token)) n = sizeof(g_write_token) - 1;
+    if (n > 0) memcpy(g_write_token, token, n);
+    g_write_token[n] = '\0';
+    g_write_token_len = n;
+}
+
+/* Constant-time comparison to avoid leaking token length/content via
+ * timing on the write-token check. */
+static bool token_equal_ct(const char* a, size_t a_len, const char* b, size_t b_len) {
+    if (a_len != b_len) return false;
+    unsigned char diff = 0;
+    for (size_t i = 0; i < a_len; i++) diff |= (unsigned char)a[i] ^ (unsigned char)b[i];
+    return diff == 0;
+}
+
+/* Shared write-gate for non-/wal/ modules (static_pack, pico_route) that
+ * mutate picowal directly, bypassing /wal/'s JSON-schema validation. These
+ * raw-byte write routes always require credentials, independent of
+ * --oidc-cookie-auth: when cookie auth is enabled, the same X-PW-Auth
+ * header + valid session cookie gate as /wal/ mutations applies; otherwise
+ * a shared write token (--picowal-write-token / PICOWAL_WRITE_TOKEN) must
+ * be presented via X-PW-Write-Token. If no token has been configured,
+ * writes are refused outright (503) rather than defaulting open. Returns
+ * true if the caller may proceed; otherwise resp has already been filled
+ * in (401/403/503). */
+bool api_require_pw_auth(const char* cookie, size_t cookie_len,
+                          bool has_pw_auth_header,
+                          const char* write_token, size_t write_token_len,
+                          api_resp_t* resp) {
+    if (g_oidc_cookie_auth) {
+        if (!has_pw_auth_header) {
+            resp_text_error(resp, 403, "Forbidden", "missing X-PW-Auth header\n");
+            return false;
+        }
+        return auth_require_cookie(cookie, cookie_len, resp);
+    }
+    if (g_write_token_len == 0) {
+        resp_text_error(resp, 503, "Service Unavailable",
+                        "raw picowal writes are disabled: configure --picowal-write-token "
+                        "or enable --oidc-cookie-auth\n");
+        return false;
+    }
+    if (!write_token || write_token_len == 0 ||
+        !token_equal_ct(write_token, write_token_len, g_write_token, g_write_token_len)) {
+        resp_text_error(resp, 401, "Unauthorized", "missing or invalid X-PW-Write-Token header\n");
         return false;
     }
     return true;
@@ -2191,10 +2257,27 @@ void api_dispatch(http_method_t method,
                   const char* body, size_t body_len,
                   const char* cookie, size_t cookie_len,
                   bool has_pw_auth_header,
+                  const char* write_token, size_t write_token_len,
                   const api_request_context_t* req_ctx,
                   api_resp_t* resp) {
     (void)req_ctx;
     memset(resp, 0, sizeof(*resp));
+    if (api_blob_path_matches(path, path_len)) {
+        api_blob_dispatch(method, path, path_len, body, body_len, resp);
+        return;
+    }
+    if (static_pack_path_matches(path, path_len)) {
+        static_pack_dispatch(method, path, path_len, body, body_len,
+                             cookie, cookie_len, has_pw_auth_header,
+                             write_token, write_token_len, resp);
+        return;
+    }
+    if (pico_route_path_matches(path, path_len)) {
+        pico_route_dispatch(method, path, path_len, body, body_len,
+                            cookie, cookie_len, has_pw_auth_header,
+                            write_token, write_token_len, resp);
+        return;
+    }
     if (method == M_OPTIONS) {
         if ((g_picowal_enabled &&
              path_len >= g_picowal_prefix_len &&

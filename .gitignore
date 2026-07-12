@@ -5,4 +5,5 @@ src/*.o
 *.o
 *.dSYM
 *.log
+*.d
 /tmp/

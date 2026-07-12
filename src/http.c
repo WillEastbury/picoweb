@@ -224,6 +224,9 @@ http_result_t http_parse(char* buf, size_t buf_len, http_request_t* out) {
         case 16:
             if (metal_ieq(p, 16, "X-Forwarded-User", 16)) {
                 set_principal_header(out, tval, tl);
+            } else if (metal_ieq(p, 16, "X-PW-Write-Token", 16)) {
+                out->write_token = tval;
+                out->write_token_len = tl;
             }
             break;
         case 17:

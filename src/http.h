@@ -37,6 +37,8 @@ typedef struct {
     const char* cookie;          /* raw Cookie header value (points into buf) */
     size_t cookie_len;
     bool   pw_auth_header;       /* X-PW-Auth: 1 */
+    const char* write_token;     /* raw X-PW-Write-Token header value */
+    size_t write_token_len;
     const char* origin;          /* raw Origin header value (points into buf) */
     size_t origin_len;
     const char* acr_headers;     /* Access-Control-Request-Headers value */

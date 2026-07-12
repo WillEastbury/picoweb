@@ -45,11 +45,11 @@ USERSPACE_TLS_SRC := \
 	userspace/tls/engine.c \
 	userspace/tls/ticket_store.c
 
-ALL_SRC := $(wildcard src/*.c)
+ALL_SRC := $(wildcard src/*.c) $(wildcard src/pico/*.c)
 # Old AF_PACKET/AF_XDP TLS server is preserved in the tree but excluded
 # from the build. The kernel-socket TLS server (server_tls_kernel.c) is
 # the one path that defines tls_worker_main in the default binary.
-SRC := $(filter-out src/server_tls.c,$(ALL_SRC)) $(USERSPACE_TLS_SRC)
+SRC := $(filter-out src/server_tls.c src/pico/picocompress.c,$(ALL_SRC)) $(USERSPACE_TLS_SRC)
 OBJ := $(SRC:.c=.o)
 DEP := $(OBJ:.o=.d)
 BIN := picoweb

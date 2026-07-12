@@ -239,6 +239,7 @@ static void try_accept(int listen_fd, int ep, pool_t* pool, int64_t batch_now_ms
         conn->api_principal_len = 0;
         conn->api_tenant_len = 0;
         conn->api_has_pw_auth = false;
+        conn->api_write_token_len = 0;
         conn->api_path_len = 0;
         conn->last_active_ms = batch_now_ms;
 
@@ -450,6 +451,7 @@ static void api_run(conn_t* c) {
                  body, body_len,
                  c->api_cookie, c->api_cookie_len,
                  c->api_has_pw_auth,
+                 c->api_write_token, c->api_write_token_len,
                  &req_ctx,
                  &c->api_resp);
     api_apply_request_context_headers(&c->api_resp, &req_ctx);
@@ -519,6 +521,7 @@ static __attribute__((hot)) int dispatch_one(conn_t* c, const jumptable_t* jt, u
         c->api_body_needed  = (uint16_t)req.content_length;
         c->api_has_pw_auth  = req.pw_auth_header;
         c->api_cookie_len   = 0;
+        c->api_write_token_len = 0;
         c->api_host_len = 0;
         c->api_origin_len = 0;
         c->api_acr_headers_len = 0;
@@ -534,6 +537,12 @@ static __attribute__((hot)) int dispatch_one(conn_t* c, const jumptable_t* jt, u
             memcpy(c->api_cookie, req.cookie, req.cookie_len);
             c->api_cookie[req.cookie_len] = '\0';
             c->api_cookie_len = (uint16_t)req.cookie_len;
+        }
+        if (req.write_token && req.write_token_len > 0 &&
+            req.write_token_len < sizeof(c->api_write_token)) {
+            memcpy(c->api_write_token, req.write_token, req.write_token_len);
+            c->api_write_token[req.write_token_len] = '\0';
+            c->api_write_token_len = (uint16_t)req.write_token_len;
         }
         if (req.host && req.host_len > 0) {
             if (req.host_len >= sizeof(c->api_host)) {

@@ -43,6 +43,8 @@
 #include "../userspace/tls/engine.h"
 #include "../userspace/tls/pem.h"
 #include "../userspace/tls/ticket_store.h"
+#include "api.h"
+#include "api_blob.h"
 #include "http.h"
 #include "metrics.h"
 #include "tls_bridge.h"
@@ -98,6 +100,10 @@ typedef struct {
 
     int             ticket_emitted;
     int             want_close;     /* HTTP signalled close; finish TX then exit */
+
+    api_resp_t      api_resp;       /* scratch space for api_blob responses;
+                                      * released at the start of each new
+                                      * dispatch and on connection close. */
 } kconn_t;
 
 struct tls_kworker {
@@ -351,6 +357,7 @@ static void kconn_init(kconn_t* c, tls_kworker_t* w, int fd, int64_t now_ms) {
     c->plain_len      = 0;
     c->ticket_emitted = 0;
     c->want_close     = 0;
+    memset(&c->api_resp, 0, sizeof(c->api_resp));
     tls_bridge_init(&c->bridge, w->cfg->jt);
     pw_tls_engine_init(&c->eng);
     if (pw_tls_engine_configure_server(&c->eng, rng_fill, NULL,
@@ -381,6 +388,8 @@ static void kconn_close(tls_kworker_t* w, kconn_t* c) {
      * struct is reused; pw_tls_engine_init will reset internal state
      * when this slot is next allocated. */
     memset(&c->eng, 0, sizeof(c->eng));
+    api_resp_release(&c->api_resp);
+    memset(&c->api_resp, 0, sizeof(c->api_resp));
     c->state = KCONN_FREE;
     c->plain_len = 0;
     c->incomplete_started_ms = 0;
@@ -394,10 +403,57 @@ static void kconn_close(tls_kworker_t* w, kconn_t* c) {
  * legacy/ and we want this file to compile on its own.
  * ----------------------------------------------------------------- */
 
+/* Serves api_blob requests (POST/GET/HEAD/DELETE under the configured
+ * blob prefix). Mirrors server.c's api_run() finalisation: head lives
+ * inline in api_resp_t (valid as long as c->api_resp is), body (if any)
+ * is heap-owned and released at the *start* of the next dispatch on
+ * this connection (or on close) rather than immediately after seal,
+ * since pw_tls_app_seal_iov() copies the iov bytes synchronously
+ * before this function returns. Blob responses always close the
+ * connection, matching api.c's own behaviour for non-idempotent /
+ * binary-payload routes. */
+static int build_blob_response_iov(kconn_t* c, http_request_t* req,
+                                    pw_iov_t* out, unsigned* out_n,
+                                    bool* out_close_after) {
+    api_resp_release(&c->api_resp);
+    memset(&c->api_resp, 0, sizeof(c->api_resp));
+
+    const char* body = (req->content_length > 0)
+        ? (const char*)c->plain + req->consumed
+        : NULL;
+    api_blob_dispatch(req->method, req->path, req->path_len,
+                       body, req->content_length, &c->api_resp);
+
+    /* Unlike server.c's api.c response builders (which end head with a
+     * single "\r\n" and rely on a separate conn-tail iov to append the
+     * Connection header + blank line), api_blob.c's blob_resp_* helpers
+     * already self-terminate head with the blank line via
+     * blob_resp_finish_head(). Do NOT append CONN_CLOSE here or it will
+     * land in the body instead of the header block. */
+    unsigned n = 0;
+    out[n++] = (pw_iov_t){
+        .base = (const uint8_t*)c->api_resp.head,
+        .len  = c->api_resp.head_len
+    };
+    if (req->method != M_HEAD && c->api_resp.body && c->api_resp.body_len) {
+        out[n++] = (pw_iov_t){
+            .base = (const uint8_t*)c->api_resp.body,
+            .len  = c->api_resp.body_len
+        };
+    }
+
+    *out_n = n;
+    *out_close_after = true;
+    return 0;
+}
+
 static int build_http_response_iov(kconn_t* c,
                                    http_result_t pr, http_request_t* req,
                                    pw_iov_t* out, unsigned* out_n,
                                    bool* out_close_after) {
+    if (pr == HTTP_OK && api_blob_path_matches(req->path, req->path_len)) {
+        return build_blob_response_iov(c, req, out, out_n, out_close_after);
+    }
     tls_kworker_t* w = c->w;
     bool close_after = false, head_only = false;
     const resource_t* r = http_select(w->cfg->jt, pr, req, &close_after, &head_only);
@@ -617,6 +673,25 @@ static int tls_drive_engine(kconn_t* c, bool* out_close_after_drain) {
 
             http_request_t req = b->req;
             http_result_t  pr  = (prc == 1) ? HTTP_OK : b->parse_status;
+
+            /* http_parse() only waits for end-of-headers; api_blob
+             * requests (POST especially) may still have body bytes
+             * in flight. Wait for the full body before dispatching,
+             * same as server.c's epoll path does for api routes. */
+            if (pr == HTTP_OK && api_blob_path_matches(req.path, req.path_len)) {
+                if (req.content_length > API_REQ_BODY_CAP) {
+                    pr = HTTP_ERR_413;
+                } else {
+                    size_t need = req.consumed + req.content_length;
+                    if (c->plain_len < need) {
+                        if (c->incomplete_started_ms == 0) {
+                            c->incomplete_started_ms = metal_now_ms();
+                        }
+                        break;     /* wait for the rest of the body */
+                    }
+                }
+            }
+
             pw_iov_t resp[PW_IOV_MAX_FRAGS];
             unsigned rn = 0;
             if (build_http_response_iov(c, pr, &req, resp, &rn, &close_after) != 0) {
@@ -643,10 +718,17 @@ static int tls_drive_engine(kconn_t* c, bool* out_close_after_drain) {
             }
 
             if (pr == HTTP_OK && req.consumed > 0 && c->plain_len > req.consumed) {
-                size_t left = c->plain_len - req.consumed;
-                memmove(c->plain, c->plain + req.consumed, left);
-                c->plain_len = left;
-                c->incomplete_started_ms = metal_now_ms();
+                size_t total_consumed = req.consumed +
+                    (api_blob_path_matches(req.path, req.path_len) ? req.content_length : 0);
+                if (c->plain_len > total_consumed) {
+                    size_t left = c->plain_len - total_consumed;
+                    memmove(c->plain, c->plain + total_consumed, left);
+                    c->plain_len = left;
+                    c->incomplete_started_ms = metal_now_ms();
+                } else {
+                    c->plain_len = 0;
+                    c->incomplete_started_ms = 0;
+                }
             } else {
                 c->plain_len = 0;
                 c->incomplete_started_ms = 0;

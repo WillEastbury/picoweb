@@ -282,6 +282,62 @@ Safety knobs:
 
 ---
 
+## Static content and dynamic routes straight from picowal
+
+Two more optional route types serve content directly out of a picowal card,
+bypassing the on-disk `wwwroot` tree and the `/wal/` JSON-schema pipeline
+entirely (both operate on raw bytes):
+
+- **static content**: `--picowal-static-card=N [--picowal-static-prefix=/site/]`
+  - `GET/HEAD /{prefix}{record}[.ext]` returns the raw bytes stored at
+    `(card, record)`; an omitted record segment means record `0`; the
+    optional `.ext` suffix drives `Content-Type` via MIME sniffing (falls
+    back to `application/octet-stream`)
+  - `PUT /{prefix}{record}[.ext]` writes the request body verbatim to
+    `(card, record)` — no JSON validation, any byte content is accepted
+  - `DELETE /{prefix}{record}[.ext]` removes the record (`404` if absent)
+- **dynamic PicoScript routes**: `--picowal-code-card=N [--picowal-code-prefix=/app/]`
+  - the code card's record `0` holds a compiled PicoScript bytecode program
+    (see `picoscript_build.py emit --as bytecode --hex`, then pack the hex
+    words little-endian into a raw binary — there is no raw-binary emit
+    mode yet)
+  - `GET/HEAD/POST/... /{prefix}...` (any method except the bare-prefix
+    `PUT` below) re-fetches, re-verifies (`pv_verify`), and executes the
+    bytecode against the request on every call — no restart needed to pick
+    up newly deployed code; the program controls its own routing via
+    `Req.Path()`/`Req.Method()` and reads/writes storage via `Storage.*`
+    hooks bridged to the configured picowal volume
+  - `PUT /{prefix}` (bare prefix, no trailing path segment) deploys new
+    bytecode: the raw body is verified with `pv_verify` before being
+    written to record `0`; malformed bytecode is rejected with `400`
+    instead of being persisted
+
+Both PUT/DELETE write paths always require credentials — there is no
+unauthenticated default here, unlike the rest of picoweb's non-`/wal/`
+surface:
+
+- when `--oidc-cookie-auth` is enabled, the same `X-PW-Auth: 1` header +
+  valid session cookie that `/wal/` mutations require applies;
+- otherwise, a shared secret configured via `--picowal-write-token=TOK`
+  (or the `PICOWAL_WRITE_TOKEN` environment variable) must be presented in
+  the `X-PW-Write-Token` header, compared with a constant-time check;
+- if neither OIDC auth nor a write token is configured, these routes
+  refuse all writes with `503 Service Unavailable` rather than defaulting
+  open — a startup warning is logged in that case.
+
+Example:
+
+```sh
+./picoweb --picowal-device=/mnt/picowal/wal.img --picowal-format \
+          --picowal-bytes=1073741824 \
+          --picowal-static-card=5 --picowal-static-prefix=/site/ \
+          --picowal-code-card=6 --picowal-code-prefix=/app/ \
+          --picowal-write-token=change-me-to-a-real-secret \
+          8080 wwwroot
+```
+
+---
+
 ## Performance flags
 
 picoweb is built around **calculation hit at startup, pointer copies at runtime**.

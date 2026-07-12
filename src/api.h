@@ -28,6 +28,7 @@
 #include <stdint.h>
 
 #include "http.h"  /* http_method_t */
+#include "picowal_db.h"  /* picowal_db_t */
 
 /* Caps. These are tuned so a request body fits inside METAL_READ_BUF
  * after typical request headers (~1.5KB). Bumping these requires a
@@ -71,6 +72,34 @@ bool api_path_matches(const char* path, size_t path_len);
 bool api_enabled(void);
 bool api_picowal_enabled(void);
 
+/* Accessor for the picowal_db_t handle opened by api_picowal_init(), so
+ * other modules (static_pack, pico_route) can share the same open volume
+ * instead of opening a second handle to the same device/file. Returns
+ * NULL if picowal hasn't been initialised. */
+picowal_db_t* api_picowal_db(void);
+
+/* Shared write-gate for non-/wal/ modules (static_pack, pico_route) that
+ * mutate picowal directly, bypassing /wal/'s JSON-schema validation.
+ * These raw-byte write routes always require credentials, independent of
+ * --oidc-cookie-auth:
+ *   - if --oidc-cookie-auth is enabled, the normal X-PW-Auth header +
+ *     valid session cookie gate applies (same as /wal/ mutations);
+ *   - otherwise, a shared write token configured via --picowal-write-token
+ *     (or PICOWAL_WRITE_TOKEN env var) must be presented in the
+ *     X-PW-Write-Token header. If no token has been configured at all,
+ *     these routes refuse all writes (503) rather than defaulting open.
+ * Returns true if the caller may proceed; on false, resp has already been
+ * filled in with a 401/403/503. */
+bool api_require_pw_auth(const char* cookie, size_t cookie_len,
+                          bool has_pw_auth_header,
+                          const char* write_token, size_t write_token_len,
+                          api_resp_t* resp);
+
+/* Configure the shared write token checked by api_require_pw_auth when
+ * --oidc-cookie-auth is not enabled. Pass NULL/empty to disable (any raw
+ * write is then refused with 503 until a token is set). */
+void api_set_write_token(const char* token);
+
 /* Largest request body the API will accept. Useful for the dispatcher
  * to short-circuit oversize uploads before reading them. */
 size_t api_max_request_body(void);
@@ -110,6 +139,7 @@ void api_dispatch(http_method_t method,
                   const char* body, size_t body_len,
                   const char* cookie, size_t cookie_len,
                   bool has_pw_auth_header,
+                  const char* write_token, size_t write_token_len,
                   const api_request_context_t* req_ctx,
                   api_resp_t* resp);
 
