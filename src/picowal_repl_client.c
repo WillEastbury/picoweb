@@ -9,20 +9,31 @@
 
 #include <arpa/inet.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <netdb.h>
+#include <poll.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 #define REPL_HOST_MAX   256
 #define REPL_PATH_MAX   256
 #define REPL_TOKEN_MAX  128
 #define REPL_POLL_IDLE_MS   250   /* sleep between polls once caught up */
-#define REPL_RETRY_MS       2000  /* sleep after a connect/parse failure */
+#define REPL_RETRY_MS       2000  /* sleep after a connect/parse/timeout failure */
 #define REPL_RESP_HEAD_MAX  4096  /* status line + headers */
+#define REPL_CONNECT_TIMEOUT_MS  5000  /* bound TCP handshake against a
+                                          black-holed/firewalled primary */
+#define REPL_IO_TIMEOUT_MS       10000 /* bound each send()/recv() against a
+                                          primary that accepts but never
+                                          responds (or stalls mid-response) --
+                                          without this a single unresponsive
+                                          primary wedges the poller thread
+                                          forever with no retry/log/recovery */
 
 typedef struct {
     char host[REPL_HOST_MAX];
@@ -87,7 +98,10 @@ static bool parse_primary_url(const char* url, repl_client_ctx_t* ctx) {
     return true;
 }
 
-/* Connects to ctx->host:ctx->port. Returns a connected fd, or -1. */
+/* Connects to ctx->host:ctx->port with a bounded timeout (non-blocking
+ * connect + poll), then switches back to blocking mode with SO_RCVTIMEO/
+ * SO_SNDTIMEO set so every subsequent send()/recv() is also bounded.
+ * Returns a connected fd, or -1. */
 static int repl_connect(const repl_client_ctx_t* ctx) {
     char portstr[16];
     snprintf(portstr, sizeof(portstr), "%d", ctx->port);
@@ -102,9 +116,32 @@ static int repl_connect(const repl_client_ctx_t* ctx) {
     for (struct addrinfo* a = res; a; a = a->ai_next) {
         fd = socket(a->ai_family, a->ai_socktype, a->ai_protocol);
         if (fd < 0) continue;
-        if (connect(fd, a->ai_addr, a->ai_addrlen) == 0) break;
-        close(fd);
-        fd = -1;
+
+        int flags = fcntl(fd, F_GETFL, 0);
+        if (flags >= 0) fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+
+        int cr = connect(fd, a->ai_addr, a->ai_addrlen);
+        if (cr == 0) {
+            /* connected immediately (e.g. localhost) */
+        } else if (errno == EINPROGRESS) {
+            struct pollfd pfd = { .fd = fd, .events = POLLOUT };
+            int pr = poll(&pfd, 1, REPL_CONNECT_TIMEOUT_MS);
+            int soerr = 0; socklen_t solen = sizeof(soerr);
+            if (pr <= 0 || getsockopt(fd, SOL_SOCKET, SO_ERROR, &soerr, &solen) != 0 ||
+                soerr != 0) {
+                close(fd); fd = -1; continue;
+            }
+        } else {
+            close(fd); fd = -1; continue;
+        }
+
+        if (flags >= 0) fcntl(fd, F_SETFL, flags); /* restore blocking mode */
+        struct timeval tv;
+        tv.tv_sec = REPL_IO_TIMEOUT_MS / 1000;
+        tv.tv_usec = (REPL_IO_TIMEOUT_MS % 1000) * 1000;
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+        break;
     }
     freeaddrinfo(res);
     return fd;
