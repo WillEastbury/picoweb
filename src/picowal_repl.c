@@ -80,7 +80,7 @@ static void resp_text_error(api_resp_t* r, int status, const char* reason, const
 }
 
 /* Parses the decimal offset following the "stream/" path segment, e.g.
- * "stream/512" -> 512. Returns false (leaving *out unset) if absent or
+ * "stream/1024" -> 1024. Returns false (leaving *out unset) if absent or
  * malformed. Path-segment based (not a query string: http_parse() strips
  * '?...' before routing ever sees the path, so the offset travels as a
  * path component instead). */
@@ -149,8 +149,9 @@ void picowal_repl_dispatch(http_method_t method,
             resp_text_error(resp, 400, "Bad Request", "malformed stream/OFFSET\n");
             return;
         }
-        if ((from_off % 512) != 0 || from_off < 512) {
-            resp_text_error(resp, 400, "Bad Request", "from must be a multiple of 512, >= 512\n");
+        if ((from_off % PICOWAL_SECTOR_BYTES) != 0 || from_off < PICOWAL_DATA_START) {
+            resp_text_error(resp, 400, "Bad Request",
+                            "from must be a multiple of 512 and >= PICOWAL_DATA_START (1024)\n");
             return;
         }
 

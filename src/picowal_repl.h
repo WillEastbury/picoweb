@@ -18,11 +18,11 @@
  * "?..." query string before routing ever sees the request path, so an
  * offset passed as "?from=N" would never reach this handler.)
  *
- * `from` must be sector-aligned (512) and >= 512 (the superblock itself
- * is never streamed -- a replica formats its own volume on first sync).
- * A replica appends the returned bytes verbatim to its own copy of the
- * file at the same offset and calls picowal_db_repl_ingest() to replay
- * them into its local index.
+ * `from` must be sector-aligned (512) and >= PICOWAL_DATA_START (1024;
+ * the two-slot A/B superblock region is never streamed -- a replica
+ * formats its own volume on first sync). A replica appends the returned
+ * bytes verbatim to its own copy of the file at the same offset and calls
+ * picowal_db_repl_ingest() to replay them into its local index.
  *
  * Always gated by api_require_write_token() (a shared secret configured
  * via --picowal-write-token / PICOWAL_WRITE_TOKEN) -- this is a distinct,

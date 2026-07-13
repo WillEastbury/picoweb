@@ -16,10 +16,15 @@
 #include <sys/ioctl.h>
 #endif
 
-#define PICOWAL_SECTOR_SIZE 512ULL
+#define PICOWAL_SECTOR_SIZE PICOWAL_SECTOR_BYTES /* alias: public constant from picowal_db.h */
 #define PICOWAL_SUPER_MAGIC 0x50474157u /* "PWAL" */
 #define PICOWAL_REC_MAGIC   0x574c5231u /* "WLR1" */
-#define PICOWAL_SB_VERSION  1u
+#define PICOWAL_SB_VERSION  2u
+#define PICOWAL_SB_SLOTS    PICOWAL_SB_SLOT_COUNT /* A/B alternating superblock slots (sectors 0,1) */
+#define PICOWAL_SB_CHECKPOINT_INTERVAL 128u /* checkpoint cached write_off/next_seq
+                                               into the superblock every N appends,
+                                               bounding the tail-rescan on next open
+                                               to at most this many records */
 
 #define PICOWAL_REC_TOMBSTONE 0x01u
 
@@ -30,7 +35,13 @@ typedef struct __attribute__((packed)) {
     uint16_t version;
     uint16_t sector_size;
     uint64_t volume_bytes;
-    uint8_t reserved[496];
+    uint64_t generation;   /* monotonically increasing; higher generation wins
+                              when both A/B slots are otherwise valid */
+    uint64_t write_off;    /* cached log tail at last checkpoint */
+    uint64_t next_seq;     /* cached next record sequence at last checkpoint */
+    uint64_t checksum;     /* FNV-1a over the fields above; guards against a
+                              torn write to this slot */
+    uint8_t reserved[464];
 } picowal_superblock_t;
 
 typedef struct __attribute__((packed)) {
@@ -56,6 +67,8 @@ struct picowal_db {
     uint64_t volume_bytes;
     uint64_t write_off;
     uint64_t next_seq;
+    uint64_t sb_generation;         /* last superblock generation written/read */
+    uint32_t appends_since_checkpoint;
     bool read_only; /* true on a replica: reject local mutations with EROFS */
     pthread_mutex_t mu;
     picowal_index_entry_t* buckets[PICOWAL_INDEX_BUCKETS];
@@ -63,6 +76,8 @@ struct picowal_db {
 
 _Static_assert(sizeof(picowal_superblock_t) == PICOWAL_SECTOR_SIZE,
                "picowal superblock must be exactly one sector");
+_Static_assert(PICOWAL_DATA_START == PICOWAL_SB_SLOTS * PICOWAL_SECTOR_SIZE,
+               "PICOWAL_DATA_START (picowal_db.h) must match slot layout");
 
 static size_t bucket_idx(uint32_t key) {
     return (size_t)(metal_fnv1a(&key, sizeof(key)) & (PICOWAL_INDEX_BUCKETS - 1));
@@ -116,6 +131,62 @@ static uint64_t rec_checksum(uint32_t key, uint32_t len, uint32_t flags,
     h = metal_fnv1a_step(h, &seq, sizeof(seq));
     if (payload && len) h = metal_fnv1a_step(h, payload, len);
     return h;
+}
+
+static uint64_t sb_checksum(const picowal_superblock_t* sb) {
+    uint64_t h = metal_fnv1a_init();
+    h = metal_fnv1a_step(h, &sb->magic, sizeof(sb->magic));
+    h = metal_fnv1a_step(h, &sb->version, sizeof(sb->version));
+    h = metal_fnv1a_step(h, &sb->sector_size, sizeof(sb->sector_size));
+    h = metal_fnv1a_step(h, &sb->volume_bytes, sizeof(sb->volume_bytes));
+    h = metal_fnv1a_step(h, &sb->generation, sizeof(sb->generation));
+    h = metal_fnv1a_step(h, &sb->write_off, sizeof(sb->write_off));
+    h = metal_fnv1a_step(h, &sb->next_seq, sizeof(sb->next_seq));
+    return h;
+}
+
+/* True if this slot passes structural validation (magic/version/sector
+ * size/checksum) -- does NOT compare volume_bytes against a caller
+ * expectation, callers do that separately. */
+static bool sb_slot_valid(const picowal_superblock_t* sb) {
+    return sb->magic == PICOWAL_SUPER_MAGIC &&
+           sb->version == PICOWAL_SB_VERSION &&
+           sb->sector_size == PICOWAL_SECTOR_SIZE &&
+           sb->volume_bytes >= PICOWAL_DATA_START &&
+           sb->write_off >= PICOWAL_DATA_START &&
+           sb->write_off <= sb->volume_bytes &&
+           sb->next_seq >= 1 &&
+           sb_checksum(sb) == sb->checksum;
+}
+
+/* Writes the next-generation superblock into whichever slot is NOT the
+ * currently-active one (A/B alternation), so a crash mid-write always
+ * leaves the other slot's previous, still-valid generation intact.
+ * Best-effort: failure here never loses committed record data, it only
+ * means the next open falls back to scanning further from the last
+ * successful checkpoint (or from PICOWAL_DATA_START if none ever
+ * succeeded). Caller must hold db->mu. */
+static bool write_superblock_locked(picowal_db_t* db) {
+    if (db->fd < 0) return false;
+    uint64_t generation = db->sb_generation + 1;
+    uint64_t slot = generation % PICOWAL_SB_SLOTS;
+
+    picowal_superblock_t sb;
+    memset(&sb, 0, sizeof(sb));
+    sb.magic = PICOWAL_SUPER_MAGIC;
+    sb.version = PICOWAL_SB_VERSION;
+    sb.sector_size = PICOWAL_SECTOR_SIZE;
+    sb.volume_bytes = db->volume_bytes;
+    sb.generation = generation;
+    sb.write_off = db->write_off;
+    sb.next_seq = db->next_seq;
+    sb.checksum = sb_checksum(&sb);
+
+    if (pwrite_full(db->fd, &sb, sizeof(sb), slot * PICOWAL_SECTOR_SIZE) != 0) return false;
+    if (fdatasync(db->fd) != 0) return false;
+    db->sb_generation = generation;
+    db->appends_since_checkpoint = 0;
+    return true;
 }
 
 static void clear_index(picowal_db_t* db) {
@@ -202,13 +273,22 @@ static bool load_or_format(picowal_db_t* db, const char* path,
 #endif
     }
 
-    picowal_superblock_t sb;
-    memset(&sb, 0, sizeof(sb));
-    bool have_sb = (pread_full(fd, &sb, sizeof(sb), 0) == 0) &&
-                   (sb.magic == PICOWAL_SUPER_MAGIC) &&
-                   (sb.version == PICOWAL_SB_VERSION) &&
-                   (sb.sector_size == PICOWAL_SECTOR_SIZE) &&
-                   (sb.volume_bytes >= PICOWAL_SECTOR_SIZE);
+    picowal_superblock_t sb0, sb1;
+    memset(&sb0, 0, sizeof(sb0));
+    memset(&sb1, 0, sizeof(sb1));
+    bool have0 = (pread_full(fd, &sb0, sizeof(sb0), 0 * PICOWAL_SECTOR_SIZE) == 0) && sb_slot_valid(&sb0);
+    bool have1 = (pread_full(fd, &sb1, sizeof(sb1), 1 * PICOWAL_SECTOR_SIZE) == 0) && sb_slot_valid(&sb1);
+
+    /* A/B alternating superblock: pick whichever valid slot has the higher
+     * generation -- this is exactly what makes a crash mid-checkpoint-write
+     * safe. A torn write to one slot fails its own checksum and is simply
+     * ignored in favor of the other, still-intact slot from the previous
+     * generation. */
+    bool have_sb = have0 || have1;
+    picowal_superblock_t* winner = NULL;
+    if (have0 && have1) winner = (sb0.generation >= sb1.generation) ? &sb0 : &sb1;
+    else if (have0) winner = &sb0;
+    else if (have1) winner = &sb1;
 
     bool should_format = format;
     if (!have_sb) {
@@ -222,34 +302,64 @@ static bool load_or_format(picowal_db_t* db, const char* path,
             }
         }
     } else {
-        if (want_bytes > 0 && want_bytes != sb.volume_bytes) {
+        if (want_bytes > 0 && want_bytes != winner->volume_bytes) {
             close(fd);
             errno = EINVAL;
             return false;
         }
-        want_bytes = sb.volume_bytes;
+        want_bytes = winner->volume_bytes;
     }
+
+    uint64_t init_generation = 0, init_write_off = PICOWAL_DATA_START, init_next_seq = 1;
 
     if (should_format) {
         if (S_ISREG(st.st_mode) && ftruncate(fd, (off_t)want_bytes) != 0) {
             close(fd);
             return false;
         }
+        picowal_superblock_t sb;
         memset(&sb, 0, sizeof(sb));
         sb.magic = PICOWAL_SUPER_MAGIC;
         sb.version = PICOWAL_SB_VERSION;
         sb.sector_size = PICOWAL_SECTOR_SIZE;
         sb.volume_bytes = want_bytes;
-        if (pwrite_full(fd, &sb, sizeof(sb), 0) != 0 || fdatasync(fd) != 0) {
+        sb.generation = 1;
+        sb.write_off = PICOWAL_DATA_START;
+        sb.next_seq = 1;
+        sb.checksum = sb_checksum(&sb);
+        /* Both slots start identical and valid -- there's no "torn write"
+         * risk yet since this is the initial format, but writing both now
+         * means the very first real checkpoint already has a well-formed
+         * predecessor slot to fall back to if it's interrupted. */
+        if (pwrite_full(fd, &sb, sizeof(sb), 0 * PICOWAL_SECTOR_SIZE) != 0 ||
+            pwrite_full(fd, &sb, sizeof(sb), 1 * PICOWAL_SECTOR_SIZE) != 0 ||
+            fdatasync(fd) != 0) {
             close(fd);
             return false;
+        }
+        init_generation = 1;
+        init_write_off = PICOWAL_DATA_START;
+        init_next_seq = 1;
+    } else {
+        /* Resume from the winning slot's checkpoint. Defensive clamp: if
+         * the cached values are somehow out of range (shouldn't happen,
+         * sb_slot_valid() already checked bounds) fall back to a full
+         * rescan from PICOWAL_DATA_START rather than trusting bad data. */
+        init_generation = winner->generation;
+        init_write_off = winner->write_off;
+        init_next_seq = winner->next_seq;
+        if (init_write_off < PICOWAL_DATA_START || init_write_off > want_bytes) {
+            init_write_off = PICOWAL_DATA_START;
+            init_next_seq = 1;
         }
     }
 
     db->fd = fd;
     db->volume_bytes = want_bytes;
-    db->write_off = PICOWAL_SECTOR_SIZE;
-    db->next_seq = 1;
+    db->write_off = init_write_off;
+    db->next_seq = init_next_seq;
+    db->sb_generation = init_generation;
+    db->appends_since_checkpoint = 0;
     return true;
 }
 
@@ -296,10 +406,21 @@ static bool scan_range_locked(picowal_db_t* db, uint64_t start_off, uint64_t sto
 }
 
 static bool scan_volume(picowal_db_t* db) {
+    /* IMPORTANT: this must always rebuild the FULL in-memory index from
+     * PICOWAL_DATA_START, not resume from the cached checkpoint. The
+     * checkpoint only tells us the log's *tail* position/next_seq -- it
+     * says nothing about where every other key's latest record lives, and
+     * picowal_db_open() clears the whole hash index before calling this.
+     * Skipping the pre-checkpoint span would silently lose every key
+     * whose newest record predates the last checkpoint. The superblock
+     * checkpoint is used elsewhere (crash-safe write_off/next_seq
+     * recovery, sanity-checking the log tail) but NOT to shortcut index
+     * construction -- that would require also persisting/snapshotting the
+     * index itself, which this design does not do. */
     uint64_t end = 0, max_seq = 0;
-    if (!scan_range_locked(db, PICOWAL_SECTOR_SIZE, db->volume_bytes, &end, &max_seq)) return false;
+    if (!scan_range_locked(db, PICOWAL_DATA_START, db->volume_bytes, &end, &max_seq)) return false;
     db->write_off = end;
-    db->next_seq = max_seq + 1;
+    if (max_seq + 1 > db->next_seq) db->next_seq = max_seq + 1;
     return true;
 }
 
@@ -346,6 +467,16 @@ static int append_record_locked(picowal_db_t* db, uint32_t key,
         return -1;
     }
     db->write_off += span;
+
+    /* Periodic checkpoint: cache write_off/next_seq into the superblock
+     * (A/B alternating) so the next open only has to rescan the last
+     * <= PICOWAL_SB_CHECKPOINT_INTERVAL records instead of the whole log.
+     * Best-effort -- a failed checkpoint doesn't affect durability of the
+     * record just appended (already fdatasync'd above), it only means the
+     * next open falls back to scanning a bit further. */
+    if (++db->appends_since_checkpoint >= PICOWAL_SB_CHECKPOINT_INTERVAL) {
+        write_superblock_locked(db);
+    }
     return 0;
 }
 
@@ -403,13 +534,16 @@ void picowal_db_close(picowal_db_t* db) {
     if (!db) return;
     pthread_mutex_lock(&db->mu);
     if (db->fd >= 0) {
+        write_superblock_locked(db); /* best-effort checkpoint for a fast next open */
         close(db->fd);
         db->fd = -1;
     }
     clear_index(db);
-    db->write_off = PICOWAL_SECTOR_SIZE;
+    db->write_off = PICOWAL_DATA_START;
     db->next_seq = 1;
     db->volume_bytes = 0;
+    db->sb_generation = 0;
+    db->appends_since_checkpoint = 0;
     pthread_mutex_unlock(&db->mu);
 }
 
@@ -556,7 +690,7 @@ void picowal_db_repl_status(picowal_db_t* db, uint64_t* out_write_off,
 int picowal_db_repl_read(picowal_db_t* db, uint64_t from_off,
                          void* out, uint32_t* inout_len) {
     if (!db || !out || !inout_len || (from_off % PICOWAL_SECTOR_SIZE) != 0 ||
-        from_off < PICOWAL_SECTOR_SIZE) {
+        from_off < PICOWAL_DATA_START) {
         errno = EINVAL;
         return -1;
     }
@@ -625,6 +759,11 @@ int picowal_db_repl_ingest(picowal_db_t* db, uint64_t at_off,
     db->write_off = end;
     if (max_seq + 1 > db->next_seq) db->next_seq = max_seq + 1;
     bool short_ingest = (end != at_off + len);
+    /* Checkpoint after every ingested batch (replicas typically ingest in
+     * larger bursts than the primary's per-key appends, so this is cheap
+     * relative to the batch, and keeps a replica's own reopen/promotion
+     * boot just as fast as the primary's). Best-effort. */
+    if (!short_ingest && len > 0) write_superblock_locked(db);
     pthread_mutex_unlock(&db->mu);
     if (short_ingest) {
         /* Wrote bytes but some tail failed validation (shouldn't happen

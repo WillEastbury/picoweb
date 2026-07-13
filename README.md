@@ -340,13 +340,30 @@ Example:
 
 ## Log replication (multi-reader / single-writer)
 
-picowal's on-disk log is a fixed 512-byte superblock followed by a
-strictly append-only, sector-aligned sequence of records — nothing is
-ever rewritten in place. That makes a raw byte-range copy of
-`[offset, write_off)` a complete, self-describing, independently
-replayable log segment, so physical replication needs no separate wire
-format: a replica just streams new bytes and replays them through the
-same record scanner used at boot/crash-recovery.
+picowal's on-disk log is two alternating 512-byte superblock slots
+(sector 0 and 1, A/B-versioned by a generation counter — see below)
+followed by a strictly append-only, sector-aligned sequence of records
+starting at byte 1024 — nothing is ever rewritten in place. That makes a
+raw byte-range copy of `[offset, write_off)` a complete, self-describing,
+independently replayable log segment, so physical replication needs no
+separate wire format: a replica just streams new bytes and replays them
+through the same record scanner used at boot/crash-recovery.
+
+**On-disk header (A/B alternating superblock).** Rather than a single
+mutable superblock sector (which would risk a torn/half-written header if
+the process crashes mid-update), the header is two slots that take turns:
+each checkpoint write goes to whichever slot is *not* currently active and
+carries a monotonically increasing generation number plus a checksum. On
+open, whichever slot has a valid checksum **and** the higher generation
+wins; a torn write to one slot just fails its own checksum and is ignored
+in favor of the other, still-intact slot. Each slot also caches the log's
+`write_off`/`next_seq` at the time of that checkpoint (written after every
+`PICOWAL_SB_CHECKPOINT_INTERVAL` (128) appends, on every replicated-batch
+ingest, and on clean shutdown) — this is used to sanity-check/bound the
+log-tail scan on reopen, not to skip rebuilding the in-memory key index
+(which is always fully rebuilt from the start of the log on open — the
+index itself isn't persisted, so this is a crash-safety and bookkeeping
+improvement rather than a full-scan-avoidance optimization).
 
 **Primary side** — `--picowal-repl` (or `--picowal-repl-prefix=/p/`,
 which implies it) exposes:

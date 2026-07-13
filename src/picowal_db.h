@@ -11,6 +11,18 @@
 #define PICOWAL_DEFAULT_VOLUME_BYTES (1ULL << 30) /* 1 GiB */
 #define PICOWAL_REPL_CHUNK_MAX       (4U * 1024U * 1024U) /* max bytes per repl fetch */
 
+/* On-disk header layout: two alternating 512-byte superblock slots
+ * (sector 0 and sector 1), each carrying a generation counter, a cached
+ * write_off/next_seq checkpoint, and a checksum. Every checkpoint write
+ * goes to whichever slot is NOT the currently-active one and bumps the
+ * generation; on open, whichever valid slot has the higher generation
+ * wins. This makes a crash mid-checkpoint safe (the torn slot just fails
+ * its own checksum and is ignored) without ever risking the *only* copy
+ * of the metadata being half-written. Log data begins at sector 2. */
+#define PICOWAL_SECTOR_BYTES         512ULL
+#define PICOWAL_SB_SLOT_COUNT        2ULL
+#define PICOWAL_DATA_START           (PICOWAL_SB_SLOT_COUNT * PICOWAL_SECTOR_BYTES)
+
 typedef struct picowal_db picowal_db_t;
 
 picowal_db_t* picowal_db_create(void);
@@ -32,12 +44,16 @@ void picowal_db_set_read_only(picowal_db_t* db, bool read_only);
 
 /* --- Replication primitives ---
  * picowal's on-disk format is a sector-aligned, append-only log with a
- * fixed 512-byte superblock: every mutation is a new record appended at
- * write_off, never an in-place rewrite. That makes raw byte-range
- * streaming of [some_offset, write_off) a complete, self-describing
- * physical replication feed -- a replica just needs to append those same
- * bytes to its own copy of the file and re-run the same record-parsing
- * logic used at startup (scan_volume) over the newly-appended span. */
+ * two-slot alternating superblock (see PICOWAL_DATA_START above): every
+ * mutation is a new record appended at write_off, never an in-place
+ * rewrite. That makes raw byte-range streaming of [some_offset,
+ * write_off) a complete, self-describing physical replication feed -- a
+ * replica just needs to append those same bytes to its own copy of the
+ * file and re-run the same record-parsing logic used at startup
+ * (scan_volume) over the newly-appended span. write_off/next_seq are also
+ * periodically checkpointed into the superblock so a replica's (or the
+ * primary's) own reopen after a clean or unclean restart doesn't need to
+ * rescan the whole log, only the tail since the last checkpoint. */
 
 /* Thread-safe snapshot of current log position/generation, for a
  * replication primary to report to a replica. */
