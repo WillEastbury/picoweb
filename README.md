@@ -548,6 +548,86 @@ trusting a promoted node's writes as authoritative.
 
 ---
 
+## Virtual-partition ownership routing & the query/report gateway (`--picowal-partition-nodes`)
+
+On top of the single-writer replication/gossip model above, picowal can
+also be run as a **horizontally-sharded cluster**: a fixed pool of nodes
+that each own a disjoint slice of the record space, so writes for a
+given tenant scale across multiple independent volumes instead of a
+single primary. This is orthogonal to (and can be combined with)
+replication — each node in the partition pool is its own independent
+picowal volume; partitioning decides *which* node a given record lives
+on, not how that node protects its own data.
+
+### Ownership: 1000 virtual partitions, rendezvous (HRW) hashing
+
+```sh
+./picoweb --picowal-device=/var/lib/picowal --picowal-format \
+          --picowal-write-token=change-me \
+          --picowal-node-id=10.0.0.1:8080 \
+          --picowal-partition-nodes=10.0.0.1:8080,10.0.0.2:8080,10.0.0.3:8080 \
+          --picowal-partition-mode=redirect \
+          8080 ./www 4 200
+```
+
+- `--picowal-partition-nodes=ID1,ID2,...` — the fixed node pool (reuses
+  `--picowal-node-id` for this node's own identity).
+- `--picowal-partition-tenant-map=` (optional) — per-tenant subsets of
+  the pool, for multi-tenant clusters that don't want every tenant
+  spread across every node; a tenant absent from the map falls back to
+  the full global pool.
+- `--picowal-partition-mode=redirect|proxy` (default `redirect`) —
+  what a non-owner node does with a write for a record it doesn't own:
+  `redirect` returns `307` + `X-PW-Partition-Owner: host:port` for the
+  client to retry against directly; `proxy` transparently forwards the
+  request over HTTP and relays the owner's response back (adding
+  `X-PW-Proxied-From`), so clients never need partition awareness.
+
+Each record's virtual partition is `hash(key) mod 1000`; each virtual
+partition's owner is the pool node that wins rendezvous (HRW) hashing
+over `(vpart, node_id)` — every node computes the same answer
+independently, with no coordination, gossip, or central directory
+required. (Rendezvous hashing means adding/removing a node only
+reshuffles the ~1/N share of partitions it's responsible for, not the
+whole keyspace.)
+
+### Query/report gateway: read across every shard from any node
+
+Because ownership is per-record, a full scan/query has no single
+owner — `POST /wal/query` and `POST /wal/report` therefore **fan out**
+to every node in the tenant's pool automatically whenever partitioning
+is enabled: the receiving node serves its own shard in-process, fetches
+every other node's shard over a plain HTTP round trip, and merges the
+per-shard `{"rows":[...],"count":N}` results into one response — so any
+node in the pool can be queried and will return the full, cluster-wide
+result set, not just its own local records. A shard that's unreachable
+is skipped rather than failing the whole request; the merged response
+then includes `"partial":true,"shards_ok":N,"shards_total":M` so
+callers can detect degraded (partial) results. The whole query only
+fails if every shard is unreachable.
+
+The `X-PW-Partition-Hop: 1` header (set automatically on the internal
+forwarded requests) stops a node that receives a forwarded query from
+fanning out a second time.
+
+There's no separate gateway process — every `picoweb` node can act as
+the entry point for a query and performs the fan-out/merge itself,
+using the exact same `--picowal-partition-nodes`/`--picowal-partition-tenant-map`
+configuration as the write-ownership routing above.
+
+```sh
+curl -H 'X-PW-Write-Token: ...' -X POST --data-binary $'S:id,name\nF:10' \
+     http://10.0.0.2:8080/wal/query
+# returns rows from ALL THREE nodes' volumes, merged, regardless of
+# which node the client happened to hit
+```
+
+See `test_picowal_partition.sh` for an end-to-end 3-node test covering
+ownership agreement, redirect/proxy write routing, and the query
+fan-out gateway.
+
+---
+
 ## Performance flags
 
 picoweb is built around **calculation hit at startup, pointer copies at runtime**.
