@@ -191,6 +191,12 @@ bool picowal_db_exists_key(picowal_db_t* db, uint32_t key);
 uint32_t picowal_db_list_records(picowal_db_t* db, uint16_t card,
                                  uint32_t* out_records, uint32_t max_records);
 
+/* Monotonically increasing counter bumped on every write to pack 1 (pack-
+ * name registry) or pack 2 (schema store). picowal_query.c uses this to
+ * cheaply invalidate its parsed-query cache when schema/pack metadata
+ * changes, without needing to track individual pack dependencies. */
+uint64_t picowal_db_schema_generation(picowal_db_t* db);
+
 /* --- Checkpointing ---
  * Folds every SEALED WAL segment's live (committed, non-tombstone,
  * latest-version) records into a freshly rewritten base.dat (atomic

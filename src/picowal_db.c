@@ -140,6 +140,10 @@ struct picowal_db {
     bool read_only;
     bool bg_started;
     volatile bool dirty_unsynced;
+    volatile uint64_t schema_gen; /* bumped on every write to pack 1 (name
+                                      registry) or pack 2 (schema store) so
+                                      picowal_query.c's parsed-query cache
+                                      can detect staleness cheaply */
 
     pthread_mutex_t mu;
     picowal_index_entry_t* buckets[PICOWAL_INDEX_BUCKETS];
@@ -437,6 +441,9 @@ static bool scan_file_range(picowal_db_t* db, int fd, uint32_t seg_id,
                     errno = ENOMEM;
                     return false;
                 }
+                uint16_t card = 0; uint32_t recid = 0;
+                picowal_db_unpack_key(pending[i].key, &card, &recid);
+                if (card == 1 || card == 2) db->schema_gen++;
             }
             pending_n = 0;
             last_committed_end = off;
@@ -1047,6 +1054,9 @@ int picowal_db_txn_commit(picowal_txn_t* txn, picowal_durability_t durability, b
     for (uint32_t i = 0; i < txn->op_count; i++) {
         index_upsert(db, txn->ops[i].key, txn->ops[i].seg_id, txn->ops[i].offset,
                     txn->ops[i].len, txn->ops[i].seq, txn->ops[i].tombstone);
+        uint16_t card = 0; uint32_t recid = 0;
+        picowal_db_unpack_key(txn->ops[i].key, &card, &recid);
+        if (card == 1 || card == 2) db->schema_gen++;
     }
     db->appends_since_checkpoint += txn->op_count;
     if (db->appends_since_checkpoint >= PICOWAL_SB_CHECKPOINT_INTERVAL) write_superblock_locked(db);
@@ -1098,6 +1108,11 @@ int picowal_db_put_key_dur(picowal_db_t* db, uint32_t key, const void* data, uin
     index_upsert(db, key, seg_id, offset, len, seq, false);
     if (++db->appends_since_checkpoint >= PICOWAL_SB_CHECKPOINT_INTERVAL) write_superblock_locked(db);
     uint64_t tail = db->leading_write_off;
+    {
+        uint16_t card = 0; uint32_t rec = 0;
+        picowal_db_unpack_key(key, &card, &rec);
+        if (card == 1 || card == 2) db->schema_gen++;
+    }
     pthread_mutex_unlock(&db->mu);
 
     if (durability == PICOWAL_DURABILITY_REPLICATED) wait_for_ack_quorum(db, seg_id, tail, out_replicated);
@@ -1125,6 +1140,11 @@ int picowal_db_delete_key_dur(picowal_db_t* db, uint32_t key,
     index_upsert(db, key, seg_id, offset, 0, seq, true);
     if (++db->appends_since_checkpoint >= PICOWAL_SB_CHECKPOINT_INTERVAL) write_superblock_locked(db);
     uint64_t tail = db->leading_write_off;
+    {
+        uint16_t card = 0; uint32_t rec = 0;
+        picowal_db_unpack_key(key, &card, &rec);
+        if (card == 1 || card == 2) db->schema_gen++;
+    }
     pthread_mutex_unlock(&db->mu);
 
     if (durability == PICOWAL_DURABILITY_REPLICATED) wait_for_ack_quorum(db, seg_id, tail, out_replicated);
@@ -1137,6 +1157,11 @@ int picowal_db_put_key(picowal_db_t* db, uint32_t key, const void* data, uint32_
 
 int picowal_db_delete_key(picowal_db_t* db, uint32_t key) {
     return picowal_db_delete_key_dur(db, key, PICOWAL_DURABILITY_LOCAL, NULL);
+}
+
+uint64_t picowal_db_schema_generation(picowal_db_t* db) {
+    if (!db) return 0;
+    return db->schema_gen;
 }
 
 /* ============================================================ reads */

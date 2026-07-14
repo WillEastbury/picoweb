@@ -2,6 +2,7 @@
 
 #include <ctype.h>
 #include <errno.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -51,6 +52,73 @@ typedef struct {
     pwq_where_t where[PWQ_MAX_WHERE];
     uint8_t where_count;
 } pwq_query_t;
+
+/* --- parsed-query cache -----------------------------------------------
+ * Parsing the S:/F:/W: text into a pwq_query_t and validating every
+ * FROM/SELECT/WHERE pack+field against the schema store are both cheap
+ * per-call, but under high query/report throughput the same literal
+ * query text is typically resubmitted over and over (dashboards, polling
+ * clients, repeated report panels) -- so it's worth skipping both steps
+ * entirely on a cache hit. Entries are invalidated wholesale whenever
+ * db->schema_gen changes (see picowal_db_schema_generation()), i.e. any
+ * write to pack 1 or pack 2, so a schema/pack-name edit can never leave a
+ * query resolved against stale FROM ids or a stale field-allow decision.
+ * Direct-mapped by hash(text) -- no eviction bookkeeping needed since a
+ * miss is exactly as expensive as the uncached path was before. */
+#define PWQ_CACHE_SIZE 128
+#define PWQ_CACHE_TEXT_MAX 512
+
+typedef struct {
+    void* db;              /* which db this entry was resolved against */
+    uint64_t schema_gen;   /* db->schema_gen at resolution time */
+    char text[PWQ_CACHE_TEXT_MAX];
+    bool valid;
+    pwq_query_t q;
+} pwq_cache_entry_t;
+
+static pwq_cache_entry_t g_pwq_cache[PWQ_CACHE_SIZE];
+static pthread_mutex_t g_pwq_cache_mu = PTHREAD_MUTEX_INITIALIZER;
+
+static uint32_t pwq_hash(const char* s) {
+    /* FNV-1a */
+    uint32_t h = 2166136261u;
+    for (const unsigned char* p = (const unsigned char*)s; *p; p++) {
+        h ^= *p;
+        h *= 16777619u;
+    }
+    return h;
+}
+
+static bool pwq_cache_lookup(picowal_db_t* db, const char* text, pwq_query_t* out) {
+    size_t len = strlen(text);
+    if (len == 0 || len >= PWQ_CACHE_TEXT_MAX) return false;
+    uint32_t idx = pwq_hash(text) % PWQ_CACHE_SIZE;
+    bool hit = false;
+    pthread_mutex_lock(&g_pwq_cache_mu);
+    pwq_cache_entry_t* e = &g_pwq_cache[idx];
+    if (e->valid && e->db == (void*)db &&
+        e->schema_gen == picowal_db_schema_generation(db) &&
+        strcmp(e->text, text) == 0) {
+        *out = e->q;
+        hit = true;
+    }
+    pthread_mutex_unlock(&g_pwq_cache_mu);
+    return hit;
+}
+
+static void pwq_cache_store(picowal_db_t* db, const char* text, const pwq_query_t* q) {
+    size_t len = strlen(text);
+    if (len == 0 || len >= PWQ_CACHE_TEXT_MAX) return; /* too long to cache, not fatal */
+    uint32_t idx = pwq_hash(text) % PWQ_CACHE_SIZE;
+    pthread_mutex_lock(&g_pwq_cache_mu);
+    pwq_cache_entry_t* e = &g_pwq_cache[idx];
+    e->db = (void*)db;
+    e->schema_gen = picowal_db_schema_generation(db);
+    memcpy(e->text, text, len + 1);
+    e->q = *q;
+    e->valid = true;
+    pthread_mutex_unlock(&g_pwq_cache_mu);
+}
 
 typedef enum {
     JVAL_NONE = 0,
@@ -549,6 +617,13 @@ bool picowal_query_run(picowal_db_t* db, const char* text,
     *out_len = 0;
 
     pwq_query_t q;
+    if (pwq_cache_lookup(db, text, &q)) {
+        /* Already parsed and fully validated (FROM/SELECT/WHERE pack and
+         * field resolution) against the current schema generation --
+         * skip straight to execution below. */
+        goto resolved;
+    }
+
     if (!parse_query(text, &q, err, err_cap)) return false;
 
     for (uint8_t i = 0; i < q.from_count; i++) {
@@ -585,6 +660,10 @@ bool picowal_query_run(picowal_db_t* db, const char* text,
         }
     }
 
+    pwq_cache_store(db, text, &q);
+
+resolved:
+    ;
     uint32_t records[PWQ_SCAN_LIMIT];
     uint32_t rcnt = picowal_db_list_records(db, q.from_ids[0], records, PWQ_SCAN_LIMIT);
 
