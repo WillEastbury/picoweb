@@ -1896,7 +1896,7 @@ void pv_default_host(pv_ctx *ctx, int hook, int rd, int rs1, int rs2, int imm16)
         if (pv_map_hook(ctx, hook, rd, rs1, rs2)) return;
     }
     /* Parsers: Json.Parse / Binary.ParseCard|SerializeCard -> Map. */
-    if (hook >= PV_HOOK_JSON_PARSE && hook <= PV_HOOK_BINARY_SERIALIZECARD) {
+    if (hook >= PV_HOOK_JSON_PARSE && hook <= PV_HOOK_BINARY_VERIFY) {
         if (pv_parse_hook(ctx, hook, rd, rs1, rs2)) return;
     }
     /* Storage.* (0x60-0x6F) / Search.* card packs (0x1A0-0x1A4): delegate to the
