@@ -54,11 +54,56 @@
 > integration, the same "primitives real, wiring not done yet" shape
 > as the rest of this stack.
 >
-> **What is sketched but not wired:** AF_PACKET I/O (compiles on
-> Linux, no E2E test against a real link -- see "Why this won't run
-> end-to-end in WSL" below), AF_XDP (compiles, same caveat), DPDK pump
-> (real `rte_*` calls under `-DWITH_DPDK=1`; stub mode returns -1
-> otherwise so the binary always links).
+> **Deployment finding (packet-I/O backend decision): AF_PACKET is the
+> validated path; AF_XDP and DPDK are a dead end on Kubernetes.** Both
+> AF_XDP and DPDK need kernel-level integration that isn't available
+> in a typical Kubernetes pod (AF_XDP wants a driver in native/zero-copy
+> mode plus `CAP_NET_ADMIN`/`CAP_BPF` and a compatible NIC driver
+> exposed to the pod's network namespace; DPDK wants either full
+> hugepage + `vfio-pci`/UIO device passthrough or SR-IOV VF binding --
+> neither is something a standard CNI-managed pod network gives you
+> without cluster-wide privileged configuration most operators won't
+> grant). **AF_PACKET has none of these requirements** -- it works over
+> an ordinary pod network interface with just `CAP_NET_RAW`, which is
+> why it's the one packet-I/O path that's actually been validated to
+> work in this project's real target deployment environment
+> (Kubernetes), not just in a WSL dev loop. AF_XDP/DPDK remain in tree
+> (they still compile) but are no longer the intended direction for
+> this project's own deployment target -- treat AF_PACKET as the
+> packet-I/O backend to invest further effort in, and AF_XDP/DPDK as
+> kept-for-reference/other-deployment-targets rather than the near-term
+> roadmap.
+>
+> **Related project, a further evolution of this same idea: `pios`
+> is a from-scratch, bare-metal multi-core OS (targets Raspberry Pi 5
+> / bcm2712, boots via UEFI/QEMU too) with its own custom,
+> kernel-integrated network + TLS + TCP stack -- not a userspace stack
+> running on top of Linux at all. It lives in its own separate repo
+> (sibling directory in this workspace, NOT a subdirectory of
+> `picoweb` -- there is no relative path between them in a standalone
+> clone of this repo).** Where this `userspace/` tree bypasses the
+> Linux kernel's TCP/TLS by running userspace code that still
+> ultimately talks to a Linux NIC driver via AF_PACKET/AF_XDP/DPDK,
+> `pios` goes further: **there is no Linux kernel to bypass** --
+> `pios`'s own kernel owns the network+TCP+TLS stack directly on
+> Core 0, and other cores talk to it via lock-free SPSC
+> (single-producer/single-consumer) inter-core FIFOs (`fifo.c`) rather
+> than sockets or shared network namespaces -- conceptually the same
+> "raw frame access, no kernel abstraction layer in the way" goal
+> AF_PACKET was reaching for here, taken to its logical conclusion by
+> owning the whole kernel. Per `pios`'s own `STATUS.md`: TCP
+> (connect/listen/send/recv) and TLS (basic TLS 1.2 handshake + record
+> layer) are both working there today. See that repo's own `README.md`
+> and `STATUS.md` for its current, tracked status -- this document
+> doesn't attempt to track it in detail.
+>> **What is sketched but not wired:** AF_PACKET I/O (compiles on
+> Linux, no E2E test against a real link yet -- see "Why this won't
+> run end-to-end in WSL" below -- but see the deployment finding above:
+> this is the packet-I/O path actually worth finishing). AF_XDP and
+> DPDK pump (real `rte_*` calls under `-DWITH_DPDK=1`; stub mode
+> returns -1 otherwise so the binary always links) both compile but
+> are deprioritized for this project's Kubernetes deployment target --
+> see the deployment finding above.
 >
 > **What is still genuinely deliberately out of scope (these parts of
 > the original spike's caveats remain accurate):**
@@ -85,9 +130,14 @@
 >   path; hostile/malformed inputs (especially into the QUIC/H3/QPACK
 >   parsers, which are newer and less battle-tested than the TLS 1.3
 >   record layer) are an enormous, unexamined attack surface.
-> - **AF_PACKET/AF_XDP/DPDK have never been exercised end-to-end
->   against a real NIC** -- see "Why this won't run end-to-end in
->   WSL" below; this is unchanged from the original spike.
+> - **AF_PACKET has still never been exercised end-to-end against a
+>   real production Kubernetes NIC/CNI path** -- validated as the
+>   right backend choice (see deployment finding above), but the
+>   actual E2E wiring against a live link is still open work; see "Why
+>   this won't run end-to-end in WSL" below for the WSL-specific
+>   version of this gap. AF_XDP/DPDK's lack of E2E testing is no
+>   longer the priority gap -- they're deprioritized for this
+>   project's deployment target regardless.
 > - **No `gzip`/`brotli`/`zstd`** in this userspace stack's own scope
 >   -- the picoweb HTTP server uses `picoweb-compress` (vendored,
 >   ~250 lines of LZ77, wire-compatible with `BareMetal.Compress.js`);
@@ -122,6 +172,16 @@ kernel transitions per request (after socket setup).
 The wins come at a cost: you reimplement a TCP stack and a TLS stack.
 This is decades of OpenSSL / Linux kernel hardening you're throwing
 out. We do not pretend this is small work.
+
+**Of the three packet-I/O options above, only AF_PACKET is actually
+viable for this project's real deployment target (Kubernetes) --** see
+the deployment finding in the status block at the top of this
+document. AF_XDP and DPDK both need kernel-level integration
+(zero-copy driver mode + `CAP_NET_ADMIN`/`CAP_BPF`, or hugepage +
+`vfio-pci`/SR-IOV device passthrough respectively) that a standard
+CNI-managed pod network doesn't grant without cluster-wide privileged
+configuration. AF_PACKET needs only `CAP_NET_RAW` over an ordinary pod
+interface, which is why it's the path worth finishing.
 
 ## Scope of this branch
 
@@ -161,14 +221,23 @@ In the spike we delivered:
    (see the "still genuinely deliberately out of scope" list above).
 4. An **AF_PACKET** packet-I/O skeleton — runs in WSL, doesn't need
    DPDK, gives us a way to wire the stack to a real link in dev.
-   **Status: unchanged** -- compiles on Linux, still no E2E test
-   against a real link.
+   **Status: this is now the validated packet-I/O direction** -- see
+   the deployment finding at the top of this document: AF_PACKET is
+   the one packet-I/O path that actually works within Kubernetes's
+   constraints (needs only `CAP_NET_RAW`), unlike AF_XDP/DPDK below.
+   Still compiles on Linux with no E2E test against a real production
+   link yet, but it's the path worth finishing, not a dead end.
 5. A **DPDK** backend (`io/dpdk.{c,h}`) that compiles in two modes:
    stub-by-default (init returns -1, prints a clear "rebuild with
    -DWITH_DPDK=1" message — keeps the userspace tree linkable on
    WSL/CI), and full `rte_eal_init` / mempool / `rte_eth_rx_burst`
-   pump under `-DWITH_DPDK=1`. **Status: unchanged** -- tested in stub
-   mode only.
+   pump under `-DWITH_DPDK=1`. **Status: dead end for this project's
+   Kubernetes deployment target** -- DPDK needs hugepage +
+   `vfio-pci`/UIO device passthrough or SR-IOV VF binding, none of
+   which a standard CNI-managed pod gets without cluster-wide
+   privileged configuration. Kept in tree (still compiles, still
+   tested in stub mode), but AF_PACKET is the packet-I/O backend to
+   invest in going forward, not this.
 6. **Not part of the original spike, added later:** a full QUIC
    transport (`userspace/quic/`), HTTP/3 (`userspace/h3/`), and QPACK
    (`userspace/qpack/`) -- real, RFC-vector-tested via the standalone
@@ -212,13 +281,18 @@ userspace/
   quic/, h3/, qpack/         full QUIC + HTTP/3 + QPACK -- real, RFC-vector-tested standalone
                              (test_quic_primitives), NOT linked into the live picoweb server
   io/
-    af_packet.{c,h}          dev-only RX/TX over a real NIC
-    af_xdp.{c,h}             AF_XDP socket I/O
+    af_packet.{c,h}          RX/TX over a real NIC -- VALIDATED packet-I/O path for this project's
+                             Kubernetes deployment target (needs only CAP_NET_RAW); see the
+                             deployment finding in the status block at the top of this document
+    af_xdp.{c,h}             AF_XDP socket I/O -- compiles, but a dead end for Kubernetes (needs
+                             kernel driver zero-copy mode + CAP_NET_ADMIN/CAP_BPF); see status block
     dpdk.c                   real DPDK pump under -DWITH_DPDK=1;
                              stub returning -1 otherwise. Always
-                             links into the spike test build.
+                             links into the spike test build. Also a
+                             dead end for Kubernetes (needs hugepage +
+                             vfio-pci/SR-IOV device passthrough); see status block
   xdp/
-    xdp_loader.{c,h}         XDP program loader
+    xdp_loader.{c,h}         XDP program loader (supports the deprioritized AF_XDP path)
   tests/
     test_crypto.c            crypto + TLS + TCP RFC vectors (50 test functions)
     test_quic_primitives.c   QUIC/H3/QPACK primitive tests
@@ -270,15 +344,33 @@ all run in pure userspace and are tested against RFC vectors in this
 branch — those parts are real, here, and green. The packet path is
 sketched but not wired to a live link.
 
+**This is a separate limitation from the Kubernetes deployment
+finding above** (see the status block at the top of this document):
+WSL's lack of a passthrough NIC blocks testing ALL THREE packet-I/O
+backends equally in a dev loop, whereas the Kubernetes finding is
+about which backend is even *architecturally viable* once you get to
+a real cluster (AF_PACKET; not AF_XDP/DPDK, regardless of WSL).
+
 ## Realistic next steps if we ever ship this
 
 **Updated -- several of these are now done; see the status block at
-the top of this document.**
+the top of this document. Also updated: AF_XDP/DPDK are no longer the
+intended direction for this project's deployment target (Kubernetes)
+-- see the deployment finding in the status block -- so step 1 below
+is now scoped to AF_PACKET only, not "graduate through all three."**
 
-1. Boot a Linux VM with a passthrough NIC, get DPDK bound, smoke-test
-   AF_PACKET first then graduate to AF_XDP, then to DPDK PMD. **Still
-   not done** -- this remains the biggest real gap: none of
-   AF_PACKET/AF_XDP/DPDK have ever been exercised against a real link.
+1. ~~Boot a Linux VM with a passthrough NIC, get DPDK bound, smoke-test
+   AF_PACKET first then graduate to AF_XDP, then to DPDK PMD.~~
+   **Re-scoped:** AF_XDP and DPDK are a dead end for this project's
+   Kubernetes deployment target (both need kernel-level integration --
+   zero-copy driver mode + `CAP_NET_ADMIN`/`CAP_BPF` for AF_XDP,
+   hugepage + `vfio-pci`/SR-IOV device passthrough for DPDK -- that a
+   standard CNI-managed pod network doesn't grant). The real next step
+   is: get AF_PACKET (needs only `CAP_NET_RAW`) working end-to-end
+   against a real NIC/CNI path in an actual Kubernetes pod, not a
+   passthrough-NIC VM. This remains the biggest real gap: AF_PACKET
+   has still never been exercised against a real link, even though
+   it's now the validated architectural choice.
 2. Get a single TCP connection, single HTTP request, no TLS. End to end.
    **Still not done end-to-end against a real NIC** -- the TCP state
    machine itself is real and tested against a scripted client, but
@@ -308,10 +400,12 @@ Do not ship any of this without third-party security review.
 
 ## Layered architecture: webserver as a module on a userspace stack
 
-The long-term shape (still being built out):
+The long-term shape (still being built out) -- **updated to reflect
+the deployment finding above: `AF_PACKET`, not DPDK/AF_XDP, is the
+intended driver for this project's Kubernetes target**:
 
 ```
-[ NIC RX ] -> [ driver: epoll | io_uring | DPDK | AF_XDP ]
+[ NIC RX ] -> [ driver: epoll | io_uring | AF_PACKET ]
             -> [ TCP reassembly  (per-flow, fixed flow table) ]
             -> [ TLS decrypt     (in-place over reassembled record) ]
             -> [ HTTP request slice + jumptable lookup ]

@@ -979,6 +979,22 @@ exercised end-to-end against a real NIC (see
 [`userspace/DESIGN.md`](./userspace/DESIGN.md) for the honest, current
 breakdown of what's wired vs. sketched).
 
+**Deployment finding: on Kubernetes, AF_PACKET is the validated
+packet-I/O backend; AF_XDP and DPDK are a dead end.** Both need
+kernel-level integration (zero-copy driver mode + `CAP_NET_ADMIN`/
+`CAP_BPF` for AF_XDP; hugepage + `vfio-pci`/SR-IOV device passthrough
+for DPDK) that a standard CNI-managed pod network doesn't grant.
+AF_PACKET needs only `CAP_NET_RAW` over an ordinary pod interface. See
+`userspace/DESIGN.md`'s status block for the full reasoning.
+
+**Related project**: `pios` (a separate repo/sibling directory in this
+workspace) takes this same idea further with a from-scratch, bare-metal
+multi-core OS (Raspberry Pi 5) whose own kernel owns the network+TCP+TLS
+stack directly, with lock-free inter-core FIFOs standing in for what
+sockets/AF_PACKET do here — TCP and a basic TLS 1.2 handshake + record
+layer are both working there today (see that repo's own `README.md`/
+`STATUS.md`).
+
 What's real (50+ RFC-vector tests pass in `test_crypto.c` alone, plus
 a separate `test_quic_primitives` binary — `cd userspace/tests && make test`):
 
@@ -997,8 +1013,11 @@ a separate `test_quic_primitives` binary — `cd userspace/tests && make test`):
   (RFC 6298), fast retransmit/fast recovery (RFC 5681)**, and
   zero-window flow control — all previously listed as "not in scope,"
   all now real in `tcp/tcp.c`.
-- AF_PACKET + AF_XDP RX/TX (Linux only, compile-clean, no E2E test
-  against a real link yet).
+- AF_PACKET RX/TX (Linux only, compile-clean; the validated packet-I/O
+  path for Kubernetes -- see the deployment finding above -- but still
+  no E2E test against a real production link). AF_XDP/DPDK also
+  compile but are deprioritized dead ends for this project's
+  Kubernetes target (see deployment finding above).
 - A **full QUIC transport + HTTP/3 + QPACK** implementation
   (`userspace/quic/`, `userspace/h3/`, `userspace/qpack/`) — real and
   RFC-vector-tested via `test_quic_primitives`, but **not yet linked
@@ -1007,9 +1026,12 @@ a separate `test_quic_primitives` binary — `cd userspace/tests && make test`):
 
 What's still deliberately **not** in scope: AES-GCM is not wired into
 `tls/record.c`'s dispatch (ChaCha20-Poly1305 only), TCP SYN
-cookies/listen-queue protection, parser fuzzing, and any end-to-end
-test of AF_PACKET/AF_XDP/DPDK against a real NIC (WSL has no
-passthrough NIC to test against). See
+cookies/listen-queue protection, parser fuzzing, and an end-to-end
+test of AF_PACKET against a real production NIC/CNI path (WSL has no
+passthrough NIC to test against, and this hasn't yet been tried in an
+actual Kubernetes pod either). AF_XDP/DPDK's own lack of E2E testing
+is no longer the priority gap -- both are deprioritized regardless,
+per the deployment finding above. See
 [`userspace/DESIGN.md`](./userspace/DESIGN.md) for the full, current,
 honestly-tracked scope and roadmap.
 
