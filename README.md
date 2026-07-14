@@ -53,7 +53,6 @@ the CPU.
 - [What's deliberately NOT supported](#whats-deliberately-not-supported)
 - [Source layout](#source-layout)
 - [Userspace TCP+TLS foundation](#userspace-tcptls-foundation-userspace)
-- [`picowal` — an embedded WAL datastore with replication](#picowal--an-embedded-wal-datastore-with-replication---picowal-device)
 - [License](#license)
 
 ---
@@ -498,20 +497,31 @@ whether its primary looks healthy (a run of consecutive failed
 `/repl/status` polls). While the primary is healthy, nothing happens.
 Once a follower detects the primary is down, every healthy follower
 independently and deterministically nominates the same candidate (the
-lexicographically-smallest registered follower id) and gossips its vote
-to the others via `POST {prefix}vote` (fire-and-forget, short timeout,
-gated by the same `--picowal-write-token`). The moment any follower
-observes **more than 50% of the registered followers** have voted for a
-candidate that is itself, it self-promotes: it stops pulling from the
-dead primary, flips its own picowal volume back to read-write, and
-starts serving the primary-side replication feed so the remaining
-followers could in principle re-point at it.
+lexicographically-smallest registered follower id **not already known
+to be dead** — see below) and gossips its vote to the others via
+`POST {prefix}vote` (fire-and-forget, short timeout, gated by the same
+`--picowal-write-token`). The moment **any** follower observes **more
+than 50% of the registered followers** have voted for a candidate, it
+records that candidate as the known leader — symmetrically, not just
+the winner — and, if that candidate is itself, self-promotes: it stops
+pulling from the dead primary, flips its own picowal volume back to
+read-write, and starts serving the primary-side replication feed.
+
+Every OTHER follower (not just the winner) then automatically
+re-points its own repl-client at the newly-confirmed leader via
+`picowal_repl_client_retarget()` — the sentence above used to read
+"could in principle re-point at it"; this is now real, not aspirational.
+If that confirmed leader later fails ITS health checks too (a normal
+event over a cluster's lifetime — leaders can fail more than once),
+it's added to a per-process dead-candidate exclusion list so the next
+election picks a genuinely different node instead of deadlocking by
+re-nominating the same now-dead node forever.
 
 Check election state via `GET {prefix}status` (same token-gated auth):
 
 ```sh
 curl -H 'X-PW-Write-Token: ...' http://replica-host:8081/gossip/status
-# {"self":"replica-host:8081","term":1,"candidate":"replica-host:8081","votes":3,"followers":3,"quorum":2,"promoted":true}
+# {"self":"replica-host:8081","term":1,"candidate":"replica-host:8081","votes":3,"followers":3,"quorum":2,"promoted":true,"known_leader":"replica-host:8081"}
 ```
 
 **This is deliberately not a full consensus protocol.** There is no
@@ -525,6 +535,16 @@ HTTP. Treat it as a pragmatic "mostly cooperative" failover aid, not a
 guarantee against split-brain — an operator (or an external fencing
 mechanism) should still confirm the old primary is truly dead before
 trusting a promoted node's writes as authoritative.
+
+> This same protocol was ported to a separate Python service
+> (`wavesearch-api`, elsewhere in this workspace) and tested end-to-end
+> against real multi-node bootstrap and failover scenarios. Two real
+> bugs found during that port — dead-candidate re-election never
+> making forward progress past a second leader failure, and a
+> stale-failure-count bug when retargeting to a newly-confirmed leader
+> — were back-ported here (`picowal_gossip.c`/`picowal_repl_client.c`);
+> see `tests/test_gossip_backport.c` for an isolated unit test of both
+> fixes run against the real production file.
 
 ---
 
@@ -995,54 +1015,13 @@ honestly-tracked scope and roadmap.
 
 ---
 
-## `picowal` — an embedded WAL datastore with replication (`--picowal-device`)
-
-A separate embedded data-store engine lives alongside the HTTP server
-(`src/picowal_*.c`), enabled via `--picowal-device=PATH` (see
-`./picoweb --help`). It's a real write-ahead-log engine, not a toy:
-
-- **On-disk model**: a directory containing a crash-safe alternating
-  A/B superblock, a checkpointed `base.dat` snapshot, and a sequence
-  of monotonically-numbered WAL segments (exactly one "leading"
-  segment open for appends at a time, the rest sealed/read-only).
-  Every mutation is WAL-appended first (with a configurable durability
-  tier — see `picowal_db.h`), applied to the in-memory index on
-  commit, and later folded into `base.dat` by
-  `picowal_db_checkpoint()`, which then deletes the now-fully-applied
-  sealed segments.
-- **HTTP JSON API** (`/wal/...` by default): explicit and
-  auto-commit transactions, query (`picowal_query.c`) and schema
-  validation (`picowal_validate.c`) layers on top of the raw
-  key/record store.
-- **Primary/replica physical replication** (`--picowal-repl` /
-  `--picowal-replica-of=http://HOST:PORT/PREFIX/`): a replica pulls
-  the primary's segment list + leading-segment byte stream over plain
-  HTTP and reconciles its own local copy — no shared network
-  filesystem required.
-- **Gossip-based leader election** (`--picowal-node-id` /
-  `--picowal-followers=...`): a fixed, statically-configured follower
-  set deterministically nominates and quorum-votes a new writer when
-  the current primary goes unhealthy, for multi-reader/single-writer
-  topologies. This is deliberately **not a full consensus protocol**
-  (no fencing tokens, no protection against a stale primary
-  reappearing mid-election) — see the doc comment at the top of
-  `src/picowal_gossip.h` for the exact, current design and its
-  explicitly-tracked limitations, and `tests/test_gossip_backport.c`
-  for an isolated unit test of its dead-candidate-exclusion and
-  symmetric-leader-confirmation behavior.
-- Optional static-content and PicoScript-bytecode serving straight out
-  of a picowal volume (`--picowal-static-card=N`,
-  `--picowal-code-card=N`).
-
-This same replication/gossip protocol was ported to a Python service
-(`wavesearch-api`) elsewhere in this workspace and tested end-to-end
-against real multi-node bootstrap and failover scenarios; two real
-bugs found during that port (dead-candidate re-election never making
-forward progress, and a stale-failure-count bug when retargeting to a
-new leader) were back-ported into `picowal_gossip.c`/
-`picowal_repl_client.c` here as a result.
-
 ---
+
+## `picowal` — an embedded WAL datastore with replication
+
+Already documented in detail above (see [Storage engine](#storage-engine-wal-segments-basedat-transactions-durability),
+[Log replication](#log-replication-multi-reader--single-writer), and
+[Gossip-based leader election](#gossip-based-leader-election---picowal-node-id--picowal-followers)).
 
 ## License
 
