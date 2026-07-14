@@ -129,6 +129,25 @@ else
     check "PUT directly to owner :$owner_port" "$put_code" "204"
     got_body=$(curl -sS --max-time 5 -H "$H" "http://127.0.0.1:$owner_port/wal/10/$rec")
     check "GET from owner reflects the write" "$(echo "$got_body" | grep -c "item-$rec")" "1"
+
+    echo
+    echo "== query gateway: /wal/query fans out to every node in the pool, merges rows =="
+    # Records i1..i$rec were written above (before the redirect was hit, each
+    # PUT lands on whichever node happens to own that id) so they are spread
+    # across all 3 nodes' independent volumes. A query sent to ANY single
+    # node must return the union of every node's local rows, not just its own.
+    query_body=$'S:id,name,value\nF:10'
+    counts=()
+    for p in "$PORT_A" "$PORT_B" "$PORT_C"; do
+        out=$(curl -sS --max-time 5 -X POST --data-binary "$query_body" -H "$H" \
+              "http://127.0.0.1:$p/wal/query")
+        c=$(echo "$out" | grep -o '"count":[0-9]*' | head -1 | cut -d: -f2)
+        counts+=("$c")
+    done
+    check "node A/B/C query counts agree" "${counts[0]}=${counts[1]}=${counts[2]}" \
+          "${counts[0]}=${counts[0]}=${counts[0]}"
+    check "query gateway merged count covers all $rec written records" \
+          "$([ "${counts[0]:-0}" -ge "$rec" ] && echo yes || echo no)" "yes"
 fi
 
 echo

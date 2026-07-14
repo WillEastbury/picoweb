@@ -238,9 +238,16 @@ http_result_t http_parse(char* buf, size_t buf_len, http_request_t* out) {
                 set_principal_header(out, tval, tl);
             }
             break;
+        case 18:
+            if (metal_ieq(p, 18, "X-PW-Partition-Hop", 18)) {
+                if (tl == 1 && tval[0] == '1') out->pw_partition_hop = true;
+            }
+            break;
         case 19:
             if (metal_ieq(p, 19, "X-Auth-Request-User", 19)) {
                 set_principal_header(out, tval, tl);
+            } else if (metal_ieq(p, 19, "X-PW-Partition-Hop", 19)) {
+                if (tl == 1 && tval[0] == '1') out->pw_partition_hop = true;
             }
             break;
         case 20:

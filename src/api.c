@@ -1086,7 +1086,171 @@ static bool json_escape_copy(const char* src, char* out, size_t out_cap) {
     return true;
 }
 
+/* ---------- partition query/report gateway ---------- */
+
+#define PP_FANOUT_MAX_NODES 64
+
+/* Our own picowal_query_run() always emits exactly {"rows":[...],"count":N}
+ * (see picowal_query.c). This is an internal, same-binary wire format
+ * between nodes in the same cluster (not arbitrary/untrusted JSON), so a
+ * cheap literal-marker split is safe here rather than pulling in a real
+ * JSON parser just to re-assemble our own output. */
+static bool split_shard_rows(const char* json, size_t len,
+                             const char** rows_start, size_t* rows_len,
+                             uint64_t* count) {
+    static const char PREFIX[] = "{\"rows\":[";
+    static const char MARKER[] = "],\"count\":";
+    size_t prefix_len = sizeof(PREFIX) - 1;
+    size_t marker_len = sizeof(MARKER) - 1;
+    if (len < prefix_len + marker_len || memcmp(json, PREFIX, prefix_len) != 0) return false;
+
+    const char* found = NULL;
+    for (size_t i = prefix_len; i + marker_len <= len; i++) {
+        if (memcmp(json + i, MARKER, marker_len) == 0) found = json + i;
+    }
+    if (!found) return false;
+
+    *rows_start = json + prefix_len;
+    *rows_len = (size_t)(found - *rows_start);
+
+    const char* cstart = found + marker_len;
+    const char* jend = json + len;
+    const char* cend = memchr(cstart, '}', (size_t)(jend - cstart));
+    if (!cend) return false;
+    char buf[32];
+    size_t clen = (size_t)(cend - cstart);
+    if (clen == 0 || clen >= sizeof(buf)) return false;
+    memcpy(buf, cstart, clen);
+    buf[clen] = '\0';
+    *count = strtoull(buf, NULL, 10);
+    return true;
+}
+
+/* Fans a query DSL body out to every node in the tenant's configured
+ * partition pool (ownership is per-record, so a scan/query must visit
+ * every node that could hold a shard of the target pack -- there is no
+ * single owner for a whole-pack read) and merges the per-shard
+ * {"rows":[...],"count":N} results into one. The local node's shard is
+ * served in-process (no network hop); every other node is queried over
+ * a fresh HTTP/1.1 connection via picowal_partition_fetch(). A shard
+ * that errors or is unreachable is skipped (not fatal) and reflected in
+ * the "partial"/"shards_ok"/"shards_total" fields of the merged result;
+ * the call only fails outright if every shard failed. */
+static bool picowal_query_run_fanout(const char* tenant, size_t tenant_len,
+                                     const char* query_text, size_t query_len,
+                                     const char* write_token, size_t write_token_len,
+                                     char** out_json, size_t* out_len,
+                                     char* err, size_t err_cap) {
+    char nodes[PP_FANOUT_MAX_NODES][PICOWAL_PARTITION_NODE_ID_MAX];
+    int n_nodes = picowal_partition_all_nodes(tenant, tenant_len, nodes, PP_FANOUT_MAX_NODES);
+    if (n_nodes <= 0) {
+        snprintf(err, err_cap, "partition routing enabled but no nodes configured");
+        return false;
+    }
+
+    char qpath[PICOWAL_PARTITION_NODE_ID_MAX + 64];
+    int qn = snprintf(qpath, sizeof(qpath), "%squery", g_picowal_prefix);
+    if (qn <= 0 || (size_t)qn >= sizeof(qpath)) {
+        snprintf(err, err_cap, "query path too long");
+        return false;
+    }
+
+    size_t rows_cap = 4096;
+    char* rows_buf = (char*)malloc(rows_cap);
+    if (!rows_buf) { snprintf(err, err_cap, "oom"); return false; }
+    size_t rows_len = 0;
+    uint64_t total_count = 0;
+    int shards_ok = 0;
+    bool any_rows = false;
+
+    for (int i = 0; i < n_nodes; i++) {
+        char* shard_json = NULL;
+        size_t shard_len = 0;
+        bool owned = false; /* need to free? local path returns owned buffer too */
+
+        if (picowal_partition_owner_is_self(nodes[i])) {
+            char qerr[128] = {0};
+            char* qtxt = (char*)malloc(query_len + 1);
+            if (!qtxt) continue;
+            memcpy(qtxt, query_text, query_len);
+            qtxt[query_len] = '\0';
+            bool ok = picowal_query_run(g_picowal, qtxt, &shard_json, &shard_len, qerr, sizeof(qerr));
+            free(qtxt);
+            if (!ok) continue;
+            owned = true;
+        } else {
+            int status = 0;
+            if (!picowal_partition_fetch(nodes[i], M_POST, qpath, (size_t)qn,
+                                         query_text, query_len,
+                                         write_token, write_token_len, NULL, 0,
+                                         &status, &shard_json, &shard_len)) {
+                continue;
+            }
+            if (status != 200) { free(shard_json); continue; }
+            owned = true;
+        }
+
+        const char* r_start = NULL;
+        size_t r_len = 0;
+        uint64_t r_count = 0;
+        if (!split_shard_rows(shard_json, shard_len, &r_start, &r_len, &r_count)) {
+            if (owned) free(shard_json);
+            continue;
+        }
+
+        if (r_len > 0) {
+            if (rows_len + r_len + 2 > rows_cap) {
+                size_t new_cap = rows_cap * 2;
+                while (new_cap < rows_len + r_len + 2) new_cap *= 2;
+                char* grown = (char*)realloc(rows_buf, new_cap);
+                if (!grown) { free(rows_buf); if (owned) free(shard_json); snprintf(err, err_cap, "oom"); return false; }
+                rows_buf = grown;
+                rows_cap = new_cap;
+            }
+            if (any_rows) rows_buf[rows_len++] = ',';
+            memcpy(rows_buf + rows_len, r_start, r_len);
+            rows_len += r_len;
+            any_rows = true;
+        }
+        total_count += r_count;
+        shards_ok++;
+        if (owned) free(shard_json);
+    }
+
+    if (shards_ok == 0) {
+        free(rows_buf);
+        snprintf(err, err_cap, "all partition shards failed or unreachable");
+        return false;
+    }
+
+    size_t out_cap = rows_len + 128;
+    char* out = (char*)malloc(out_cap);
+    if (!out) { free(rows_buf); snprintf(err, err_cap, "oom"); return false; }
+    int n;
+    if (shards_ok == n_nodes) {
+        n = snprintf(out, out_cap, "{\"rows\":[%.*s],\"count\":%llu}",
+                    (int)rows_len, rows_buf, (unsigned long long)total_count);
+    } else {
+        n = snprintf(out, out_cap, "{\"rows\":[%.*s],\"count\":%llu,"
+                    "\"partial\":true,\"shards_ok\":%d,\"shards_total\":%d}",
+                    (int)rows_len, rows_buf, (unsigned long long)total_count,
+                    shards_ok, n_nodes);
+    }
+    free(rows_buf);
+    if (n <= 0 || (size_t)n >= out_cap) {
+        free(out);
+        snprintf(err, err_cap, "merge render failed");
+        return false;
+    }
+    *out_json = out;
+    *out_len = (size_t)n;
+    return true;
+}
+
 static bool picowal_build_report(const char* body, size_t body_len,
+                                 const char* tenant_id, size_t tenant_id_len,
+                                 const char* write_token, size_t write_token_len,
+                                 bool is_partition_hop,
                                  char** out_json, size_t* out_len,
                                  int* out_status, char* err, size_t err_cap) {
     if (!out_json || !out_len) return false;
@@ -1116,7 +1280,15 @@ static bool picowal_build_report(const char* body, size_t body_len,
     char* result_json = NULL;
     size_t result_len = 0;
     char qerr[128] = {0};
-    if (!picowal_query_run(g_picowal, query_buf, &result_json, &result_len, qerr, sizeof(qerr))) {
+    bool qok;
+    if (!is_partition_hop && picowal_partition_enabled()) {
+        qok = picowal_query_run_fanout(tenant_id, tenant_id_len, query_buf, strlen(query_buf),
+                                       write_token, write_token_len,
+                                       &result_json, &result_len, qerr, sizeof(qerr));
+    } else {
+        qok = picowal_query_run(g_picowal, query_buf, &result_json, &result_len, qerr, sizeof(qerr));
+    }
+    if (!qok) {
         snprintf(err, err_cap, "%s", qerr[0] ? qerr : "report query failed");
         return false;
     }
@@ -1811,6 +1983,7 @@ static void dispatch_picowal(http_method_t method,
                              bool has_pw_auth_header,
                              const char* write_token, size_t write_token_len,
                              const char* tenant_id, size_t tenant_id_len,
+                             bool is_partition_hop,
                              api_resp_t* resp) {
     if (path_len == g_picowal_prefix_len + 10 &&
         memcmp(path + g_picowal_prefix_len, "auth/login", 10) == 0) {
@@ -2028,7 +2201,9 @@ static void dispatch_picowal(http_method_t method,
         size_t out_len = 0;
         int status = 500;
         char err[128] = {0};
-        if (!picowal_build_report(body, body_len, &out, &out_len, &status, err, sizeof(err))) {
+        if (!picowal_build_report(body, body_len, tenant_id, tenant_id_len,
+                                  write_token, write_token_len, is_partition_hop,
+                                  &out, &out_len, &status, err, sizeof(err))) {
             if (!err[0]) snprintf(err, sizeof(err), "report generation failed");
             if (status == 400) resp_text_error(resp, 400, "Bad Request", err);
             else resp_text_error(resp, 500, "Internal Server Error", err);
@@ -2088,7 +2263,14 @@ static void dispatch_picowal(http_method_t method,
         char* out_json = NULL;
         size_t out_len = 0;
         char err[128] = {0};
-        bool ok = picowal_query_run(g_picowal, qtxt, &out_json, &out_len, err, sizeof(err));
+        bool ok;
+        if (!is_partition_hop && picowal_partition_enabled()) {
+            ok = picowal_query_run_fanout(tenant_id, tenant_id_len, qtxt, body_len,
+                                          write_token, write_token_len,
+                                          &out_json, &out_len, err, sizeof(err));
+        } else {
+            ok = picowal_query_run(g_picowal, qtxt, &out_json, &out_len, err, sizeof(err));
+        }
         free(qtxt);
         if (!ok) {
             if (!err[0]) snprintf(err, sizeof(err), "query failed");
@@ -2340,6 +2522,7 @@ void api_dispatch(http_method_t method,
                   const char* cookie, size_t cookie_len,
                   bool has_pw_auth_header,
                   const char* write_token, size_t write_token_len,
+                  bool is_partition_hop,
                   const api_request_context_t* req_ctx,
                   api_resp_t* resp) {
     memset(resp, 0, sizeof(*resp));
@@ -2389,7 +2572,7 @@ void api_dispatch(http_method_t method,
         dispatch_picowal(method, path, path_len, body, body_len,
                          cookie, cookie_len, has_pw_auth_header,
                          write_token, write_token_len,
-                         tenant_id, tenant_id_len, resp);
+                         tenant_id, tenant_id_len, is_partition_hop, resp);
         return;
     }
     if (!g_enabled ||

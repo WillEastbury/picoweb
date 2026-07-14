@@ -85,6 +85,8 @@ typedef struct conn {
     uint16_t      api_principal_len;    /* X-PW-Principal/X-Principal-Id length */
     uint16_t      api_tenant_len;       /* X-PW-Tenant length */
     bool          api_has_pw_auth;      /* X-PW-Auth: 1 marker */
+    bool          api_partition_hop;    /* X-PW-Partition-Hop: 1 marker (request
+                                          * already fanned out; do not re-fan-out) */
     uint16_t      api_write_token_len;  /* length of copied X-PW-Write-Token header */
     uint8_t       api_path_len;
     char          api_path[256];        /* request-target copy (see above) */

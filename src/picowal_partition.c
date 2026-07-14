@@ -327,24 +327,34 @@ static const char* method_name(http_method_t m) {
     }
 }
 
-bool picowal_partition_proxy(const char* owner, uint32_t vpart,
-                              http_method_t method,
-                              const char* path, size_t path_len,
-                              const char* body, size_t body_len,
-                              const char* write_token, size_t write_token_len,
-                              const char* cookie, size_t cookie_len,
-                              api_resp_t* resp) {
+/* Shared raw HTTP/1.1 round trip used by both picowal_partition_proxy()
+ * (single-owner write forwarding) and picowal_partition_fetch()
+ * (fan-out query/report gateway). Returns true and fills *out_status /
+ * *out_body (caller frees, may be NULL if empty) / *out_body_len on a
+ * successful round trip (any HTTP status code counts as success here --
+ * false is reserved for transport-level failures). */
+static bool pp_http_roundtrip(const char* node_id, const char* method_str,
+                               const char* path, size_t path_len,
+                               const char* body, size_t body_len,
+                               const char* write_token, size_t write_token_len,
+                               const char* cookie, size_t cookie_len,
+                               int* out_status, char** out_body, size_t* out_body_len,
+                               char* errbuf, size_t errbuf_cap) {
+    *out_status = 0;
+    *out_body = NULL;
+    *out_body_len = 0;
+
     char host[PICOWAL_PARTITION_NODE_ID_MAX];
     char port[16];
-    const char* colon = strrchr(owner, ':');
-    if (!colon) { fill_502(resp, "bad owner id\n"); return false; }
-    size_t hlen = (size_t)(colon - owner);
-    if (hlen >= sizeof(host)) { fill_502(resp, "bad owner id\n"); return false; }
-    memcpy(host, owner, hlen); host[hlen] = '\0';
+    const char* colon = strrchr(node_id, ':');
+    if (!colon) { snprintf(errbuf, errbuf_cap, "bad node id\n"); return false; }
+    size_t hlen = (size_t)(colon - node_id);
+    if (hlen >= sizeof(host)) { snprintf(errbuf, errbuf_cap, "bad node id\n"); return false; }
+    memcpy(host, node_id, hlen); host[hlen] = '\0';
     snprintf(port, sizeof(port), "%s", colon + 1);
 
     int fd = pp_connect(host, port);
-    if (fd < 0) { fill_502(resp, "partition owner unreachable\n"); return false; }
+    if (fd < 0) { snprintf(errbuf, errbuf_cap, "node unreachable\n"); return false; }
 
     const char* tok = (write_token_len > 0) ? write_token : NULL;
     if (!tok && g_write_token[0]) tok = g_write_token;
@@ -354,10 +364,11 @@ bool picowal_partition_proxy(const char* owner, uint32_t vpart,
     int n = snprintf(head, sizeof(head),
                      "%s %.*s HTTP/1.1\r\n"
                      "Host: %s\r\n"
+                     "Connection: close\r\n"
                      "X-PW-Partition-Hop: 1\r\n"
                      "Content-Length: %zu\r\n",
-                     method_name(method), (int)path_len, path, host, body_len);
-    if (n <= 0 || (size_t)n >= sizeof(head)) { close(fd); fill_502(resp, "path too long\n"); return false; }
+                     method_str, (int)path_len, path, host, body_len);
+    if (n <= 0 || (size_t)n >= sizeof(head)) { close(fd); snprintf(errbuf, errbuf_cap, "path too long\n"); return false; }
     size_t off = (size_t)n;
     if (tok_len > 0 && off + tok_len + 32 < sizeof(head)) {
         off += (size_t)snprintf(head + off, sizeof(head) - off, "X-PW-Write-Token: %.*s\r\n", (int)tok_len, tok);
@@ -372,33 +383,33 @@ bool picowal_partition_proxy(const char* owner, uint32_t vpart,
     size_t sent = 0;
     while (sent < off) {
         ssize_t w = send(fd, head + sent, off - sent, 0);
-        if (w < 0) { if (errno == EINTR) continue; close(fd); fill_502(resp, "send failed\n"); return false; }
+        if (w < 0) { if (errno == EINTR) continue; close(fd); snprintf(errbuf, errbuf_cap, "send failed\n"); return false; }
         sent += (size_t)w;
     }
     sent = 0;
     while (body_len && sent < body_len) {
         ssize_t w = send(fd, body + sent, body_len - sent, 0);
-        if (w < 0) { if (errno == EINTR) continue; close(fd); fill_502(resp, "send failed\n"); return false; }
+        if (w < 0) { if (errno == EINTR) continue; close(fd); snprintf(errbuf, errbuf_cap, "send failed\n"); return false; }
         sent += (size_t)w;
     }
 
     char* buf = (char*)malloc(PP_RESP_CAP);
-    if (!buf) { close(fd); fill_502(resp, "oom\n"); return false; }
+    if (!buf) { close(fd); snprintf(errbuf, errbuf_cap, "oom\n"); return false; }
     size_t got = 0;
     for (;;) {
-        if (got >= PP_RESP_CAP) { free(buf); close(fd); fill_502(resp, "response too large\n"); return false; }
+        if (got >= PP_RESP_CAP) { free(buf); close(fd); snprintf(errbuf, errbuf_cap, "response too large\n"); return false; }
         ssize_t r = recv(fd, buf + got, PP_RESP_CAP - got, 0);
-        if (r < 0) { if (errno == EINTR) continue; free(buf); close(fd); fill_502(resp, "recv failed\n"); return false; }
+        if (r < 0) { if (errno == EINTR) continue; free(buf); close(fd); snprintf(errbuf, errbuf_cap, "recv failed\n"); return false; }
         if (r == 0) break;
         got += (size_t)r;
     }
     close(fd);
 
-    if (got < 12 || strncmp(buf, "HTTP/1.", 7) != 0) { free(buf); fill_502(resp, "bad upstream response\n"); return false; }
+    if (got < 12 || strncmp(buf, "HTTP/1.", 7) != 0) { free(buf); snprintf(errbuf, errbuf_cap, "bad upstream response\n"); return false; }
     const char* sp = memchr(buf, ' ', got);
-    if (!sp) { free(buf); fill_502(resp, "bad upstream response\n"); return false; }
+    if (!sp) { free(buf); snprintf(errbuf, errbuf_cap, "bad upstream response\n"); return false; }
     int status = (int)strtol(sp + 1, NULL, 10);
-    if (status <= 0) { free(buf); fill_502(resp, "bad upstream response\n"); return false; }
+    if (status <= 0) { free(buf); snprintf(errbuf, errbuf_cap, "bad upstream response\n"); return false; }
 
     const char* hdr_end = NULL;
     for (size_t i = 0; i + 3 < got; i++) {
@@ -407,9 +418,67 @@ bool picowal_partition_proxy(const char* owner, uint32_t vpart,
             break;
         }
     }
-    if (!hdr_end) { free(buf); fill_502(resp, "bad upstream response\n"); return false; }
+    if (!hdr_end) { free(buf); snprintf(errbuf, errbuf_cap, "bad upstream response\n"); return false; }
 
     size_t upstream_body_len = got - (size_t)(hdr_end - buf);
+    *out_status = status;
+    if (upstream_body_len > 0) {
+        char* b = (char*)malloc(upstream_body_len);
+        if (b) {
+            memcpy(b, hdr_end, upstream_body_len);
+            *out_body = b;
+            *out_body_len = upstream_body_len;
+        }
+    }
+    free(buf);
+    return true;
+}
+
+bool picowal_partition_fetch(const char* node_id,
+                              http_method_t method,
+                              const char* path, size_t path_len,
+                              const char* body, size_t body_len,
+                              const char* write_token, size_t write_token_len,
+                              const char* cookie, size_t cookie_len,
+                              int* out_status, char** out_body, size_t* out_body_len) {
+    char errbuf[128];
+    return pp_http_roundtrip(node_id, method_name(method), path, path_len,
+                             body, body_len, write_token, write_token_len,
+                             cookie, cookie_len, out_status, out_body, out_body_len,
+                             errbuf, sizeof(errbuf));
+}
+
+int picowal_partition_all_nodes(const char* tenant, size_t tenant_len,
+                                 char out[][PICOWAL_PARTITION_NODE_ID_MAX], int max_out) {
+    int n = 0;
+    const pp_node_t* nodes = nodes_for_tenant(tenant, tenant_len, &n);
+    int copied = (n < max_out) ? n : max_out;
+    for (int i = 0; i < copied; i++) {
+        size_t len = strlen(nodes[i].id);
+        memcpy(out[i], nodes[i].id, len + 1);
+    }
+    return copied;
+}
+
+bool picowal_partition_proxy(const char* owner, uint32_t vpart,
+                              http_method_t method,
+                              const char* path, size_t path_len,
+                              const char* body, size_t body_len,
+                              const char* write_token, size_t write_token_len,
+                              const char* cookie, size_t cookie_len,
+                              api_resp_t* resp) {
+    int status = 0;
+    char* upstream_body = NULL;
+    size_t upstream_body_len = 0;
+    char errbuf[128];
+    if (!pp_http_roundtrip(owner, method_name(method), path, path_len, body, body_len,
+                           write_token, write_token_len, cookie, cookie_len,
+                           &status, &upstream_body, &upstream_body_len,
+                           errbuf, sizeof(errbuf))) {
+        fill_502(resp, errbuf);
+        return false;
+    }
+
     resp->status = status;
     int hn = snprintf(resp->head, sizeof(resp->head),
                       "HTTP/1.1 %d Proxied\r\n"
@@ -419,15 +488,12 @@ bool picowal_partition_proxy(const char* owner, uint32_t vpart,
                       "Content-Length: %zu\r\n",
                       status, (unsigned)vpart, owner, upstream_body_len);
     resp->head_len = (hn > 0 && (size_t)hn < sizeof(resp->head)) ? (size_t)hn : 0;
-    if (upstream_body_len > 0) {
-        char* b = (char*)malloc(upstream_body_len);
-        if (b) {
-            memcpy(b, hdr_end, upstream_body_len);
-            resp->body = b;
-            resp->body_len = upstream_body_len;
-            resp->body_owned = true;
-        }
+    if (upstream_body_len > 0 && upstream_body) {
+        resp->body = upstream_body;
+        resp->body_len = upstream_body_len;
+        resp->body_owned = true;
+    } else {
+        free(upstream_body);
     }
-    free(buf);
     return true;
 }

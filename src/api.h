@@ -153,6 +153,7 @@ void api_dispatch(http_method_t method,
                   const char* cookie, size_t cookie_len,
                   bool has_pw_auth_header,
                   const char* write_token, size_t write_token_len,
+                  bool is_partition_hop,
                   const api_request_context_t* req_ctx,
                   api_resp_t* resp);
 

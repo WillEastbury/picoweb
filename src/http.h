@@ -47,6 +47,9 @@ typedef struct {
     size_t pw_principal_len;
     const char* pw_tenant;       /* X-PW-Tenant value */
     size_t pw_tenant_len;
+    bool   pw_partition_hop;     /* X-PW-Partition-Hop: 1 -- request already fanned
+                                   * out by a peer partition/query gateway; do not
+                                   * fan out again (prevents redundant/looping hops) */
     /* Content-Length value, parsed from header. 0 if header absent or
      * value was "0". On a valid request, body bytes (if any) live in the
      * caller buffer at offset `consumed` and have length `content_length`.

@@ -239,6 +239,7 @@ static void try_accept(int listen_fd, int ep, pool_t* pool, int64_t batch_now_ms
         conn->api_principal_len = 0;
         conn->api_tenant_len = 0;
         conn->api_has_pw_auth = false;
+        conn->api_partition_hop = false;
         conn->api_write_token_len = 0;
         conn->api_path_len = 0;
         conn->last_active_ms = batch_now_ms;
@@ -452,6 +453,7 @@ static void api_run(conn_t* c) {
                  c->api_cookie, c->api_cookie_len,
                  c->api_has_pw_auth,
                  c->api_write_token, c->api_write_token_len,
+                 c->api_partition_hop,
                  &req_ctx,
                  &c->api_resp);
     api_apply_request_context_headers(&c->api_resp, &req_ctx);
@@ -520,6 +522,7 @@ static __attribute__((hot)) int dispatch_one(conn_t* c, const jumptable_t* jt, u
         c->api_headers_len  = (uint16_t)req.consumed;
         c->api_body_needed  = (uint16_t)req.content_length;
         c->api_has_pw_auth  = req.pw_auth_header;
+        c->api_partition_hop = req.pw_partition_hop;
         c->api_cookie_len   = 0;
         c->api_write_token_len = 0;
         c->api_host_len = 0;

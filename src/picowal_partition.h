@@ -99,4 +99,26 @@ bool picowal_partition_proxy(const char* owner, uint32_t vpart,
                               const char* cookie, size_t cookie_len,
                               api_resp_t* resp);
 
+/* Copy up to max_out node ids (for a given tenant, or the global pool if
+ * tenant is NULL/empty) into out[]. Returns the number of nodes copied.
+ * Used by the query/report gateway layer to fan a request out to every
+ * node that might hold a shard of the data (ownership is per-record, so
+ * a full scan must query every node in the pool, not just one). */
+int picowal_partition_all_nodes(const char* tenant, size_t tenant_len,
+                                 char out[][PICOWAL_PARTITION_NODE_ID_MAX], int max_out);
+
+/* Low-level raw HTTP/1.1 round trip to any node in the pool (not
+ * necessarily a partition owner) -- used by the query/report gateway to
+ * fetch each shard's local result. Returns true on a successful
+ * transport-level round trip (any HTTP status counts as success);
+ * out_status, out_body (caller frees) and out_body_len describe the
+ * response. Returns false only on connect/send/recv/parse failure. */
+bool picowal_partition_fetch(const char* node_id,
+                              http_method_t method,
+                              const char* path, size_t path_len,
+                              const char* body, size_t body_len,
+                              const char* write_token, size_t write_token_len,
+                              const char* cookie, size_t cookie_len,
+                              int* out_status, char** out_body, size_t* out_body_len);
+
 #endif
