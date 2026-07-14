@@ -7,6 +7,7 @@
 #include "picowal_repl.h"
 #include "picowal_repl_client.h"
 #include "picowal_gossip.h"
+#include "picowal_partition.h"
 #include "picowal_db.h"
 #include "picowal_query.h"
 #include "picowal_validate.h"
@@ -1808,6 +1809,8 @@ static void dispatch_picowal(http_method_t method,
                               const char* body, size_t body_len,
                              const char* cookie, size_t cookie_len,
                              bool has_pw_auth_header,
+                             const char* write_token, size_t write_token_len,
+                             const char* tenant_id, size_t tenant_id_len,
                              api_resp_t* resp) {
     if (path_len == g_picowal_prefix_len + 10 &&
         memcmp(path + g_picowal_prefix_len, "auth/login", 10) == 0) {
@@ -2103,6 +2106,37 @@ static void dispatch_picowal(http_method_t method,
         resp_text_error(resp, 400, "Bad Request", "invalid wal path\n");
         return;
     }
+
+    /* Virtual-partition ownership routing: mutations (PUT/POST-update/
+     * DELETE) against a specific record are only ever applied by the
+     * node that owns that record's virtual partition for this tenant
+     * (rendezvous-hashed over the tenant's configured writer set). A
+     * non-owner either redirects the client at the real owner or
+     * transparently proxies the request there, depending on
+     * --picowal-partition-mode. Collection-level/no-id POST (id
+     * generation) and GET/HEAD reads are left alone -- reads are served
+     * locally on the assumption the node pool is itself replicated. */
+    if (id_len > 0 && picowal_partition_enabled() &&
+        (method == M_PUT || method == M_POST || method == M_DELETE)) {
+        uint32_t pkey = 0;
+        if (picowal_path_to_key(coll, coll_len, id, id_len, &pkey)) {
+            uint32_t vpart = picowal_partition_of_key(pkey);
+            char owner[PICOWAL_PARTITION_NODE_ID_MAX];
+            if (picowal_partition_owner(tenant_id, tenant_id_len, vpart, owner, sizeof(owner)) &&
+                !picowal_partition_owner_is_self(owner)) {
+                if (picowal_partition_mode_is_proxy()) {
+                    picowal_partition_proxy(owner, vpart, method, path, path_len,
+                                            body, body_len,
+                                            write_token, write_token_len,
+                                            cookie, cookie_len, resp);
+                } else {
+                    picowal_partition_redirect(owner, vpart, path, path_len, resp);
+                }
+                return;
+            }
+        }
+    }
+
     if ((method == M_PUT || method == M_POST || method == M_DELETE) &&
         picowal_replica_mode_enabled()) {
         resp_text_error(resp, 503, "Service Unavailable", "read replica: writes must go to the primary\n");
@@ -2308,7 +2342,6 @@ void api_dispatch(http_method_t method,
                   const char* write_token, size_t write_token_len,
                   const api_request_context_t* req_ctx,
                   api_resp_t* resp) {
-    (void)req_ctx;
     memset(resp, 0, sizeof(*resp));
     if (api_blob_path_matches(path, path_len)) {
         api_blob_dispatch(method, path, path_len, body, body_len, resp);
@@ -2351,8 +2384,12 @@ void api_dispatch(http_method_t method,
     if (g_picowal_enabled &&
         path_len >= g_picowal_prefix_len &&
         memcmp(path, g_picowal_prefix, g_picowal_prefix_len) == 0) {
+        const char* tenant_id = req_ctx ? req_ctx->tenant_id : NULL;
+        size_t tenant_id_len = tenant_id ? strlen(tenant_id) : 0;
         dispatch_picowal(method, path, path_len, body, body_len,
-                         cookie, cookie_len, has_pw_auth_header, resp);
+                         cookie, cookie_len, has_pw_auth_header,
+                         write_token, write_token_len,
+                         tenant_id, tenant_id_len, resp);
         return;
     }
     if (!g_enabled ||

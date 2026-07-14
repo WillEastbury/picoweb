@@ -16,6 +16,7 @@
 #include "picowal_repl.h"
 #include "picowal_repl_client.h"
 #include "picowal_gossip.h"
+#include "picowal_partition.h"
 #include "metrics.h"
 #include "server.h"
 #include "simd.h"
@@ -71,6 +72,17 @@ static void usage(const char* argv0) {
         "  --picowal-followers=ID1,ID2,...  registered follower set for gossip-based\n"
         "                              leader election (with --picowal-replica-of, promotes\n"
         "                              a replica to writer once >50%% of followers vote for it)\n"
+        "  --picowal-partition-nodes=ID1,ID2,...  global pool of nodes eligible to own\n"
+        "                              virtual partitions (1000 vpartitions, rendezvous-\n"
+        "                              hashed per record's pack+id); enables partition\n"
+        "                              routing (requires --picowal-node-id)\n"
+        "  --picowal-partition-tenant-map=T1=ID1|ID2;T2=ID3   per-tenant override of the\n"
+        "                              writer node set used for rendezvous hashing\n"
+        "                              (tenant resolved the same way as X-PW-Tenant-Id;\n"
+        "                              falls back to --picowal-partition-nodes if unset)\n"
+        "  --picowal-partition-mode=redirect|proxy   how a non-owner node responds to a\n"
+        "                              mutation for a partition it doesn't own: 307\n"
+        "                              redirect (default) or transparent HTTP proxy\n"
         "  --oidc-cookie-auth     require OIDC-backed short-lived cookie auth for /wal/ routes\n"
         "  --oidc-cookie-ttl-sec=N session cookie ttl in seconds (default 900)\n"
         "  --oidc-google-client-id=ID expected Google OAuth client id (aud)\n"
@@ -135,6 +147,9 @@ int main(int argc, char** argv) {
     const char* picowal_replica_of_cli = NULL;
     const char* picowal_node_id_cli = NULL;
     const char* picowal_followers_cli = NULL;
+    const char* picowal_partition_nodes_cli = NULL;
+    const char* picowal_partition_tenant_map_cli = NULL;
+    const char* picowal_partition_mode_cli = "redirect";
     bool oidc_cookie_auth = false;
     uint32_t oidc_cookie_ttl_sec = 900;
     const char* oidc_google_client_id = NULL;
@@ -376,6 +391,31 @@ int main(int argc, char** argv) {
             }
             continue;
         }
+        if (strncmp(argv[i], "--picowal-partition-nodes=", 26) == 0) {
+            picowal_partition_nodes_cli = argv[i] + 26;
+            if (!picowal_partition_nodes_cli[0]) {
+                fprintf(stderr, "picoweb: --picowal-partition-nodes requires a non-empty list\n");
+                return 1;
+            }
+            continue;
+        }
+        if (strncmp(argv[i], "--picowal-partition-tenant-map=", 32) == 0) {
+            picowal_partition_tenant_map_cli = argv[i] + 32;
+            if (!picowal_partition_tenant_map_cli[0]) {
+                fprintf(stderr, "picoweb: --picowal-partition-tenant-map requires a non-empty value\n");
+                return 1;
+            }
+            continue;
+        }
+        if (strncmp(argv[i], "--picowal-partition-mode=", 25) == 0) {
+            picowal_partition_mode_cli = argv[i] + 25;
+            if (strcmp(picowal_partition_mode_cli, "redirect") != 0 &&
+                strcmp(picowal_partition_mode_cli, "proxy") != 0) {
+                fprintf(stderr, "picoweb: --picowal-partition-mode must be 'redirect' or 'proxy'\n");
+                return 1;
+            }
+            continue;
+        }
         if (strcmp(argv[i], "--oidc-cookie-auth") == 0) {
             oidc_cookie_auth = true;
             continue;
@@ -530,8 +570,23 @@ int main(int argc, char** argv) {
         fprintf(stderr, "picoweb: --picowal-followers requires --picowal-node-id\n");
         return 1;
     }
-    if (picowal_node_id_cli && !picowal_followers_cli) {
-        fprintf(stderr, "picoweb: --picowal-node-id requires --picowal-followers\n");
+    if (picowal_partition_nodes_cli && !picowal_node_id_cli) {
+        fprintf(stderr, "picoweb: --picowal-partition-nodes requires --picowal-node-id\n");
+        return 1;
+    }
+    if (picowal_node_id_cli && !picowal_followers_cli && !picowal_partition_nodes_cli) {
+        fprintf(stderr, "picoweb: --picowal-node-id requires --picowal-followers and/or "
+                "--picowal-partition-nodes\n");
+        return 1;
+    }
+    if ((picowal_partition_tenant_map_cli || strcmp(picowal_partition_mode_cli, "redirect") != 0) &&
+        !picowal_partition_nodes_cli) {
+        fprintf(stderr, "picoweb: --picowal-partition-tenant-map/--picowal-partition-mode "
+                "require --picowal-partition-nodes\n");
+        return 1;
+    }
+    if (picowal_partition_nodes_cli && !picowal_device_cli) {
+        fprintf(stderr, "picoweb: --picowal-partition-nodes requires --picowal-device\n");
         return 1;
     }
     if (picowal_followers_cli && !picowal_replica_of_cli) {
@@ -644,6 +699,25 @@ int main(int argc, char** argv) {
                     return 1;
                 }
             }
+        }
+        if (picowal_partition_nodes_cli) {
+            const char* token = picowal_write_token_cli;
+            if (!token) token = getenv("PICOWAL_WRITE_TOKEN");
+            if (!picowal_partition_configure(picowal_node_id_cli, picowal_partition_nodes_cli,
+                                             picowal_partition_tenant_map_cli,
+                                             picowal_partition_mode_cli, token)) {
+                fprintf(stderr, "picoweb: failed to enable partition routing "
+                        "(node-id='%s', nodes='%s', tenant-map='%s', mode='%s') -- "
+                        "check that --picowal-node-id appears in --picowal-partition-nodes "
+                        "and in any tenant list it should own partitions in\n",
+                        picowal_node_id_cli, picowal_partition_nodes_cli,
+                        picowal_partition_tenant_map_cli ? picowal_partition_tenant_map_cli : "",
+                        picowal_partition_mode_cli);
+                return 1;
+            }
+            fprintf(stderr, "picoweb: partition routing enabled: node='%s' mode='%s' "
+                    "(%d virtual partitions)\n",
+                    picowal_node_id_cli, picowal_partition_mode_cli, PICOWAL_PARTITION_COUNT);
         }
     }
     if (blob_root_cli) {
