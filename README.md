@@ -186,8 +186,10 @@ picoweb can expose two lightweight data APIs in the same binary:
 - **picowal raw-volume API** (new): `--picowal-device=PATH [--picowal-prefix=/wal/]`
 - **OIDC cookie auth for picowal** (optional): `--oidc-cookie-auth --oidc-google-client-id=... --oidc-entra-client-id=... [--oidc-cookie-ttl-sec=900] [--oidc-entra-tenant=...]`
 
-`picowal` uses a sector-aligned append-only log over a raw volume/file and
-maps keys as `card`/`record` integers:
+`picowal` uses a directory-based write-ahead-log (WAL) + `base.dat`
+transactional engine (see "Storage engine" below for the on-disk layout,
+transactions, durability, and checkpointing) and maps keys as
+`card`/`record` integers:
 
 - `card`: `0..1023`
 - `record`: `0..4194303`
@@ -268,17 +270,71 @@ Conventions wired in:
 Example:
 
 ```sh
-./picoweb --picowal-device=/mnt/picowal/wal.img --picowal-format \
+./picoweb --picowal-device=/var/lib/picowal --picowal-format \
           --picowal-bytes=1073741824 --picowal-prefix=/wal/ \
           8080 wwwroot
 ```
 
 Safety knobs:
 
-- `--picowal-format` is required to initialize a new non-empty volume
-- default volume size is **1 GiB**
-- writes are durable (`fdatasync`) before ack
+- `--picowal-device=DIR` is a **directory**, not a raw block device or single
+  file — it holds `base.dat` plus one or more `wal-NNNNNNNN.wal` segment files
+- `--picowal-format` is required to initialize a new (empty) volume directory
+- default WAL segment size is **1 GiB** (`--picowal-bytes`); segments seal and
+  rotate to a new file once full
+- writes are durable (`fdatasync`) at the configured durability tier before ack
 - when OIDC auth is enabled, session cookies are short-lived (`Max-Age` = `--oidc-cookie-ttl-sec`, default 900s)
+
+---
+
+## Storage engine: WAL segments, `base.dat`, transactions, durability
+
+picowal's engine keeps two kinds of files inside the device directory:
+
+- **`base.dat`** — a compacted, checkpointed snapshot of all live keys, laid
+  out as fixed-size sector-aligned slots addressed by `card`/`record`.
+- **`wal-NNNNNNNN.wal` segments** — an ordered sequence of append-only,
+  crash-safe log files. New writes always go to the *leading* (currently
+  open) segment; once a segment reaches `--picowal-bytes`, it is **sealed**
+  (marked read-only, never appended to again) and a new leading segment is
+  created. Sealed segments accumulate until a checkpoint folds them into
+  `base.dat` and deletes them.
+
+**Crash safety / A/B superblock.** Each file (both `base.dat` and every WAL
+segment) begins with two alternating 512-byte superblock slots, each carrying
+a monotonically increasing generation counter and a checksum. A checkpoint
+or append writes to whichever slot is *not* currently active; on reopen,
+whichever slot has a valid checksum **and** the higher generation wins. A
+torn/half-written superblock from a mid-write crash just fails its own
+checksum and is ignored in favor of the other, still-intact slot — the
+engine can never boot from a corrupt header, and at most the last
+in-flight append is lost (not the whole file).
+
+**Transactions.** Every mutation happens inside a transaction:
+
+- a single implicit call (`picowal_db_put_key`/`picowal_db_delete_key`) opens,
+  performs one change, and commits immediately — this is what the `/wal/*`
+  HTTP routes use today;
+- `picowal_db_txn_begin()` / `..._txn_put()` / `..._txn_delete()` /
+  `..._txn_commit()` / `..._txn_abort()` let a caller batch several changes
+  into one atomic, single commit-record unit (not yet exposed over HTTP —
+  internal-API only for now).
+
+**Durability tiers** (`picowal_durability_t`, chosen per-commit):
+
+| Tier | Behavior |
+|---|---|
+| `PICOWAL_DURABILITY_IMMEDIATE` | returns as soon as the record is queued in memory — fastest, weakest guarantee |
+| `PICOWAL_DURABILITY_LOCAL` | returns only after `fdatasync` on the local WAL segment — survives a local crash/power loss (this is what `/wal/*` HTTP routes use) |
+| `PICOWAL_DURABILITY_REMOTE` | returns only once at least one replica has acknowledged the commit over `/repl/ack/{id}/{off}` — survives loss of the primary node itself |
+
+**Checkpointing.** A background thread on the primary periodically checks how
+many bytes are reclaimable (bytes in sealed WAL segments that are already
+superseded/compacted into `base.dat`-eligible state); once that exceeds a
+threshold it folds the sealed segments into `base.dat` and deletes the
+now-redundant `wal-*.wal` files, keeping the device directory bounded in size
+instead of growing forever. This replaces the earlier single-file design's
+periodic superblock-only checkpoint with genuine log truncation.
 
 ---
 
@@ -328,7 +384,7 @@ surface:
 Example:
 
 ```sh
-./picoweb --picowal-device=/mnt/picowal/wal.img --picowal-format \
+./picoweb --picowal-device=/var/lib/picowal --picowal-format \
           --picowal-bytes=1073741824 \
           --picowal-static-card=5 --picowal-static-prefix=/site/ \
           --picowal-code-card=6 --picowal-code-prefix=/app/ \
@@ -340,42 +396,31 @@ Example:
 
 ## Log replication (multi-reader / single-writer)
 
-picowal's on-disk log is two alternating 512-byte superblock slots
-(sector 0 and 1, A/B-versioned by a generation counter — see below)
-followed by a strictly append-only, sector-aligned sequence of records
-starting at byte 1024 — nothing is ever rewritten in place. That makes a
-raw byte-range copy of `[offset, write_off)` a complete, self-describing,
-independently replayable log segment, so physical replication needs no
-separate wire format: a replica just streams new bytes and replays them
-through the same record scanner used at boot/crash-recovery.
+Replication is segment-aware: a replica doesn't stream a single growing
+file, it discovers the primary's current set of WAL segments (sealed +
+leading) and `base.dat`, fetches whichever it's missing, and then
+tail-follows the leading segment for new bytes — correctly handling
+rotation (the leading segment sealing and a new one opening) without
+losing or duplicating bytes.
 
-**On-disk header (A/B alternating superblock).** Rather than a single
-mutable superblock sector (which would risk a torn/half-written header if
-the process crashes mid-update), the header is two slots that take turns:
-each checkpoint write goes to whichever slot is *not* currently active and
-carries a monotonically increasing generation number plus a checksum. On
-open, whichever slot has a valid checksum **and** the higher generation
-wins; a torn write to one slot just fails its own checksum and is ignored
-in favor of the other, still-intact slot. Each slot also caches the log's
-`write_off`/`next_seq` at the time of that checkpoint (written after every
-`PICOWAL_SB_CHECKPOINT_INTERVAL` (128) appends, on every replicated-batch
-ingest, and on clean shutdown) — this is used to sanity-check/bound the
-log-tail scan on reopen, not to skip rebuilding the in-memory key index
-(which is always fully rebuilt from the start of the log on open — the
-index itself isn't persisted, so this is a crash-safety and bookkeeping
-improvement rather than a full-scan-avoidance optimization).
-
-**Primary side** — `--picowal-repl` (or `--picowal-repl-prefix=/p/`,
+**Primary side** — `--picowal-repl` (or `--picowal-repl-prefix=/repl/`,
 which implies it) exposes:
 
-- `GET {prefix}status` → `{"write_off":N,"volume_bytes":N,"next_seq":N,"sector_size":512}`
-- `GET {prefix}stream/N` → raw bytes `[N, min(N+4MiB, write_off))`,
-  `Content-Type: application/octet-stream`, with `X-Picowal-From` /
-  `X-Picowal-Chunk-Len` / `X-Picowal-Write-Off` response headers
-  (`N` is a path segment, not a query string — a query string would be
-  stripped before routing ever saw it)
+- `GET {prefix}status` → `{"write_off":N,"leading_wal_id":N,"next_seq":N,"sector_size":512}`
+- `GET {prefix}segments` → list of known segments:
+  `{"segments":[{"id":N,"gen":N,"sealed":true|false,"bytes":N}, ...]}`
+- `GET {prefix}segment/{id}/{gen}` → full raw bytes of a sealed segment
+  (used by a replica bootstrapping or catching up on a segment it doesn't
+  have yet)
+- `GET {prefix}stream/{id}/{off}` → raw bytes `[off, write_off)` of the
+  **leading** segment only, `Content-Type: application/octet-stream`,
+  with `X-Picowal-From`/`X-Picowal-Chunk-Len`/`X-Picowal-Write-Off`
+  response headers
+- `POST {prefix}ack/{id}/{off}` → replica acknowledges it has durably
+  persisted bytes up to `off` in segment `id`; this is what unblocks a
+  primary-side commit made with `PICOWAL_DURABILITY_REMOTE`
 
-Both endpoints always require `--picowal-write-token`/`PICOWAL_WRITE_TOKEN`
+All endpoints always require `--picowal-write-token`/`PICOWAL_WRITE_TOKEN`
 via `X-PW-Write-Token` — independent of `--oidc-cookie-auth`, since
 replication is a machine-to-machine trust boundary that streams the
 *entire* raw, schema-unvalidated log (much larger blast radius than a
@@ -383,28 +428,29 @@ single static-pack write). The feed refuses to serve at all (503) if no
 token is configured.
 
 **Replica side** — `--picowal-replica-of=http://host:port/prefix/`
-spawns a background thread that polls the primary's `status`/`stream`
-endpoints over plain HTTP (no TLS — run this over a trusted network,
-e.g. a VPC or WireGuard mesh, or front it with a TLS-terminating
-sidecar) and replays new bytes into the local picowal volume. Once
-replication starts, the node marks its local picowal volume read-only:
-all `/wal/`, static-pack, and pico-route mutation routes return
-`503 Service Unavailable` ("read replica: writes must go to the
-primary") instead of writing locally, so replicas can never silently
-diverge from the primary's log. Reads (`GET`/`HEAD`) keep serving out
-of the continuously-updated local copy.
+spawns a background thread that polls the primary's `status`/`segments`
+endpoints, fetches any sealed segments (or `base.dat`) it's missing via
+`segment/{id}/{gen}`, then tail-follows the current leading segment via
+`stream/{id}/{off}` and replays new bytes into the local picowal volume
+(no TLS — run this over a trusted network, e.g. a VPC or WireGuard mesh,
+or front it with a TLS-terminating sidecar). Once replication starts, the
+node marks its local picowal volume read-only: all `/wal/`, static-pack,
+and pico-route mutation routes return `503 Service Unavailable` ("read
+replica: writes must go to the primary") instead of writing locally, so
+replicas can never silently diverge from the primary's log. Reads
+(`GET`/`HEAD`) keep serving out of the continuously-updated local copy.
 
 Example (primary on `:8080`, replica on `:8081` polling it):
 
 ```sh
 # primary
-./picoweb --picowal-device=/mnt/picowal/wal.img --picowal-format \
+./picoweb --picowal-device=/var/lib/picowal --picowal-format \
           --picowal-write-token=change-me-to-a-real-secret \
           --picowal-repl --picowal-repl-prefix=/repl/ \
           8080 wwwroot
 
 # replica
-./picoweb --picowal-device=/mnt/picowal-replica/wal.img --picowal-format \
+./picoweb --picowal-device=/var/lib/picowal-replica --picowal-format \
           --picowal-write-token=change-me-to-a-real-secret \
           --picowal-replica-of=http://primary-host:8080/repl/ \
           8081 wwwroot
@@ -423,7 +469,7 @@ primary.
 
 ```sh
 # replica, additionally opted into gossip election
-./picoweb --picowal-device=/mnt/picowal-replica/wal.img --picowal-format \
+./picoweb --picowal-device=/var/lib/picowal-replica --picowal-format \
           --picowal-write-token=change-me-to-a-real-secret \
           --picowal-replica-of=http://primary-host:8080/repl/ \
           --picowal-node-id=replica-host:8081 \

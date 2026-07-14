@@ -5,7 +5,7 @@ set -u
 cd "$(dirname "$0")"
 
 PORT="${1:-8776}"
-VOL="$(mktemp /tmp/picowal.XXXXXX)"
+VOL="$(mktemp -d /tmp/picowal.XXXXXX)"
 WWW="$(mktemp -d)"
 mkdir -p "$WWW/localhost"
 echo '<h1>hi</h1>' > "$WWW/localhost/index.html"
@@ -22,7 +22,7 @@ start_server() {
 }
 
 start_server --picowal-format
-trap 'kill "$PID" 2>/dev/null; rm -f "$VOL"; rm -rf "$WWW"' EXIT
+trap 'kill "$PID" 2>/dev/null; rm -rf "$VOL"; rm -rf "$WWW"' EXIT
 
 fail=0
 
