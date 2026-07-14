@@ -48,4 +48,16 @@ bool picowal_repl_client_primary_healthy(void);
  * its old primary). Idempotent; safe to call even if never started. */
 void picowal_repl_client_stop(void);
 
+/* Re-points an already-running replica at a different primary
+ * (host:port + repl prefix, same "http://host[:port]/prefix/" shape
+ * as picowal_repl_client_start's primary_url) without restarting the
+ * poller thread. Used by picowal_gossip.c the moment gossip quorum
+ * establishes or changes a known leader, so followers that did NOT
+ * win an election still learn to follow whoever did, instead of
+ * staying stuck polling their original (possibly now-dead) primary
+ * forever. Thread-safe (may be called from a different thread than
+ * the one that called picowal_repl_client_start). Returns false if
+ * this node isn't currently a replica, or the URL is malformed. */
+bool picowal_repl_client_retarget(const char* new_primary_url);
+
 #endif

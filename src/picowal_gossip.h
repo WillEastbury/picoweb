@@ -16,22 +16,51 @@
  * happens. Once a follower sees its primary go unhealthy (a run of
  * consecutive failed status polls), it starts an election: it
  * deterministically nominates a single candidate (the lexicographically
- * smallest id among the registered followers -- this makes every
+ * smallest NON-BLACKLISTED id among the registered followers -- see
+ * "dead-candidate exclusion" below -- this makes every
  * correctly-functioning follower converge on the *same* candidate for a
  * given election without needing a real leader-election algorithm), and
  * gossips that vote to every other registered follower via
  * `POST {prefix}vote` (best-effort, fire-and-forget, short timeout).
  *
  * Each follower tallies votes for the current (term, candidate) pair.
- * The moment a follower observes that the candidate has been voted for
+ * The moment ANY follower observes that a candidate has been voted for
  * by *more than 50% of the registered followers* (strictly greater than
- * half of len(--picowal-followers)), and that candidate is itself, it
- * self-promotes:
+ * half of len(--picowal-followers)), it records that candidate as the
+ * known leader (symmetric -- see "symmetric leader confirmation" below)
+ * and, if that candidate is itself, self-promotes:
  *   - stops its own repl-client polling (picowal_repl_client_stop())
  *   - flips its local picowal volume back to read-write
  *     (picowal_db_set_read_only(db, false))
  *   - starts serving the primary-side replication feed
  *     (picowal_repl_init()) so the other followers can re-point at it
+ *
+ * Two behaviors closing real gaps in an earlier version of this design
+ * (found while porting this exact protocol to another service and
+ * testing it end-to-end against real multi-node failure scenarios --
+ * both are necessary for a cluster to survive MORE THAN ONE leader
+ * failure over its lifetime, not just the very first one):
+ *
+ *   - Dead-candidate exclusion: pick_candidate() excludes any follower
+ *     id already conclusively shown unhealthy (g_dead[]) while it was
+ *     the known leader. Without this, once the alphabetically-smallest
+ *     follower id has been elected and later ALSO dies (an entirely
+ *     normal event), every remaining follower would keep re-nominating
+ *     that SAME dead node on every subsequent health-check failure
+ *     forever (plain lexicographic order never changes) -- nobody can
+ *     ever vote a dead node back into quorum, so the cluster would
+ *     simply never recover past the second leader failure.
+ *   - Symmetric leader confirmation + dynamic retargeting: the moment
+ *     ANY follower observes quorum for a candidate, it records that
+ *     candidate as g_known_leader and (if the candidate isn't itself)
+ *     calls picowal_repl_client_retarget() to start following it --
+ *     not just the winning candidate learning it won. The original
+ *     design only handled self-promotion, leaving every OTHER follower
+ *     with no mechanism to ever learn a new leader had been elected
+ *     (their repl_client stayed pointed at whatever --picowal-replica-of
+ *     was originally configured with). Vote tallying is inherently
+ *     symmetric -- every follower can independently count the same
+ *     ballots -- so there's no reason only the winner should act on it.
  *
  * This is deliberately NOT a full consensus protocol (no log-matching,
  * no fencing tokens, no protection against a stale primary reappearing

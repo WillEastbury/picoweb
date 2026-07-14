@@ -65,6 +65,17 @@ static bool g_replica_mode = false;
 static volatile int g_consecutive_failures = 0;
 static volatile bool g_stop_requested = false;
 
+/* Protects the mutable host/port/path_prefix fields of *g_ctx (below)
+ * against a torn read in repl_client_thread while
+ * picowal_repl_client_retarget() (called from picowal_gossip.c's
+ * thread) is updating them concurrently. Deliberately NOT used for
+ * g_consecutive_failures/g_stop_requested -- those stay plain
+ * volatile ints/bools, matching this module's existing "control
+ * plane, not hot path" locking posture; this lock exists ONLY to make
+ * retargeting safe. */
+static pthread_mutex_t g_ctx_lock = PTHREAD_MUTEX_INITIALIZER;
+static repl_client_ctx_t* g_ctx = NULL; /* set once by picowal_repl_client_start(); retargeted in place under g_ctx_lock */
+
 bool picowal_replica_mode_enabled(void) { return g_replica_mode; }
 
 bool picowal_repl_client_primary_healthy(void) {
@@ -125,6 +136,53 @@ static bool parse_primary_url(const char* url, repl_client_ctx_t* ctx) {
         ctx->path_prefix[path_len + 1] = '\0';
     } else {
         memcpy(ctx->path_prefix, path, path_len + 1);
+    }
+    return true;
+}
+
+/* Re-points this replica at a DIFFERENT primary while already running --
+ * used by picowal_gossip.c the moment gossip quorum establishes (or
+ * changes) a known leader, so a follower that DIDN'T win the election
+ * still learns to follow whoever DID, rather than staying stuck
+ * polling the original (possibly now-dead) --picowal-replica-of URL
+ * forever (a real gap the original design left implicit -- see
+ * picowal_gossip.h's split-brain caveat and this function's callers).
+ *
+ * Resets g_consecutive_failures to 0 when the target actually changes
+ * (different host:port than currently configured) -- this matters:
+ * without it, a newly-nominated candidate would inherit stale failure
+ * counts accrued against a completely different, previous target, and
+ * could be wrongly judged unhealthy/blacklisted after just one real
+ * check against it. A no-op (returns true, no reset) if the resolved
+ * host:port is unchanged, so redundant retarget calls (e.g. gossip
+ * re-confirming the same known_leader on every tick) don't pointlessly
+ * reset the failure count and mask a genuinely failing target.
+ *
+ * Thread-safe: safe to call concurrently with repl_client_thread's own
+ * per-iteration snapshot of ctx (see g_ctx_lock). Returns false if this
+ * node isn't currently running as a replica, or the URL is malformed. */
+bool picowal_repl_client_retarget(const char* new_primary_url) {
+    if (!g_replica_mode || !g_ctx) return false;
+    repl_client_ctx_t parsed;
+    memset(&parsed, 0, sizeof(parsed));
+    if (!parse_primary_url(new_primary_url, &parsed)) {
+        fprintf(stderr, "picowal_repl_client: retarget: invalid URL '%s'\n", new_primary_url);
+        return false;
+    }
+
+    pthread_mutex_lock(&g_ctx_lock);
+    bool changed = strcmp(g_ctx->host, parsed.host) != 0 || g_ctx->port != parsed.port;
+    if (changed) {
+        memcpy(g_ctx->host, parsed.host, sizeof(g_ctx->host));
+        g_ctx->port = parsed.port;
+        memcpy(g_ctx->path_prefix, parsed.path_prefix, sizeof(g_ctx->path_prefix));
+    }
+    pthread_mutex_unlock(&g_ctx_lock);
+
+    if (changed) {
+        g_consecutive_failures = 0; /* fresh chances for the new target -- see doc comment above */
+        fprintf(stderr, "picowal_repl_client: retargeted to %s://%s:%d%s\n",
+                "http", parsed.host, parsed.port, parsed.path_prefix);
     }
     return true;
 }
@@ -415,16 +473,33 @@ static void send_ack(repl_client_ctx_t* ctx, uint32_t seg_id, uint64_t off) {
 }
 
 static void* repl_client_thread(void* arg) {
-    repl_client_ctx_t* ctx = (repl_client_ctx_t*)arg;
+    repl_client_ctx_t* shared_ctx = (repl_client_ctx_t*)arg;
     char path[REPL_PATH_MAX + 32];
 
     for (;;) {
         if (g_stop_requested) {
             g_replica_mode = false;
             fprintf(stderr, "picowal_repl_client: stopped (promoted to writer)\n");
-            free(ctx);
+            pthread_mutex_lock(&g_ctx_lock);
+            g_ctx = NULL;
+            pthread_mutex_unlock(&g_ctx_lock);
+            free(shared_ctx);
             return NULL;
         }
+
+        /* Snapshot the (possibly just-retargeted) shared ctx into a
+         * per-iteration stack copy under the lock, then use ONLY the
+         * local copy for this iteration's actual network calls -- this
+         * is what makes picowal_repl_client_retarget() (called from a
+         * DIFFERENT thread, picowal_gossip.c's) safe against a torn
+         * read of host/port/path_prefix mid-iteration. token/replica_id/
+         * db never change after picowal_repl_client_start(), so copying
+         * the whole struct is simplest and cheap (a few hundred bytes). */
+        repl_client_ctx_t ctx_copy;
+        pthread_mutex_lock(&g_ctx_lock);
+        ctx_copy = *shared_ctx;
+        pthread_mutex_unlock(&g_ctx_lock);
+        repl_client_ctx_t* ctx = &ctx_copy;
 
         snprintf(path, sizeof(path), "%sstatus", ctx->path_prefix);
         char* body = NULL; size_t body_len = 0;
@@ -538,8 +613,15 @@ bool picowal_repl_client_start(const char* primary_url, const char* write_token,
     ctx->db = db;
     snprintf(ctx->replica_id, sizeof(ctx->replica_id), "replica-%d", (int)getpid());
 
+    pthread_mutex_lock(&g_ctx_lock);
+    g_ctx = ctx; /* registered BEFORE starting the thread so a retarget() racing with startup is safe */
+    pthread_mutex_unlock(&g_ctx_lock);
+
     pthread_t th;
     if (pthread_create(&th, NULL, repl_client_thread, ctx) != 0) {
+        pthread_mutex_lock(&g_ctx_lock);
+        g_ctx = NULL;
+        pthread_mutex_unlock(&g_ctx_lock);
         free(ctx);
         return false;
     }

@@ -48,6 +48,8 @@ static int      g_term = 0;
 static char     g_candidate[GOSSIP_ID_MAX] = {0};
 static uint32_t g_vote_bitmask = 0;   /* bit i set => g_followers[i] voted for g_candidate this term */
 static volatile bool g_promoted = false;
+static bool     g_dead[GOSSIP_MAX_FOLLOWERS] = {0}; /* g_dead[i] => g_followers[i] conclusively failed health checks while it was the known leader; excluded from pick_candidate() so re-election makes forward progress instead of re-nominating the same dead node forever */
+static char     g_known_leader[GOSSIP_ID_MAX] = {0}; /* symmetric: every follower learns this the moment quorum is reached for ANY candidate, not just the winner -- see picowal_gossip.h's split-brain caveat and this file's retarget_to_leader() */
 
 bool picowal_gossip_enabled(void) { return g_enabled; }
 bool picowal_gossip_is_leader(void) { return g_promoted; }
@@ -60,11 +62,31 @@ static int find_follower(const char* id) {
 }
 
 /* Deterministic candidate pick: lexicographically-smallest registered
- * follower id. Every follower computes the same answer independently,
- * so no separate campaign/nomination round-trip is needed -- they all
- * converge on one candidate for a given election. */
+ * follower id EXCLUDING any id already conclusively shown unhealthy
+ * this process's lifetime (g_dead). Every follower computes the same
+ * answer independently, so no separate campaign/nomination round-trip
+ * is needed -- they all converge on one candidate for a given
+ * election.
+ *
+ * The g_dead exclusion is NOT cosmetic: without it, once the
+ * alphabetically-smallest follower id has been elected and later ALSO
+ * dies (a normal, expected event -- leaders fail more than once over a
+ * cluster's lifetime), every remaining follower would keep
+ * "re-electing" that same dead node on every subsequent failure
+ * forever, since plain lexicographic order never changes. Nobody can
+ * ever vote a dead node back into quorum, so election would simply
+ * never make forward progress past the second leader failure. */
 static const char* pick_candidate(void) {
-    const char* best = g_followers[0].id;
+    const char* best = NULL;
+    for (int i = 0; i < g_n_followers; i++) {
+        if (g_dead[i]) continue;
+        if (!best || strcmp(g_followers[i].id, best) < 0) best = g_followers[i].id;
+    }
+    if (best) return best;
+    /* All registered followers marked dead (shouldn't happen with a
+     * live quorum still ticking) -- fall back to the plain rule rather
+     * than nominating nothing. */
+    best = g_followers[0].id;
     for (int i = 1; i < g_n_followers; i++) {
         if (strcmp(g_followers[i].id, best) < 0) best = g_followers[i].id;
     }
@@ -77,14 +99,35 @@ static int popcount32(uint32_t v) {
     return n;
 }
 
-/* Must be called with g_lock held. Promotes if quorum is reached for a
- * candidate that is this node. */
-static void check_and_promote_locked(void) {
-    if (g_promoted) return;
-    if (g_candidate[0] == '\0' || strcmp(g_candidate, g_self_id) != 0) return;
+/* Must be called with g_lock held. Handles BOTH sides of quorum being
+ * reached for the current (term, g_candidate):
+ *   - Symmetric leader confirmation: the moment votes >= quorum for
+ *     ANY candidate (not just this node), records it in g_known_leader
+ *     and writes it to *out_new_leader (empty string if nothing new
+ *     this call) -- vote tallying is inherently symmetric (every
+ *     follower can independently count the same ballots), so there is
+ *     no reason only the winner should learn who won. Callers use
+ *     out_new_leader to retarget picowal_repl_client OUTSIDE this lock
+ *     (network I/O must never happen while g_lock is held).
+ *   - Self-promotion: unchanged from the original design -- if the
+ *     confirmed candidate is THIS node, flips to writer.
+ * out_new_leader must point at a buffer of at least GOSSIP_ID_MAX
+ * bytes; may be NULL if the caller doesn't need it (nothing else in
+ * this file needs it, but kept as a parameter rather than a global for
+ * clarity about what changed on a given call). */
+static void check_quorum_locked(char* out_new_leader) {
+    if (out_new_leader) out_new_leader[0] = '\0';
+    if (g_candidate[0] == '\0') return;
     int votes = popcount32(g_vote_bitmask);
     int quorum = g_n_followers / 2 + 1; /* strictly > 50% of registered followers */
     if (votes < quorum) return;
+
+    if (strcmp(g_known_leader, g_candidate) != 0) {
+        snprintf(g_known_leader, sizeof(g_known_leader), "%s", g_candidate);
+        if (out_new_leader) snprintf(out_new_leader, GOSSIP_ID_MAX, "%s", g_candidate);
+    }
+
+    if (g_promoted || strcmp(g_candidate, g_self_id) != 0) return; /* someone else won, or we already promoted earlier */
 
     g_promoted = true;
     fprintf(stderr, "picowal_gossip: *** %s PROMOTED TO LEADER (WRITER) via gossip quorum "
@@ -100,9 +143,22 @@ static void check_and_promote_locked(void) {
     }
 }
 
+/* Builds the "http://host:port/prefix/" URL to hand to
+ * picowal_repl_client_retarget() for the given follower id, assuming
+ * (as this whole design already does for --picowal-followers to be
+ * meaningful at all) every cluster member uses the SAME
+ * --picowal-repl-prefix convention. */
+static void build_primary_url(const char* id, char* out, size_t out_cap) {
+    snprintf(out, out_cap, "http://%s%s", id, g_repl_prefix[0] ? g_repl_prefix : "/repl/");
+}
+
 /* Adopts a (term, candidate) if it supersedes what we have, recording
- * voter's ballot. Must be called with g_lock held. */
-static void record_vote_locked(int term, const char* candidate, const char* voter) {
+ * voter's ballot. Must be called with g_lock held. Writes the newly-
+ * confirmed leader (if any) to out_new_leader -- see
+ * check_quorum_locked's doc comment; caller retargets OUTSIDE the
+ * lock. */
+static void record_vote_locked(int term, const char* candidate, const char* voter, char* out_new_leader) {
+    if (out_new_leader) out_new_leader[0] = '\0';
     if (term > g_term) {
         g_term = term;
         snprintf(g_candidate, sizeof(g_candidate), "%s", candidate);
@@ -113,7 +169,7 @@ static void record_vote_locked(int term, const char* candidate, const char* vote
     if (term != g_term || strcmp(candidate, g_candidate) != 0) return; /* stale/mismatched ballot */
     int vi = find_follower(voter);
     if (vi >= 0) g_vote_bitmask |= (1u << vi);
-    check_and_promote_locked();
+    check_quorum_locked(out_new_leader);
 }
 
 /* ---- best-effort fire-and-forget vote broadcast ------------------- */
@@ -214,6 +270,19 @@ static void* gossip_thread(void* arg) {
         }
 
         pthread_mutex_lock(&g_lock);
+        if (g_known_leader[0] != '\0') {
+            /* The confirmed leader we were following (and, once
+             * retargeted, actually polling) has failed enough
+             * consecutive health checks -- blacklist it so
+             * pick_candidate() below makes forward progress instead of
+             * re-nominating the same dead node forever (see
+             * pick_candidate's doc comment for why this matters). */
+            int di = find_follower(g_known_leader);
+            if (di >= 0) g_dead[di] = true;
+            fprintf(stderr, "picowal_gossip: known leader %s is unhealthy -- blacklisting it "
+                    "and starting a new election\n", g_known_leader);
+            g_known_leader[0] = '\0';
+        }
         const char* candidate = pick_candidate();
         if (strcmp(candidate, g_candidate) != 0) {
             g_term++;
@@ -226,8 +295,20 @@ static void* gossip_thread(void* arg) {
         int term = g_term;
         char candidate_copy[GOSSIP_ID_MAX];
         snprintf(candidate_copy, sizeof(candidate_copy), "%s", g_candidate);
-        check_and_promote_locked();
+        char new_leader[GOSSIP_ID_MAX];
+        check_quorum_locked(new_leader);
         pthread_mutex_unlock(&g_lock);
+
+        if (new_leader[0] != '\0' && strcmp(new_leader, g_self_id) != 0) {
+            /* Quorum just confirmed a DIFFERENT node as leader -- follow
+             * it (see picowal_repl_client_retarget's doc comment for why
+             * this is necessary: without it, only the winner itself
+             * would ever learn it won, and every other follower would
+             * stay stuck polling whatever primary they started with). */
+            char url[GOSSIP_ID_MAX + 32];
+            build_primary_url(new_leader, url, sizeof(url));
+            picowal_repl_client_retarget(url);
+        }
 
         for (int i = 0; i < g_n_followers; i++) {
             if (strcmp(g_followers[i].id, g_self_id) == 0) continue;
@@ -358,13 +439,14 @@ void picowal_gossip_dispatch(http_method_t method,
 
     if (method == M_GET && rest_len == 6 && memcmp(rest, "status", 6) == 0) {
         pthread_mutex_lock(&g_lock);
-        char json[256];
+        char json[320];
         int n = snprintf(json, sizeof(json),
                          "{\"self\":\"%s\",\"term\":%d,\"candidate\":\"%s\","
-                         "\"votes\":%d,\"followers\":%d,\"quorum\":%d,\"promoted\":%s}",
+                         "\"votes\":%d,\"followers\":%d,\"quorum\":%d,\"promoted\":%s,"
+                         "\"known_leader\":\"%s\"}",
                          g_self_id, g_term, g_candidate, popcount32(g_vote_bitmask),
                          g_n_followers, g_n_followers / 2 + 1,
-                         g_promoted ? "true" : "false");
+                         g_promoted ? "true" : "false", g_known_leader);
         pthread_mutex_unlock(&g_lock);
         resp_json(resp, json, (size_t)n);
         return;
@@ -380,8 +462,18 @@ void picowal_gossip_dispatch(http_method_t method,
         }
         int term = atoi(term_s);
         pthread_mutex_lock(&g_lock);
-        record_vote_locked(term, candidate, voter);
+        char new_leader[GOSSIP_ID_MAX];
+        record_vote_locked(term, candidate, voter, new_leader);
         pthread_mutex_unlock(&g_lock);
+        if (new_leader[0] != '\0' && strcmp(new_leader, g_self_id) != 0) {
+            /* Same symmetric retarget as gossip_thread's self-vote path
+             * -- this HTTP-received vote is what pushed quorum over the
+             * line for THIS follower's view, so retarget here too
+             * (network I/O deliberately kept outside g_lock above). */
+            char url[GOSSIP_ID_MAX + 32];
+            build_primary_url(new_leader, url, sizeof(url));
+            picowal_repl_client_retarget(url);
+        }
         resp_status_only(resp, 204, "No Content");
         return;
     }
