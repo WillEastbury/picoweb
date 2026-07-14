@@ -5,6 +5,7 @@
 #include "security_headers.h"
 #include "pico/picovm.h"
 #include "pico/pico_hooks.h"
+#include "picowal_partition.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -12,7 +13,7 @@
 #include <errno.h>
 
 #define PICO_ROUTE_BYTECODE_CAP  (PICOWAL_DATA_MAX / 4U)  /* words */
-#define PICO_ROUTE_ARENA_BYTES   (32U * 1024U)
+#define PICO_ROUTE_ARENA_BYTES   (128U * 1024U)
 
 static uint16_t g_card = 0;
 static char     g_prefix[64] = {0};
@@ -81,6 +82,31 @@ static int span_from_bytes(pv_ctx *ctx, const uint8_t *data, int32_t len) {
     return h;
 }
 
+/* -- partition-aware forwarding for Storage.* hooks --
+ *
+ * Storage.* operates on raw KV bytes (no /wal/ JSON-schema validation),
+ * so when partitioning is enabled and a given (pack, record) key's owner
+ * is a *different* node, these hooks forward over a dedicated internal
+ * raw endpoint ("{code-prefix}_raw/{pack}/{rec}", handled below in
+ * pico_route_dispatch()) rather than reusing /wal/'s schema-validated
+ * REST routes, which would incorrectly re-validate/re-encode data that
+ * Storage.* callers never intended to be JSON in the first place. */
+
+/* True (and *owner filled) if partitioning is enabled and this node is
+ * NOT the owner of `key` -- the caller must forward instead of touching
+ * the local volume directly. */
+static bool pr_owner_if_remote(uint32_t key, char* owner, size_t owner_cap) {
+    if (!picowal_partition_enabled()) return false;
+    uint32_t vpart = picowal_partition_of_key(key);
+    if (!picowal_partition_owner(NULL, 0, vpart, owner, owner_cap)) return false;
+    return !picowal_partition_owner_is_self(owner);
+}
+
+static int pr_raw_path(char* out, size_t cap, uint16_t pack, uint32_t rec) {
+    int n = snprintf(out, cap, "%s_raw/%u/%u", g_prefix, (unsigned)pack, (unsigned)rec);
+    return (n > 0 && (size_t)n < cap) ? n : -1;
+}
+
 static int pico_route_storage_hook(pv_ctx *ctx, int hook, int rd, int rs1, int rs2) {
     picowal_db_t *db = api_picowal_db();
     if (!db) return 0;
@@ -96,10 +122,33 @@ static int pico_route_storage_hook(pv_ctx *ctx, int hook, int rd, int rs1, int r
         for (int32_t i = 0; i < n; i++) buf[i] = ctx->mem[p + (uint32_t)i];
         /* Auto-increment: linear-probe from record 0 for the first free slot.
          * O(n) worst case but bounded by PICOWAL_RECORD_MAX in practice;
-         * app-level packs are expected to be modest in size. */
+         * app-level packs are expected to be modest in size. Under
+         * partitioning, each candidate record may live on a different
+         * owner, so the existence check + placement write both have to
+         * be routed to whichever node actually owns that candidate key. */
         for (uint32_t rec = 0; rec <= PICOWAL_RECORD_MAX; rec++) {
             uint32_t key;
             if (!picowal_db_pack_key(pack, rec, &key)) break;
+
+            char owner[PICOWAL_PARTITION_NODE_ID_MAX];
+            if (pr_owner_if_remote(key, owner, sizeof(owner))) {
+                char path[128];
+                int plen = pr_raw_path(path, sizeof(path), pack, rec);
+                if (plen < 0) continue;
+                int status = 0; char* rbody = NULL; size_t rlen = 0;
+                if (!picowal_partition_fetch(owner, M_GET, path, (size_t)plen, NULL, 0,
+                                             NULL, 0, NULL, 0, &status, &rbody, &rlen)) continue;
+                free(rbody);
+                if (status == 200) continue; /* occupied on the owner, try next rec */
+                if (status != 404) continue; /* unexpected -- skip this candidate */
+                if (!picowal_partition_fetch(owner, M_PUT, path, (size_t)plen,
+                                             (const char*)buf, (size_t)n,
+                                             NULL, 0, NULL, 0, &status, &rbody, &rlen)) continue;
+                free(rbody);
+                ctx->regs[rd] = (status == 204 || status == 200) ? (int32_t)rec : -1;
+                return 1;
+            }
+
             if (!picowal_db_exists_key(db, key)) {
                 ctx->regs[rd] = (picowal_db_put_key(db, key, buf, (uint32_t)n, true) == 0) ? (int32_t)rec : -1;
                 return 1;
@@ -127,6 +176,20 @@ static int pico_route_storage_hook(pv_ctx *ctx, int hook, int rd, int rs1, int r
         uint8_t buf[PICOWAL_DATA_MAX];
         if (n > (int32_t)sizeof(buf)) n = sizeof(buf);
         for (int32_t i = 0; i < n; i++) buf[i] = ctx->mem[p + (uint32_t)i];
+
+        char owner[PICOWAL_PARTITION_NODE_ID_MAX];
+        if (pr_owner_if_remote(key, owner, sizeof(owner))) {
+            char path[128];
+            int plen = pr_raw_path(path, sizeof(path), pack, rec);
+            int status = 0; char* rbody = NULL; size_t rlen = 0;
+            bool ok = plen >= 0 &&
+                      picowal_partition_fetch(owner, M_PUT, path, (size_t)plen,
+                                              (const char*)buf, (size_t)n,
+                                              NULL, 0, NULL, 0, &status, &rbody, &rlen);
+            free(rbody);
+            ctx->regs[rd] = (ok && (status == 204 || status == 200)) ? 1 : 0;
+            return 1;
+        }
         ctx->regs[rd] = (picowal_db_put_key(db, key, buf, (uint32_t)n, true) == 0) ? 1 : 0;
         return 1;
     }
@@ -135,6 +198,19 @@ static int pico_route_storage_hook(pv_ctx *ctx, int hook, int rd, int rs1, int r
         uint32_t rec = (uint32_t)ctx->regs[rs2];
         uint32_t key;
         if (!picowal_db_pack_key(pack, rec, &key)) { ctx->regs[rd] = 0; return 1; }
+
+        char owner[PICOWAL_PARTITION_NODE_ID_MAX];
+        if (pr_owner_if_remote(key, owner, sizeof(owner))) {
+            char path[128];
+            int plen = pr_raw_path(path, sizeof(path), pack, rec);
+            int status = 0; char* rbody = NULL; size_t rlen = 0;
+            bool ok = plen >= 0 &&
+                      picowal_partition_fetch(owner, M_DELETE, path, (size_t)plen, NULL, 0,
+                                              NULL, 0, NULL, 0, &status, &rbody, &rlen);
+            free(rbody);
+            ctx->regs[rd] = (ok && status == 204) ? 1 : 0;
+            return 1;
+        }
         ctx->regs[rd] = (picowal_db_delete_key(db, key) == 0) ? 1 : 0;
         return 1;
     }
@@ -143,6 +219,24 @@ static int pico_route_storage_hook(pv_ctx *ctx, int hook, int rd, int rs1, int r
         uint32_t rec = (uint32_t)ctx->regs[rs2];
         uint32_t key;
         if (!picowal_db_pack_key(pack, rec, &key)) { ctx->regs[rd] = 0; return 1; }
+
+        char owner[PICOWAL_PARTITION_NODE_ID_MAX];
+        if (pr_owner_if_remote(key, owner, sizeof(owner))) {
+            char path[128];
+            int plen = pr_raw_path(path, sizeof(path), pack, rec);
+            int status = 0; char* rbody = NULL; size_t rlen = 0;
+            bool ok = plen >= 0 &&
+                      picowal_partition_fetch(owner, M_GET, path, (size_t)plen, NULL, 0,
+                                              NULL, 0, NULL, 0, &status, &rbody, &rlen);
+            if (ok && status == 200 && rlen > 0) {
+                ctx->regs[rd] = span_from_bytes(ctx, (const uint8_t*)rbody, (int32_t)rlen);
+            } else {
+                ctx->regs[rd] = 0;
+            }
+            free(rbody);
+            return 1;
+        }
+
         uint8_t buf[PICOWAL_DATA_MAX];
         int n = picowal_db_get_key(db, key, buf, sizeof(buf));
         ctx->regs[rd] = (n < 0) ? 0 : span_from_bytes(ctx, buf, n);
@@ -238,6 +332,92 @@ void pico_route_dispatch(http_method_t method,
             return;
         }
         resp_status_only(resp, 204, "No Content");
+        return;
+    }
+
+    /* Internal raw KV path: "{prefix}_raw/{pack}/{rec}" -- used only for
+     * cross-node forwarding of Storage.* hook operations (see
+     * pico_route_storage_hook() above / pr_owner_if_remote()). Bypasses
+     * bytecode execution and /wal/'s JSON-schema validation entirely:
+     * Storage.* deals in raw bytes, and this path exists purely so a
+     * non-owner node can forward a raw get/put/delete to the true owner
+     * without re-validating arbitrary binary data as JSON. Never intended
+     * to be called directly by end clients; gated by the same shared
+     * write-token trust boundary as replication (api_require_write_token). */
+    size_t raw_prefix_len = g_prefix_len + 4; /* "_raw/" minus trailing already counted below */
+    if (path_len > g_prefix_len + 5 &&
+        memcmp(path, g_prefix, g_prefix_len) == 0 &&
+        memcmp(path + g_prefix_len, "_raw/", 5) == 0) {
+        (void)raw_prefix_len;
+        if (!api_require_write_token(write_token, write_token_len, resp)) return;
+
+        const char* rest = path + g_prefix_len + 5;
+        size_t rest_len = path_len - g_prefix_len - 5;
+        char buf[64];
+        if (rest_len == 0 || rest_len >= sizeof(buf)) {
+            resp_text_error(resp, 400, "Bad Request", "malformed raw path\n");
+            return;
+        }
+        memcpy(buf, rest, rest_len);
+        buf[rest_len] = 0;
+        char* slash = strchr(buf, '/');
+        if (!slash) {
+            resp_text_error(resp, 400, "Bad Request", "expected _raw/{pack}/{rec}\n");
+            return;
+        }
+        *slash = 0;
+        long pack_l = strtol(buf, NULL, 10);
+        long rec_l = strtol(slash + 1, NULL, 10);
+        if (pack_l < 0 || pack_l > PICOWAL_CARD_MAX || rec_l < 0 || (unsigned long)rec_l > PICOWAL_RECORD_MAX) {
+            resp_text_error(resp, 400, "Bad Request", "pack/rec out of range\n");
+            return;
+        }
+        uint32_t rkey;
+        if (!picowal_db_pack_key((uint16_t)pack_l, (uint32_t)rec_l, &rkey)) {
+            resp_text_error(resp, 400, "Bad Request", "invalid pack/rec\n");
+            return;
+        }
+
+        if (method == M_GET) {
+            uint8_t data[PICOWAL_DATA_MAX];
+            int n = picowal_db_get_key(db, rkey, data, sizeof(data));
+            if (n < 0) { resp_status_only(resp, 404, "Not Found"); return; }
+            resp->status = 200;
+            resp->head_len = (size_t)snprintf(resp->head, sizeof(resp->head),
+                                              "HTTP/1.1 200 OK\r\n"
+                                              "Server: picoweb\r\n"
+                                              "Content-Type: application/octet-stream\r\n"
+                                              "Content-Length: %d\r\n"
+                                              PICOWEB_SECURITY_HEADERS, n);
+            if (n > 0) {
+                resp->body = (char*)malloc((size_t)n);
+                if (resp->body) { memcpy(resp->body, data, (size_t)n); resp->body_len = (size_t)n; resp->body_owned = true; }
+            }
+            return;
+        }
+        if (method == M_PUT) {
+            if (body_len > PICOWAL_DATA_MAX) {
+                resp_text_error(resp, 400, "Bad Request", "body too large\n");
+                return;
+            }
+            if (picowal_db_put_key(db, rkey, body, (uint32_t)body_len, true) != 0) {
+                if (errno == EROFS) { resp_text_error(resp, 503, "Service Unavailable", "read replica\n"); return; }
+                if (errno == ENOSPC) { resp_text_error(resp, 507, "Insufficient Storage", "wal volume full\n"); return; }
+                resp_text_error(resp, 500, "Internal Server Error", "raw put failed\n");
+                return;
+            }
+            resp_status_only(resp, 204, "No Content");
+            return;
+        }
+        if (method == M_DELETE) {
+            if (picowal_db_delete_key(db, rkey) != 0) {
+                resp_status_only(resp, 404, "Not Found");
+                return;
+            }
+            resp_status_only(resp, 204, "No Content");
+            return;
+        }
+        resp_status_only(resp, 405, "Method Not Allowed");
         return;
     }
 

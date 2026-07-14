@@ -918,6 +918,39 @@ static bool picowal_read_meta_json(uint16_t meta_pack, uint32_t pack_id, char* o
 
 static bool json_escape_copy(const char* src, char* out, size_t out_cap);
 
+/* Builds a small JSON fragment describing this node's partition-routing
+ * topology, for the admin/GUI form spec and the /wal/partitions endpoint
+ * to surface ownership info to operators (which node they're on, how many
+ * peers share the tenant's pool, and how it forwards non-owned writes).
+ * This is deliberately a *topology* summary, not a per-record ownership
+ * map -- ownership of any given (pack, record) is a pure function of the
+ * key (see picowal_partition_of_key/_owner), computed on demand, not
+ * something worth precomputing/caching for 1000 vpartitions here. */
+static void picowal_partition_gui_snippet(char* out, size_t out_cap) {
+    if (!picowal_partition_enabled()) {
+        snprintf(out, out_cap, "{\"enabled\":false}");
+        return;
+    }
+    char nodes[32][PICOWAL_PARTITION_NODE_ID_MAX];
+    int n = picowal_partition_all_nodes(NULL, 0, nodes, 32);
+    const char* self = picowal_partition_self_id();
+
+    char node_arr[32 * (PICOWAL_PARTITION_NODE_ID_MAX + 4)] = {0};
+    size_t o = 0;
+    for (int i = 0; i < n; i++) {
+        int w = snprintf(node_arr + o, sizeof(node_arr) - o, "%s\"%s\"",
+                         (i > 0) ? "," : "", nodes[i]);
+        if (w <= 0 || (size_t)w >= sizeof(node_arr) - o) break;
+        o += (size_t)w;
+    }
+
+    snprintf(out, out_cap,
+             "{\"enabled\":true,\"mode\":\"%s\",\"self\":\"%s\","
+             "\"vpartitions\":%d,\"node_count\":%d,\"nodes\":[%s]}",
+             picowal_partition_mode_is_proxy() ? "proxy" : "redirect",
+             self ? self : "", PICOWAL_PARTITION_COUNT, n, node_arr);
+}
+
 static bool picowal_build_form_spec(uint32_t pack_id, char** out_json, size_t* out_len,
                                     int* out_status, char* err, size_t err_cap) {
     if (!out_json || !out_len) return false;
@@ -1021,26 +1054,30 @@ static bool picowal_build_form_spec(uint32_t pack_id, char** out_json, size_t* o
 
     size_t o = 0;
     int n;
+    char part_json[1200];
+    picowal_partition_gui_snippet(part_json, sizeof(part_json));
     if (has_name) {
         n = snprintf(out + o, cap - o,
                      "{\"pack\":%u,\"entity\":\"%s\",\"schema\":%s,"
                      "\"app\":{\"model_version\":1,\"title\":\"%s\",\"icon\":\"%s\",\"pages\":\"%s\","
                      "\"nav\":\"%s\",\"list_columns\":\"%s\",\"layout\":\"%s\",\"actions\":\"%s\","
                      "\"page_size\":\"%s\",\"default_sort\":\"%s\",\"field_labels\":\"%s\","
-                     "\"field_placeholders\":\"%s\"}}",
+                     "\"field_placeholders\":\"%s\"},\"partition\":%s}",
                      pack_id, esc_name, schema,
                      esc_title, esc_icon, esc_pages, esc_nav, esc_list_columns, esc_layout,
-                     esc_actions, esc_page_size, esc_default_sort, esc_field_labels, esc_field_placeholders);
+                     esc_actions, esc_page_size, esc_default_sort, esc_field_labels, esc_field_placeholders,
+                     part_json);
     } else {
         n = snprintf(out + o, cap - o,
                      "{\"pack\":%u,\"entity\":null,\"schema\":%s,"
                      "\"app\":{\"model_version\":1,\"title\":\"%s\",\"icon\":\"%s\",\"pages\":\"%s\","
                      "\"nav\":\"%s\",\"list_columns\":\"%s\",\"layout\":\"%s\",\"actions\":\"%s\","
                      "\"page_size\":\"%s\",\"default_sort\":\"%s\",\"field_labels\":\"%s\","
-                     "\"field_placeholders\":\"%s\"}}",
+                     "\"field_placeholders\":\"%s\"},\"partition\":%s}",
                      pack_id, schema,
                      esc_title, esc_icon, esc_pages, esc_nav, esc_list_columns, esc_layout,
-                     esc_actions, esc_page_size, esc_default_sort, esc_field_labels, esc_field_placeholders);
+                     esc_actions, esc_page_size, esc_default_sort, esc_field_labels, esc_field_placeholders,
+                     part_json);
     }
     if (n <= 0 || (size_t)n >= cap - o) { free(out); snprintf(err, err_cap, "render failed"); return false; }
     o += (size_t)n;
@@ -2230,6 +2267,22 @@ static void dispatch_picowal(http_method_t method,
             return;
         }
         resp_get_body(resp, out, out_len, false);
+        return;
+    }
+
+    if (path_len == g_picowal_prefix_len + 10 &&
+        memcmp(path + g_picowal_prefix_len, "partitions", 10) == 0) {
+        if (!(method == M_GET || method == M_HEAD)) {
+            resp_status_only(resp, 405, "Method Not Allowed");
+            return;
+        }
+        char snippet[1200];
+        picowal_partition_gui_snippet(snippet, sizeof(snippet));
+        char* out = (char*)malloc(strlen(snippet) + 1);
+        if (!out) { resp_status_only(resp, 500, "Internal Server Error"); return; }
+        size_t out_len = strlen(snippet);
+        memcpy(out, snippet, out_len);
+        resp_get_body(resp, out, out_len, method == M_HEAD);
         return;
     }
 

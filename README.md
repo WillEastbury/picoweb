@@ -626,6 +626,49 @@ See `test_picowal_partition.sh` for an end-to-end 3-node test covering
 ownership agreement, redirect/proxy write routing, and the query
 fan-out gateway.
 
+### PicoScript `Storage.*` hooks are partition-aware too
+
+Dynamic PicoScript routes (`--picowal-code-card`, see "Static content and
+dynamic routes straight from picowal" above) read/write raw bytes via
+`Storage.AddCard`/`ReadCard`/`UpdateCard`/`DeleteCard`, bypassing `/wal/`'s
+JSON-schema pipeline entirely. When partitioning is enabled, these hooks
+resolve the owner of the `(pack, record)` key being touched exactly like
+`/wal/` does, and — if the owner isn't this node — transparently forward
+the raw operation to it over an internal, non-schema-validated endpoint
+(`{code-prefix}_raw/{pack}/{rec}`, not intended to be called directly by
+clients, gated by the same `X-PW-Write-Token`/OIDC trust boundary as the
+bytecode-deploy path). `Storage.AddCard`'s auto-increment placement scan
+resolves the owner of *each candidate record* independently (since
+different candidate ids can land on different owners) and does a remote
+existence-check-then-claim for any candidate it doesn't own itself — so a
+PicoScript card behaves identically whether it's running on the record's
+owner or not. See `test_pico_route_partition.sh` for an end-to-end test
+that deploys a router card to 3 partitioned nodes and confirms a card
+added via one node is readable through every node in the pool.
+
+### Surfacing partition/ownership info to admin & GUI tooling
+
+Two read-only JSON surfaces let admin tooling display partition topology
+without needing to re-derive it from CLI flags:
+
+- `GET /wal/partitions` — a standalone topology summary:
+  ```json
+  {"enabled":true,"mode":"proxy","self":"10.0.0.1:8080",
+   "vpartitions":1000,"node_count":3,
+   "nodes":["10.0.0.1:8080","10.0.0.2:8080","10.0.0.3:8080"]}
+  ```
+  (`{"enabled":false}` if partitioning isn't configured on this node.)
+- `GET /wal/forms/{pack}` — the existing data-driven CRUD form spec now
+  also includes a `"partition"` field with the same shape, so a GUI
+  rendering a pack's form can show which node it's talking to and how
+  many peers share the tenant's pool alongside the form itself.
+
+This is a *topology* summary (node pool, mode, vpartition count), not a
+precomputed per-record ownership map — resolving the owner of any given
+`(pack, record)` is already a cheap, on-demand hash computation (see
+`picowal_partition_of_key`/`picowal_partition_owner`), so there's nothing
+worth caching per-record for 1000 vpartitions here.
+
 ---
 
 ## Performance flags

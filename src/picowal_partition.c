@@ -43,6 +43,7 @@ static int         g_n_tenants = 0;
 
 bool picowal_partition_enabled(void) { return g_enabled; }
 bool picowal_partition_mode_is_proxy(void) { return g_mode_proxy; }
+const char* picowal_partition_self_id(void) { return g_self_id[0] ? g_self_id : NULL; }
 
 /* FNV-1a over a byte buffer, followed by a MurmurHash3-style 64-bit
  * finalizer (fmix64) for full avalanche -- plain FNV-1a doesn't mix a

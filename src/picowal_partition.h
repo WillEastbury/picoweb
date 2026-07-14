@@ -66,6 +66,12 @@ bool picowal_partition_configure(const char* self_id, const char* nodes_csv,
 bool picowal_partition_enabled(void);
 bool picowal_partition_mode_is_proxy(void);
 
+/* Accessor for this node's own configured id ("host:port"), so admin/GUI
+ * surfaces (api.c's form-spec + /wal/partitions endpoint) can report which
+ * node they're talking to without re-deriving it from listen address.
+ * Returns NULL/empty if partitioning isn't configured. */
+const char* picowal_partition_self_id(void);
+
 /* Reduce a packed picowal key (picowal_db_pack_key() result) to a virtual
  * partition id in [0, PICOWAL_PARTITION_COUNT). */
 uint32_t picowal_partition_of_key(uint32_t key);
