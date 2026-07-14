@@ -574,6 +574,7 @@ int main(int argc, char** argv) {
                               picowal_prefix_cli, picowal_format)) {
             return 1;
         }
+        picowal_db_start_background_threads(api_picowal_db());
         if (static_pack_card >= 0 || pico_route_card >= 0) {
             const char* token = picowal_write_token_cli;
             if (!token) token = getenv("PICOWAL_WRITE_TOKEN");

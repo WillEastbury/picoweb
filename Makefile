@@ -21,7 +21,7 @@ USERSPACE_TLS_SRC := \
 	userspace/io/af_xdp.c \
 	userspace/xdp/xdp_loader.c \
 	userspace/crypto/util.c \
-	userspace/crypto/cpuid.c \
+	userspace/crypto/pw_cpuid.c \
 	userspace/crypto/sha256.c \
 	userspace/crypto/sha256_shani.c \
 	userspace/crypto/sha256_armv8.c \

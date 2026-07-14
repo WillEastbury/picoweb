@@ -2327,7 +2327,7 @@ void api_dispatch(http_method_t method,
         return;
     }
     if (picowal_repl_path_matches(path, path_len)) {
-        picowal_repl_dispatch(method, path, path_len, write_token, write_token_len, resp);
+        picowal_repl_dispatch(method, path, path_len, body, body_len, write_token, write_token_len, resp);
         return;
     }
     if (picowal_gossip_path_matches(path, path_len)) {

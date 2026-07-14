@@ -3,14 +3,18 @@
 
 /* Replica-side puller for picowal_repl.c's primary replication feed.
  * Spawns a background thread that repeatedly polls a primary's
- * {prefix}status / {prefix}stream endpoints over plain HTTP (no TLS --
- * run this over a private/trusted network, e.g. a VPC or WireGuard mesh,
- * or in front of a TLS-terminating sidecar) and applies received log
- * bytes to the local picowal volume via picowal_db_repl_ingest(), turning
- * this node into a read replica: local /wal/ mutation routes should be
- * refused (see picowal_replica_mode_enabled()) while GET/HEAD reads keep
- * serving out of the continuously-updated local copy -- multi-reader/
- * single-writer topology for load-balanced read scaling. */
+ * {prefix}status / {prefix}segments / {prefix}segment/{id}/{gen} /
+ * {prefix}stream/{id}/{off} endpoints over plain HTTP (no TLS -- run this
+ * over a private/trusted network, e.g. a VPC or WireGuard mesh, or in
+ * front of a TLS-terminating sidecar), reconciling base.dat + WAL
+ * segments locally via picowal_db_repl_install_segment()/
+ * _ingest_segment()/_drop_segment(), and periodically POSTs
+ * {prefix}ack/{id}/{off} so the primary can satisfy
+ * PICOWAL_DURABILITY_REPLICATED quorum waits. This turns the node into a
+ * read replica: local /wal/ mutation routes should be refused (see
+ * picowal_replica_mode_enabled()) while GET/HEAD reads keep serving out
+ * of the continuously-updated local copy -- multi-reader/single-writer
+ * topology for load-balanced read scaling. */
 
 #include <stdbool.h>
 #include <stddef.h>
