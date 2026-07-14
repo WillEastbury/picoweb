@@ -21,9 +21,16 @@ file via `wrk -c 64`, and ~810k req/s aggregated across four worker threads
 serving in parallel. It will saturate a 10 GbE link long before it saturates
 the CPU.
 
-> **Status:** working hobby project. ~2.7k lines of C, no external deps
-> beyond libc + pthreads. Linux-only (uses `epoll`, `SO_REUSEPORT`,
-> `accept4`).
+> **Status:** working hobby project. The core static-file server (`src/`,
+> excluding the `picowal` mini-datastore and the `userspace/` TLS/TCP/QUIC
+> stack described below) is a few thousand lines of C; the repo as a
+> whole (server + `userspace/` from-scratch TLS 1.3/TCP/QUIC/HTTP-3
+> stack + `picowal` WAL datastore with replication) is ~44k lines
+> across ~170 files. No external deps beyond libc + pthreads.
+> Linux-only (uses `epoll`, `SO_REUSEPORT`, `accept4`). See
+> `userspace/DESIGN.md` for the from-scratch network stack's current,
+> honestly-tracked status (what's real/tested/wired into the live
+> binary vs. sketched-but-not-wired).
 
 ---
 
@@ -45,6 +52,8 @@ the CPU.
 - [Limits / hard caps](#limits--hard-caps)
 - [What's deliberately NOT supported](#whats-deliberately-not-supported)
 - [Source layout](#source-layout)
+- [Userspace TCP+TLS foundation](#userspace-tcptls-foundation-userspace)
+- [`picowal` — an embedded WAL datastore with replication](#picowal--an-embedded-wal-datastore-with-replication---picowal-device)
 - [License](#license)
 
 ---
@@ -935,27 +944,103 @@ Helper scripts at the repo root:
 
 ## Userspace TCP+TLS foundation (`userspace/`)
 
-A pure-C TLS 1.3 + TCP/IP + AF_PACKET foundation lives under
-`userspace/`. It's the intended substrate for a future real `--dpdk`
-backend, but is **not wired into the picoweb binary today**.
+A pure-C TLS 1.3 + TCP/IP + AF_PACKET/AF_XDP foundation lives under
+`userspace/`. **Updated: parts of this ARE now wired into the live
+`picoweb` binary** (see the root `Makefile`'s `USERSPACE_TLS_SRC`) --
+this section previously said "not wired into the picoweb binary
+today," which is no longer accurate for the crypto/TLS pieces.
+Specifically: `server_tls_kernel.c` runs the from-scratch TLS 1.3
+record layer and handshake engine (`userspace/tls/`, `userspace/crypto/`)
+**over ordinary kernel TCP sockets** (not AF_PACKET/AF_XDP/DPDK) --
+"kernel TCP, userspace TLS" is the model that's actually live today.
+The full from-scratch **TCP/IP** stack (`userspace/tcp/`) and the
+AF_PACKET/AF_XDP/DPDK packet-I/O paths remain compiled but not
+exercised end-to-end against a real NIC (see
+[`userspace/DESIGN.md`](./userspace/DESIGN.md) for the honest, current
+breakdown of what's wired vs. sketched).
 
-What's real (38 RFC-vector tests pass — `cd userspace/tests && make test`):
+What's real (50+ RFC-vector tests pass in `test_crypto.c` alone, plus
+a separate `test_quic_primitives` binary — `cd userspace/tests && make test`):
 
-- Crypto: SHA-256, HMAC-SHA256, HKDF-SHA256, ChaCha20, Poly1305,
-  ChaCha20-Poly1305 AEAD, X25519 — all from-scratch, no third-party
-  crypto, validated against RFC vectors.
-- TLS 1.3 key schedule (RFC 8448 §3 vectors green) and record layer
-  (seal / open with sequence-number nonce, tamper detection).
+- Crypto: SHA-256, SHA-512, HMAC-SHA256, HKDF-SHA256, ChaCha20,
+  Poly1305, ChaCha20-Poly1305 AEAD, X25519, Ed25519, **RSA, ECDSA/P-256**
+  — all from-scratch, no third-party crypto, validated against RFC
+  vectors. (RSA/ECDSA were previously listed as "not in scope" here;
+  both are now compiled into the live binary and unit-tested.)
+- Full TLS 1.3 handshake: record layer (seal/open, tamper detection),
+  key schedule (RFC 8448 §3 vectors), ClientHello/ServerHello/
+  EncryptedExtensions/Certificate/Finished parsers and builders, an
+  SNI-aware cert store with PEM decoding, session tickets.
 - IPv4 + TCP build/parse with full checksums.
-- TCP passive-open state machine: `LISTEN → SYN-RECEIVED →
-  ESTABLISHED → CLOSE-WAIT → LAST-ACK → CLOSED`.
-- AF_PACKET RX/TX skeleton (Linux only, compile-clean).
+- Full TCP state machine: passive-open (`LISTEN → SYN-RECEIVED →
+  ESTABLISHED → CLOSE-WAIT → LAST-ACK → CLOSED`), **retransmit, RTO
+  (RFC 6298), fast retransmit/fast recovery (RFC 5681)**, and
+  zero-window flow control — all previously listed as "not in scope,"
+  all now real in `tcp/tcp.c`.
+- AF_PACKET + AF_XDP RX/TX (Linux only, compile-clean, no E2E test
+  against a real link yet).
+- A **full QUIC transport + HTTP/3 + QPACK** implementation
+  (`userspace/quic/`, `userspace/h3/`, `userspace/qpack/`) — real and
+  RFC-vector-tested via `test_quic_primitives`, but **not yet linked
+  into the live `picoweb` server** (a large body of tested code
+  awaiting protocol-level integration).
 
-What's deliberately **not** in scope: AES-GCM, RSA / ECDSA signing,
-TLS handshake message parsing (ClientHello / ServerHello), TCP
-retransmit / RTO / congestion control / SACK, SYN cookies, parser
-fuzzing, real DPDK binding. See [`userspace/DESIGN.md`](./userspace/DESIGN.md)
-for the honest scope and roadmap.
+What's still deliberately **not** in scope: AES-GCM is not wired into
+`tls/record.c`'s dispatch (ChaCha20-Poly1305 only), TCP SYN
+cookies/listen-queue protection, parser fuzzing, and any end-to-end
+test of AF_PACKET/AF_XDP/DPDK against a real NIC (WSL has no
+passthrough NIC to test against). See
+[`userspace/DESIGN.md`](./userspace/DESIGN.md) for the full, current,
+honestly-tracked scope and roadmap.
+
+---
+
+## `picowal` — an embedded WAL datastore with replication (`--picowal-device`)
+
+A separate embedded data-store engine lives alongside the HTTP server
+(`src/picowal_*.c`), enabled via `--picowal-device=PATH` (see
+`./picoweb --help`). It's a real write-ahead-log engine, not a toy:
+
+- **On-disk model**: a directory containing a crash-safe alternating
+  A/B superblock, a checkpointed `base.dat` snapshot, and a sequence
+  of monotonically-numbered WAL segments (exactly one "leading"
+  segment open for appends at a time, the rest sealed/read-only).
+  Every mutation is WAL-appended first (with a configurable durability
+  tier — see `picowal_db.h`), applied to the in-memory index on
+  commit, and later folded into `base.dat` by
+  `picowal_db_checkpoint()`, which then deletes the now-fully-applied
+  sealed segments.
+- **HTTP JSON API** (`/wal/...` by default): explicit and
+  auto-commit transactions, query (`picowal_query.c`) and schema
+  validation (`picowal_validate.c`) layers on top of the raw
+  key/record store.
+- **Primary/replica physical replication** (`--picowal-repl` /
+  `--picowal-replica-of=http://HOST:PORT/PREFIX/`): a replica pulls
+  the primary's segment list + leading-segment byte stream over plain
+  HTTP and reconciles its own local copy — no shared network
+  filesystem required.
+- **Gossip-based leader election** (`--picowal-node-id` /
+  `--picowal-followers=...`): a fixed, statically-configured follower
+  set deterministically nominates and quorum-votes a new writer when
+  the current primary goes unhealthy, for multi-reader/single-writer
+  topologies. This is deliberately **not a full consensus protocol**
+  (no fencing tokens, no protection against a stale primary
+  reappearing mid-election) — see the doc comment at the top of
+  `src/picowal_gossip.h` for the exact, current design and its
+  explicitly-tracked limitations, and `tests/test_gossip_backport.c`
+  for an isolated unit test of its dead-candidate-exclusion and
+  symmetric-leader-confirmation behavior.
+- Optional static-content and PicoScript-bytecode serving straight out
+  of a picowal volume (`--picowal-static-card=N`,
+  `--picowal-code-card=N`).
+
+This same replication/gossip protocol was ported to a Python service
+(`wavesearch-api`) elsewhere in this workspace and tested end-to-end
+against real multi-node bootstrap and failover scenarios; two real
+bugs found during that port (dead-candidate re-election never making
+forward progress, and a stale-failure-count bug when retargeting to a
+new leader) were back-ported into `picowal_gossip.c`/
+`picowal_repl_client.c` here as a result.
 
 ---
 

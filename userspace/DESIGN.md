@@ -4,59 +4,103 @@
 > spike and has been promoted to the project's permanent userspace
 > network stack (see commit history on `main`). It is not a production
 > stack — the work to ship a real userspace TCP+TLS network path is
-> still months of engineering — but it is the canonical home of the
-> crypto, TLS, and TCP work and is exercised by 130 tests on every
-> build.
+> still real engineering — but it is the canonical home of the
+> crypto, TLS, and TCP work and is exercised by 50+ RFC-vector/
+> integration tests in `userspace/tests/test_crypto.c` alone (plus a
+> separate `test_quic_primitives` binary, see below) on every build.
 >
-> **What is real, here, and green (130 RFC-vector + integration tests passing):**
-> SHA-256 (with runtime-dispatched **SHA-NI** HW acceleration on x86),
-> HMAC-SHA256, HKDF-SHA256, ChaCha20 (with runtime-dispatched **SSE2
-> 4-way** SIMD), Poly1305, ChaCha20-Poly1305 AEAD with both contiguous
-> and **scatter-gather (`*_iov`)** seal paths, X25519 ECDH, TLS 1.3
-> HKDF-Expand-Label and Derive-Secret (RFC 8448 §3 vectors), TLS 1.3
-> record seal/open with sequence-number nonce **and** scatter-gather
-> seal (`tls13_seal_record_iov` proven byte-identical to the
-> contiguous path), TLS 1.3 ClientHello parser, ServerHello /
-> EncryptedExtensions / Certificate / Finished wire builders,
-> handshake-secret derivation, running transcript-hash helper, Finished
-> compute + verify (RFC 8446 §4.4.4), IPv4 + TCP header build/parse
-> with both IPv4 and TCP checksums, TCP passive-open state machine
-> (LISTEN → SYN-RECEIVED → ESTABLISHED → CLOSE-WAIT → LAST-ACK), an
-> **L4 pre-jump table (`pw_dispatch_t`)** routing inbound bytes by
-> `(proto, dst_port)` so one TCP stack can host many services
-> independently (HTTPS, HTTP, gossip, DNS, …) with strict zero-alloc
-> per-conn pools and SYN-flood-safe `on_open`/`on_close` lifecycle,
-> SNI-aware in-memory cert store (env + disk, PEM decoder), per-worker
-> zero-allocation buffer pool, runtime CPU feature detection,
-> `pw_conn` run-to-completion runtime that walks RX → TLS-open → HTTP
-> slice → response_fn → TLS-seal → TX in one call.
+> **This status block is updated as of the current `main` -- several
+> items an earlier version of this doc listed as "explicitly NOT in
+> this branch" have since been built and are now compiled into the
+> live `picoweb` binary (see the root `Makefile`'s `USERSPACE_TLS_SRC`
+> list). Read the bullet list below, not just the historical "why"
+> sections further down this document, which still describe the
+> original spike's scope and are kept for narrative context.**
+>
+> **What is real, wired into the live `picoweb` binary, and green:**
+> SHA-256 (SHA-NI/ARMv8 dispatch), SHA-512, HMAC-SHA256, HKDF-SHA256,
+> ChaCha20 (SSE2 4-way), Poly1305, ChaCha20-Poly1305 AEAD (contiguous
+> **and** scatter-gather `_iov` seal), X25519 ECDH, Ed25519 sign/verify,
+> **RSA and ECDSA/P-256** (both compiled into `USERSPACE_TLS_SRC` and
+> unit-tested -- `test_ecdsa_p256` in `test_crypto.c` -- despite an
+> earlier version of this doc saying "explicitly NOT in this branch";
+> that statement is now stale), full TLS 1.3 record layer
+> (`tls/record.c`), handshake message parsers/builders and key
+> schedule (`tls/handshake.c`, `tls/keysched.c`, RFC 8448 §3 vectors),
+> an SNI-aware in-memory cert store with PEM decoding and session
+> tickets (`tls/cert.c`, `tls/pem.c`, `tls/ticket_store.c`), a real
+> `tls/engine.c` handshake state machine, IPv4 + TCP header build/parse
+> with checksums, a **full TCP state machine including retransmit, RTO
+> (RFC 6298 Karn's-algorithm RTT sampling), and fast retransmit/fast
+> recovery (RFC 5681)** (`tcp/tcp.c` -- also now real; an earlier
+> version of this doc listed "TCP retransmit / RTO / congestion
+> control" as explicitly NOT in this branch), an L4 pre-jump table
+> (`pw_dispatch_t`) routing inbound bytes by `(proto, dst_port)`,
+> SYN-flood-safe `on_open`/`on_close` lifecycle, per-worker
+> zero-allocation buffer pools, runtime CPU feature detection, and a
+> `pw_conn` run-to-completion runtime (RX -> TLS-open -> HTTP slice ->
+> response_fn -> TLS-seal -> TX in one call).
+>
+> **What is real and tested, but NOT wired into the live `picoweb`
+> binary:** a full **QUIC transport** (`userspace/quic/` -- packets,
+> frames, loss detection, congestion control, flow control, streams,
+> handshake driver, transport params) plus **HTTP/3** (`userspace/h3/`)
+> and **QPACK** (`userspace/qpack/`) header compression. All of this
+> compiles and is exercised by the separate `test_quic_primitives`
+> binary (`userspace/tests/Makefile`), but none of these source files
+> appear in the root `Makefile`'s `USERSPACE_TLS_SRC` -- the running
+> server does not speak QUIC/HTTP-3 today. This is a large body of
+> real, tested primitive-level code waiting on protocol-level
+> integration, the same "primitives real, wiring not done yet" shape
+> as the rest of this stack.
 >
 > **What is sketched but not wired:** AF_PACKET I/O (compiles on
-> Linux, no E2E test), DPDK pump (real `rte_*` calls under
-> `-DWITH_DPDK=1`; stub mode returns -1 otherwise so the binary
-> always links).
-> The BearSSL-style explicit TLS engine state machine is in tree but
-> still uses the spike-mode `install_app_keys` shortcut; full
-> handshake hookup is the next step.
+> Linux, no E2E test against a real link -- see "Why this won't run
+> end-to-end in WSL" below), AF_XDP (compiles, same caveat), DPDK pump
+> (real `rte_*` calls under `-DWITH_DPDK=1`; stub mode returns -1
+> otherwise so the binary always links).
 >
-> **What is deliberately not in scope:**
-> - **ECDSA / RSA** cert signing — Ed25519 is implemented (RFC 8032,
->   §7.1 vectors pass) and is the only signature algorithm the server
->   advertises. ECDSA / RSA add code surface without buying anything
->   we need for a single-cert spike.
-> - **AES-GCM** — TLS 1.3 ChaCha20-Poly1305 only. AES-GCM costs a real
->   amount of code without a real perf win on modern CPUs that have AES-NI
->   but no SHA-NI for AES-GCM's GHASH (and vice versa). One AEAD is
->   plenty for a spike; we'll add AES-GCM if a use-case forces it.
-> - **`gzip`/`brotli`/`zstd`** — the picoweb HTTP server uses
->   `picoweb-compress` (vendored, ~250 lines of LZ77, wire-compatible
->   with BareMetal.Compress.js). No third-party compression code in tree.
-> - **TCP retransmit / RTO / congestion control / SACK / SYN cookies**
->   — happy-path passive open only.
-> - **Receive-window-driven backpressure** — static 65535-byte window
->   today; flagged in [next steps](#open-engineering-items).
-> - **Fuzz testing of parsers** — would be the right next thing once
->   the handshake actually completes end-to-end.
+> **What is still genuinely deliberately out of scope (these parts of
+> the original spike's caveats remain accurate):**
+> - **AES-GCM** is NOT wired into the live TLS record dispatch --
+>   `aes_gcm.c` exists in `userspace/crypto/` (vendored out into the
+>   standalone `picocrypto`/`picotlsclient`/`picox509` repos too) but
+>   is deliberately absent from the root `Makefile`'s
+>   `USERSPACE_TLS_SRC`; `tls/record.c` only ever dispatches
+>   ChaCha20-Poly1305. Offering `TLS_AES_128_GCM_SHA256` without a real
+>   dispatch path would silently misbehave against any peer that picks
+>   it -- exactly the class of bug this session's `picotlsclient` work
+>   found and fixed on the *client* side; the *server* side hasn't
+>   been extended to dispatch AES-GCM yet either.
+> - **No SYN cookies / listen-queue protection.** `tcp.c`'s retransmit
+>   and congestion control are real, but there is still no defense
+>   against a SYN flood on the passive-open path -- this remains a
+>   real DoS exposure if this stack is ever exposed to an untrusted
+>   network without a fronting LB/firewall.
+> - **No cert chain validation** in the server-side TLS engine (it
+>   presents ITS OWN cert/key, so there's nothing to validate as a
+>   server -- this caveat is really about client-cert / mTLS support,
+>   which still doesn't exist).
+> - **No fuzz testing of parsers.** RFC test vectors prove the happy
+>   path; hostile/malformed inputs (especially into the QUIC/H3/QPACK
+>   parsers, which are newer and less battle-tested than the TLS 1.3
+>   record layer) are an enormous, unexamined attack surface.
+> - **AF_PACKET/AF_XDP/DPDK have never been exercised end-to-end
+>   against a real NIC** -- see "Why this won't run end-to-end in
+>   WSL" below; this is unchanged from the original spike.
+> - **No `gzip`/`brotli`/`zstd`** in this userspace stack's own scope
+>   -- the picoweb HTTP server uses `picoweb-compress` (vendored,
+>   ~250 lines of LZ77, wire-compatible with `BareMetal.Compress.js`);
+>   `src/brotli.c` exists in the tree but serves a different purpose
+>   (not the TLS/TCP userspace path this document describes).
+>
+> **Corrected from the original spike text:** receive-window-driven
+> backpressure is now real (`tcp.c` implements zero-window handling:
+> refuses to consume payload while the advertised window is 0,
+> re-ACKs with the current window so the peer retransmits once it
+> reopens) -- an earlier version of this doc listed this as "static
+> 65535-byte window today, flagged as an open item"; that's no longer
+> accurate.
 
 ## Why we'd ever do this
 
@@ -81,7 +125,14 @@ out. We do not pretend this is small work.
 
 ## Scope of this branch
 
-In the spike we deliver:
+**This section describes the original spike's initial scope as first
+written -- it is kept for narrative/historical context. See the status
+block at the top of this document for what's actually true of `main`
+today; several items below ("full ClientHello/ServerHello parsers are
+NOT in this commit," "no congestion control or retransmit yet") have
+since been completed and are now stale.**
+
+In the spike we delivered:
 
 1. A real working set of **TLS 1.3 cryptographic primitives** in
    pure C, validated against RFC test vectors. No OpenSSL link, no
@@ -93,38 +144,42 @@ In the spike we deliver:
    - Poly1305 (RFC 8439)
    - ChaCha20-Poly1305 AEAD (RFC 8439)
    - X25519 (RFC 7748)
+   - (Since added, see status block above: Ed25519, RSA, ECDSA/P-256 --
+     all now compiled into the live binary and unit-tested.)
 2. A **TLS 1.3 record framing + handshake** skeleton (RFC 8446).
-   The full state machine is not exercised end-to-end against a
-   real browser yet; the message parsers, key schedule, transcript
-   hash, and AEAD wrap/unwrap are real. **Status:** record layer
-   `tls/record.{c,h}` is real and round-trips green; key schedule
-   `tls/keysched.{c,h}` matches RFC 8448 §3 vectors; full
-   ClientHello/ServerHello parsers are NOT in this commit.
+   **Original status:** record layer real; full ClientHello/ServerHello
+   parsers NOT yet in tree. **Current status (see top of doc): the
+   full handshake message parser/builder set, key schedule, transcript
+   hash, and AEAD wrap/unwrap are all real and compiled into the live
+   binary** (`tls/handshake.c`, `tls/keysched.c`, `tls/engine.c`).
 3. A **TCP state machine** skeleton (RFC 793 / 9293) with the LISTEN
-   → SYN-RECEIVED → ESTABLISHED → FIN-WAIT-* transitions modelled,
-   no congestion control or retransmit yet. **Status:** real and
-   tested against a scripted client (passive open, data, FIN).
+   → SYN-RECEIVED → ESTABLISHED → FIN-WAIT-* transitions modelled.
+   **Original status:** no congestion control or retransmit yet.
+   **Current status (see top of doc): retransmit, RTO (RFC 6298), and
+   fast retransmit/fast recovery (RFC 5681) are all real** in
+   `tcp/tcp.c`. SYN cookies/listen-queue protection are still absent
+   (see the "still genuinely deliberately out of scope" list above).
 4. An **AF_PACKET** packet-I/O skeleton — runs in WSL, doesn't need
    DPDK, gives us a way to wire the stack to a real link in dev.
-   **Status:** compiles on Linux, no E2E test.
+   **Status: unchanged** -- compiles on Linux, still no E2E test
+   against a real link.
 5. A **DPDK** backend (`io/dpdk.{c,h}`) that compiles in two modes:
    stub-by-default (init returns -1, prints a clear "rebuild with
    -DWITH_DPDK=1" message — keeps the userspace tree linkable on
    WSL/CI), and full `rte_eal_init` / mempool / `rte_eth_rx_burst`
-   pump under `-DWITH_DPDK=1`. Tested in stub mode (lock-in: -1
-   from init/pump, no-op shutdown) by `test_dpdk_stub`.
+   pump under `-DWITH_DPDK=1`. **Status: unchanged** -- tested in stub
+   mode only.
+6. **Not part of the original spike, added later:** a full QUIC
+   transport (`userspace/quic/`), HTTP/3 (`userspace/h3/`), and QPACK
+   (`userspace/qpack/`) -- real, RFC-vector-tested via the standalone
+   `test_quic_primitives` binary, but **not yet linked into the live
+   `picoweb` server** (absent from the root `Makefile`'s
+   `USERSPACE_TLS_SRC`). See the status block at the top of this
+   document.
 
-What is **explicitly NOT** in this branch:
-
-- AES-GCM (we have ChaCha20-Poly1305; that's enough for TLS 1.3
-  interop — RFC 8446 mandates it as a mandatory cipher suite).
-- RSA / ECDSA. Ed25519 (RFC 8032) is implemented; that's the only
-  signature algorithm we advertise.
-- TCP retransmit, RTO, congestion control, SACK, fast retransmit.
-- TCP listen-queue / SYN cookies. Without these, picoweb is trivially
-  DoS-able once it's on its own stack.
-- Real fuzzing of the parsers. RFC test vectors prove the happy path.
-  Hostile inputs are an enormous attack surface.
+See the status block at the very top of this document for the
+authoritative, current "what's explicitly not in scope" list --
+several items below have been superseded.
 
 ## Layout
 
@@ -133,26 +188,41 @@ userspace/
   DESIGN.md                  this file
   crypto/
     sha256.{c,h}             FIPS 180-4
+    sha512.{c,h}             FIPS 180-4
     hmac.{c,h}               RFC 2104, on top of SHA-256
     hkdf.{c,h}               RFC 5869, on top of HMAC
     chacha20.{c,h}           RFC 8439 §2.4
     poly1305.{c,h}           RFC 8439 §2.5
     chacha20_poly1305.{c,h}  RFC 8439 §2.8 AEAD construction
+    aes_gcm.{c,h}            AES-GCM primitive -- exists, NOT wired into tls/record.c's dispatch (see status block)
     x25519.{c,h}             RFC 7748 §5
+    ed25519.{c,h}            RFC 8032 §7.1
+    rsa.{c,h}                RSASSA/RSAVP1 (compiled into the live binary)
+    p256.{c,h} / ecdsa.{c,h} P-256 field/group arithmetic + ECDSA sign/verify (compiled into the live binary)
   tls/
-    record.{c,h}             RFC 8446 §5 record layer
+    record.{c,h}             RFC 8446 §5 record layer (ChaCha20-Poly1305 only)
     handshake.{c,h}          RFC 8446 §4 message types and state machine
     keysched.{c,h}           RFC 8446 §7 HKDF-Expand-Label, key schedule
+    engine.{c,h}             handshake state machine driver
+    cert.{c,h} / pem.{c,h}   SNI-aware in-memory cert store, PEM decoding
+    ticket_store.{c,h}       session ticket storage
   tcp/
-    tcp.{c,h}                RFC 793 / 9293 state machine
+    tcp.{c,h}                RFC 793/9293 state machine + RFC 6298 RTO + RFC 5681 congestion control
     ip.{c,h}                 IPv4 header build/parse + checksum
+  quic/, h3/, qpack/         full QUIC + HTTP/3 + QPACK -- real, RFC-vector-tested standalone
+                             (test_quic_primitives), NOT linked into the live picoweb server
   io/
     af_packet.{c,h}          dev-only RX/TX over a real NIC
+    af_xdp.{c,h}             AF_XDP socket I/O
     dpdk.c                   real DPDK pump under -DWITH_DPDK=1;
                              stub returning -1 otherwise. Always
                              links into the spike test build.
+  xdp/
+    xdp_loader.{c,h}         XDP program loader
   tests/
-    test_crypto.c            crypto + TLS + TCP RFC vectors (38 tests)
+    test_crypto.c            crypto + TLS + TCP RFC vectors (50 test functions)
+    test_quic_primitives.c   QUIC/H3/QPACK primitive tests
+    test_preload.c           preload-path tests
     Makefile                 stand-alone test runner
 ```
 
@@ -202,14 +272,37 @@ sketched but not wired to a live link.
 
 ## Realistic next steps if we ever ship this
 
+**Updated -- several of these are now done; see the status block at
+the top of this document.**
+
 1. Boot a Linux VM with a passthrough NIC, get DPDK bound, smoke-test
-   AF_PACKET first then graduate to AF_XDP, then to DPDK PMD.
+   AF_PACKET first then graduate to AF_XDP, then to DPDK PMD. **Still
+   not done** -- this remains the biggest real gap: none of
+   AF_PACKET/AF_XDP/DPDK have ever been exercised against a real link.
 2. Get a single TCP connection, single HTTP request, no TLS. End to end.
-3. Add retransmit + RTO. This is where the months go.
-4. Wire TLS 1.3 server-side. Borrow real cert+key off disk. Pass
-   curl --insecure first; pass a real browser second.
+   **Still not done end-to-end against a real NIC** -- the TCP state
+   machine itself is real and tested against a scripted client, but
+   only over the WSL virtual interface, not a real link (see "Why
+   this won't run end-to-end in WSL").
+3. ~~Add retransmit + RTO. This is where the months go.~~ **Done** --
+   `tcp.c` now implements retransmit, RTO (RFC 6298), and fast
+   retransmit/fast recovery (RFC 5681).
+4. ~~Wire TLS 1.3 server-side.~~ **Done** -- the full handshake
+   message parser/builder set, key schedule, and engine state machine
+   are real and compiled into the live binary. Still only tested
+   against a scripted client / RFC vectors, not curl/a real browser
+   over a real link (same "not wired to a live NIC" gap as above).
 5. Add cert chain validation (RSA-PSS or ECDSA verify), AES-GCM with
-   AES-NI, session resumption.
+   AES-NI, session resumption. **Partially done**: RSA and ECDSA
+   primitives now exist and are unit-tested (though this server-side
+   engine only ever presents its own cert -- it doesn't need to
+   validate a peer's chain the way a *client* would; see
+   `picox509`/`picoecdsa` in the sibling repos this session built for
+   that side of the problem). **Still not done**: AES-GCM is not
+   wired into `tls/record.c`'s dispatch (ChaCha20-Poly1305 only), and
+   session resumption/tickets exist as storage (`ticket_store.c`) but
+   full resumption handshake logic hasn't been confirmed wired end to
+   end here.
 
 Do not ship any of this without third-party security review.
 
