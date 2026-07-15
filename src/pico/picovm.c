@@ -2253,6 +2253,25 @@ void pv_default_host(pv_ctx *ctx, int hook, int rd, int rs1, int rs2, int imm16)
         ctx->regs[rd] = ok ? 1 : 0;
         return;
     }
+    /* String.Eq: full-content equality (not span-handle equality -- two
+     * independently built spans with identical bytes are NOT the same
+     * handle, so `a == b`/`is` on strings only coincidentally works when
+     * both sides happen to alias the same span). PV_HOOK_STRING_EQ (0x8D)
+     * was already allocated + documented + implemented in the Python
+     * reference VM (picoscript_vm.py Strings.Eq), but had no C-VM
+     * implementation in this forked copy either (same gap found and fixed
+     * upstream in picoscript/vm/picovm.c while building
+     * host/picowal/app_router.eng; synced here for parity). */
+    if (hook == PV_HOOK_STRING_EQ) {
+        int ha = ctx->regs[rs1], hb = ctx->regs[rs2];
+        uint32_t pa = pv_span_p(ctx, ha), pb = pv_span_p(ctx, hb);
+        int32_t la = pv_span_n(ctx, ha), lb = pv_span_n(ctx, hb);
+        int ok = (la == lb);
+        for (int32_t j = 0; ok && j < la; j++)
+            if (pv_arena_get(ctx, pa + (uint32_t)j) != pv_arena_get(ctx, pb + (uint32_t)j)) ok = 0;
+        ctx->regs[rd] = ok ? 1 : 0;
+        return;
+    }
     if (hook == PV_HOOK_STRING_TOUPPER || hook == PV_HOOK_STRING_TOLOWER) {
         int ha = ctx->regs[rs1];
         uint32_t pa = pv_span_p(ctx, ha);
