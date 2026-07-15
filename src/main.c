@@ -768,7 +768,13 @@ int main(int argc, char** argv) {
     const char* backend_name = NULL;
     switch (backend) {
     case PICOWEB_BACKEND_EPOLL: worker_fn = epoll_worker_main; backend_name = "epoll"; break;
+#ifdef PICOWEB_WITH_URING
     case PICOWEB_BACKEND_URING: worker_fn = uring_worker_main; backend_name = "io_uring"; break;
+#else
+    case PICOWEB_BACKEND_URING:
+        fprintf(stderr, "picoweb: --io_uring requires a build with WITH_URING=1 (this binary was built without it)\n");
+        return 1;
+#endif
     case PICOWEB_BACKEND_DPDK:  worker_fn = dpdk_worker_main;  backend_name = "dpdk";  break;
     case PICOWEB_BACKEND_TLS:   worker_fn = tls_worker_main;   backend_name = "tls";   break;
     }
