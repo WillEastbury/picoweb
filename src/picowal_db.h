@@ -141,6 +141,16 @@ void picowal_db_close(picowal_db_t* db);
  * anything for themselves). */
 void picowal_db_set_read_only(picowal_db_t* db, bool read_only);
 
+/* Install a mandatory write-fence callback (clustered picoweb primary).
+ * When set, every mutation entry point (put/delete/txn_begin) calls
+ * fence_fn(ctx) BEFORE appending; a false return refuses the write
+ * (errno=EROFS, mapped to HTTP 503 by the API), fail-closed, without
+ * touching the log. NULL clears it.
+ * Set once at startup before any writer runs (standalone/replica leave
+ * it unset, preserving existing behavior). The callback is invoked
+ * without the db lock held, so it may do a bounded socket round-trip. */
+void picowal_db_set_fence(picowal_db_t* db, bool (*fence_fn)(void*), void* ctx);
+
 /* --- Explicit transactions ---
  * picowal_db_txn_begin() blocks until it can acquire exclusive access
  * (see the single-writer note above) and returns a handle; every

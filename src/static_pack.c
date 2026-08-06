@@ -4,6 +4,7 @@
 #include "static_pack.h"
 #include "security_headers.h"
 #include "mime.h"
+#include "picowal_partition.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -17,6 +18,8 @@ static uint16_t g_card = 0;
 static char     g_prefix[64] = {0};
 static size_t   g_prefix_len = 0;
 static bool     g_enabled = false;
+
+const char* static_pack_prefix(void) { return g_enabled ? g_prefix : ""; }
 
 bool static_pack_enabled(void) { return g_enabled; }
 
@@ -60,7 +63,16 @@ bool static_pack_path_matches(const char* path, size_t path_len) {
 
 /* Parse the decimal record id from the path segment right after the
  * prefix, stopping at '/' or '.'. Empty segment -> record 0 (index
- * convention). Returns false on a malformed (non-decimal) segment. */
+ * convention). Returns false on a malformed (non-decimal) segment.
+ *
+ * Two trailing forms are supported for MIME sniffing, both mapping onto
+ * the SAME record (the trailing filename is never part of the picowal
+ * key, only used to pick a Content-Type via mime.c):
+ *   {record}.ext          e.g. "/site/0.html"       -> record 0, ext ".html"
+ *   {record}/filename.ext e.g. "/site/0/index.html" -> record 0, ext ".html"
+ * The second form lets an operator publish a small multi-file bundle
+ * ("/site/0/index.html", "/site/1/app.js", ...) with human-readable
+ * filenames while storage stays a flat record-per-file scheme. */
 static bool parse_record(const char* rest, size_t rest_len, uint32_t* out_record,
                          const char** out_ext, size_t* out_ext_len) {
     size_t i = 0;
@@ -74,12 +86,28 @@ static bool parse_record(const char* rest, size_t rest_len, uint32_t* out_record
         i++;
     }
     *out_record = any ? (uint32_t)rec : 0;
+    *out_ext = NULL;
+    *out_ext_len = 0;
+
     if (i < rest_len && rest[i] == '.') {
+        /* "{record}.ext" -- extension is the remainder of the segment. */
         *out_ext = rest + i;
         *out_ext_len = rest_len - i;
-    } else {
-        *out_ext = NULL;
-        *out_ext_len = 0;
+        return true;
+    }
+    if (i < rest_len && rest[i] == '/') {
+        /* "{record}/filename.ext" -- extension comes from the LAST '.' in
+         * the trailing filename component (not part of the key). */
+        const char* fname = rest + i + 1;
+        size_t fname_len = rest_len - (i + 1);
+        const char* dot = NULL;
+        for (size_t j = 0; j < fname_len; j++) {
+            if (fname[j] == '.') dot = fname + j;
+        }
+        if (dot) {
+            *out_ext = dot;
+            *out_ext_len = (size_t)((fname + fname_len) - dot);
+        }
     }
     return true;
 }
@@ -122,6 +150,8 @@ void static_pack_dispatch(http_method_t method,
                           const char* cookie, size_t cookie_len,
                           bool has_pw_auth_header,
                           const char* write_token, size_t write_token_len,
+                          const char* tenant_id, size_t tenant_id_len,
+                          bool is_partition_hop,
                           api_resp_t* resp) {
     if (method != M_GET && method != M_HEAD &&
         method != M_PUT && method != M_DELETE) {
@@ -145,9 +175,38 @@ void static_pack_dispatch(http_method_t method,
         return;
     }
 
+    /* Authenticate mutations before resolving or contacting a remote owner.
+     * Besides keeping the route uniformly protected, this prevents an
+     * unauthenticated request from reaching the partition transport, whose
+     * internal machine credential is intentionally available for trusted
+     * server-to-server forwarding. */
     if (method == M_PUT || method == M_DELETE) {
         if (!api_require_pw_auth(cookie, cookie_len, has_pw_auth_header,
                                  write_token, write_token_len, resp)) return;
+    }
+
+    /* Partition-aware forwarding: static content isn't assumed replicated
+     * across every node in the pool (each node's picowal volume is its own
+     * shard), so a non-owner node must forward GET/HEAD too, not just
+     * mutations -- unlike /wal/'s REST API, which assumes the node pool
+     * itself is fully replicated and only proxies writes. Skipped when
+     * this request is itself an inbound partition-hop (X-PW-Partition-Hop)
+     * to avoid forwarding loops. */
+    if (!is_partition_hop && picowal_partition_enabled()) {
+        uint32_t vpart = picowal_partition_of_key(key);
+        char owner[PICOWAL_PARTITION_NODE_ID_MAX];
+        if (picowal_partition_owner(tenant_id, tenant_id_len, vpart, owner, sizeof(owner)) &&
+            !picowal_partition_owner_is_self(owner)) {
+            if (picowal_partition_mode_is_proxy()) {
+                picowal_partition_proxy(owner, vpart, method, path, path_len,
+                                        body, body_len,
+                                        write_token, write_token_len,
+                                        cookie, cookie_len, resp);
+            } else {
+                picowal_partition_redirect(owner, vpart, path, path_len, resp);
+            }
+            return;
+        }
     }
 
     if (method == M_PUT) {

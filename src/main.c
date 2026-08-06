@@ -13,10 +13,12 @@
 #include "api_blob.h"
 #include "static_pack.h"
 #include "pico_route.h"
+#include "ide.h"
 #include "picowal_repl.h"
 #include "picowal_repl_client.h"
 #include "picowal_gossip.h"
 #include "picowal_partition.h"
+#include "picowal_fence.h"
 #include "metrics.h"
 #include "server.h"
 #include "simd.h"
@@ -72,6 +74,15 @@ static void usage(const char* argv0) {
         "  --picowal-followers=ID1,ID2,...  registered follower set for gossip-based\n"
         "                              leader election (with --picowal-replica-of, promotes\n"
         "                              a replica to writer once >50%% of followers vote for it)\n"
+        "  --picowal-cluster           this picowal volume is managed by the picocluster\n"
+        "                              control plane: autonomous gossip promotion is\n"
+        "                              rejected and writable startup REQUIRES the fence\n"
+        "                              below (the control plane is the sole primary selector)\n"
+        "  --picowal-fence-sock=PATH   local picowald data-fence socket; every write must be\n"
+        "                              authorized by it (fail-closed) before touching the log\n"
+        "  --picowal-fence-group=NAME  data-group id to fence against (== capsule name)\n"
+        "  --picowal-fence-epoch=N     assignment epoch this instance was launched at\n"
+        "  --picowal-fence-node=ID     this node's id (must equal the committed primary)\n"
         "  --picowal-partition-nodes=ID1,ID2,...  global pool of nodes eligible to own\n"
         "                              virtual partitions (1000 vpartitions, rendezvous-\n"
         "                              hashed per record's pack+id); enables partition\n"
@@ -88,6 +99,17 @@ static void usage(const char* argv0) {
         "  --oidc-google-client-id=ID expected Google OAuth client id (aud)\n"
         "  --oidc-entra-client-id=ID expected Entra app client id (appid/aud)\n"
         "  --oidc-entra-tenant=T  optional Entra tenant id pin (tid)\n"
+        "  --picosts-issuer=URL   external PicoSTS OIDC authority (Authorization Code +\n"
+        "                         PKCE from the browser); requires --oidc-cookie-auth and\n"
+        "                         --picosts-cookie-key/PICOSTS_COOKIE_KEY\n"
+        "  --picosts-client-id=ID   SPA client id registered with PicoSTS (default 'spa')\n"
+        "  --picosts-audience=AUD   expected access-token audience (default 'api')\n"
+        "  --picosts-cookie-key=K   HMAC-SHA256 key signing the stateless picosts session\n"
+        "                           cookie (env PICOSTS_COOKIE_KEY fallback) -- shared\n"
+        "                           across every node in a cluster so any node accepts\n"
+        "                           any other node's picosts-issued session\n"
+        "  --ide-prefix=/p/         hosted PicoScript IDE route prefix (default /ide/);\n"
+        "                           enabled automatically whenever --picowal-device is set\n"
         "  --sqpoll     enable IORING_SETUP_SQPOLL: kernel polls our SQ,\n"
         "               eliminating io_uring_enter() syscalls on the submit\n"
         "               path. Costs one kernel thread per worker. Requires\n"
@@ -106,6 +128,12 @@ static void usage(const char* argv0) {
         "\n"
         "Default backend is epoll. --io_uring / --dpdk / --tls are mutually exclusive.\n",
         argv0);
+}
+
+/* Adapter so picowal_db can call the control-plane fence through a plain
+ * function pointer (see picowal_db_set_fence). */
+static bool picoweb_fence_thunk(void* ctx) {
+    return picowal_fence_check((picowal_fence_t*)ctx);
 }
 
 int main(int argc, char** argv) {
@@ -147,6 +175,17 @@ int main(int argc, char** argv) {
     const char* picowal_replica_of_cli = NULL;
     const char* picowal_node_id_cli = NULL;
     const char* picowal_followers_cli = NULL;
+    /* Clustered-data control-plane fence (picocluster). When
+     * --picowal-cluster is set the control plane is the sole primary
+     * selector: autonomous gossip promotion is rejected, and writable
+     * startup REQUIRES a working fence (sock+group+epoch+node). */
+    bool picowal_cluster_cli = false;
+    const char* picowal_fence_sock_cli = NULL;
+    const char* picowal_fence_group_cli = NULL;
+    const char* picowal_fence_node_cli = NULL;
+    unsigned long long picowal_fence_epoch_cli = 0;
+    bool picowal_fence_epoch_set = false;
+    picowal_fence_t* picowal_fence = NULL;
     const char* picowal_partition_nodes_cli = NULL;
     const char* picowal_partition_tenant_map_cli = NULL;
     const char* picowal_partition_mode_cli = "redirect";
@@ -155,6 +194,12 @@ int main(int argc, char** argv) {
     const char* oidc_google_client_id = NULL;
     const char* oidc_entra_client_id = NULL;
     const char* oidc_entra_tenant = NULL;
+    const char* picosts_issuer_cli = NULL;
+    const char* picosts_client_id_cli = NULL;
+    const char* picosts_audience_cli = NULL;
+    const char* picosts_cookie_key_cli = NULL;
+    const char* ide_prefix_cli = "/ide/";
+    bool ide_prefix_set = false;
 
     /* Two-pass parse: lift flags out of argv first, then handle the
      * remaining positional args exactly as before. This keeps the
@@ -391,6 +436,46 @@ int main(int argc, char** argv) {
             }
             continue;
         }
+        if (strcmp(argv[i], "--picowal-cluster") == 0) {
+            picowal_cluster_cli = true;
+            continue;
+        }
+        if (strncmp(argv[i], "--picowal-fence-sock=", 21) == 0) {
+            picowal_fence_sock_cli = argv[i] + 21;
+            if (!picowal_fence_sock_cli[0]) {
+                fprintf(stderr, "picoweb: --picowal-fence-sock requires a path\n");
+                return 1;
+            }
+            continue;
+        }
+        if (strncmp(argv[i], "--picowal-fence-group=", 22) == 0) {
+            picowal_fence_group_cli = argv[i] + 22;
+            if (!picowal_fence_group_cli[0]) {
+                fprintf(stderr, "picoweb: --picowal-fence-group requires a value\n");
+                return 1;
+            }
+            continue;
+        }
+        if (strncmp(argv[i], "--picowal-fence-node=", 21) == 0) {
+            picowal_fence_node_cli = argv[i] + 21;
+            if (!picowal_fence_node_cli[0]) {
+                fprintf(stderr, "picoweb: --picowal-fence-node requires a value\n");
+                return 1;
+            }
+            continue;
+        }
+        if (strncmp(argv[i], "--picowal-fence-epoch=", 22) == 0) {
+            char* end = NULL;
+            errno = 0;
+            unsigned long long v = strtoull(argv[i] + 22, &end, 10);
+            if (errno || end == argv[i] + 22 || *end != '\0') {
+                fprintf(stderr, "picoweb: invalid --picowal-fence-epoch value\n");
+                return 1;
+            }
+            picowal_fence_epoch_cli = v;
+            picowal_fence_epoch_set = true;
+            continue;
+        }
         if (strncmp(argv[i], "--picowal-partition-nodes=", 26) == 0) {
             picowal_partition_nodes_cli = argv[i] + 26;
             if (!picowal_partition_nodes_cli[0]) {
@@ -450,6 +535,47 @@ int main(int argc, char** argv) {
             oidc_entra_tenant = argv[i] + 20;
             if (!oidc_entra_tenant[0]) {
                 fprintf(stderr, "picoweb: --oidc-entra-tenant requires a non-empty value\n");
+                return 1;
+            }
+            continue;
+        }
+        if (strncmp(argv[i], "--picosts-issuer=", 17) == 0) {
+            picosts_issuer_cli = argv[i] + 17;
+            if (!picosts_issuer_cli[0]) {
+                fprintf(stderr, "picoweb: --picosts-issuer requires a non-empty URL\n");
+                return 1;
+            }
+            continue;
+        }
+        if (strncmp(argv[i], "--picosts-client-id=", 20) == 0) {
+            picosts_client_id_cli = argv[i] + 20;
+            if (!picosts_client_id_cli[0]) {
+                fprintf(stderr, "picoweb: --picosts-client-id requires a non-empty value\n");
+                return 1;
+            }
+            continue;
+        }
+        if (strncmp(argv[i], "--picosts-audience=", 19) == 0) {
+            picosts_audience_cli = argv[i] + 19;
+            if (!picosts_audience_cli[0]) {
+                fprintf(stderr, "picoweb: --picosts-audience requires a non-empty value\n");
+                return 1;
+            }
+            continue;
+        }
+        if (strncmp(argv[i], "--picosts-cookie-key=", 21) == 0) {
+            picosts_cookie_key_cli = argv[i] + 21;
+            if (!picosts_cookie_key_cli[0]) {
+                fprintf(stderr, "picoweb: --picosts-cookie-key requires a non-empty value\n");
+                return 1;
+            }
+            continue;
+        }
+        if (strncmp(argv[i], "--ide-prefix=", 13) == 0) {
+            ide_prefix_cli = argv[i] + 13;
+            ide_prefix_set = true;
+            if (!ide_prefix_cli[0]) {
+                fprintf(stderr, "picoweb: --ide-prefix requires a non-empty prefix\n");
                 return 1;
             }
             continue;
@@ -541,8 +667,23 @@ int main(int argc, char** argv) {
         return 1;
     }
     if (!oidc_cookie_auth &&
-        (oidc_google_client_id || oidc_entra_client_id || oidc_entra_tenant)) {
-        fprintf(stderr, "picoweb: --oidc-* provider flags require --oidc-cookie-auth\n");
+        (oidc_google_client_id || oidc_entra_client_id || oidc_entra_tenant ||
+         picosts_issuer_cli || picosts_client_id_cli || picosts_audience_cli ||
+         picosts_cookie_key_cli)) {
+        fprintf(stderr, "picoweb: --oidc-* / --picosts-* provider flags require --oidc-cookie-auth\n");
+        return 1;
+    }
+    if (oidc_cookie_auth && !oidc_google_client_id && !oidc_entra_client_id && !picosts_issuer_cli) {
+        fprintf(stderr, "picoweb: --oidc-cookie-auth requires at least one provider: "
+                "--oidc-google-client-id, --oidc-entra-client-id or --picosts-issuer\n");
+        return 1;
+    }
+    if ((picosts_client_id_cli || picosts_audience_cli || picosts_cookie_key_cli) && !picosts_issuer_cli) {
+        fprintf(stderr, "picoweb: --picosts-client-id/--picosts-audience/--picosts-cookie-key require --picosts-issuer\n");
+        return 1;
+    }
+    if (ide_prefix_set && !picowal_device_cli) {
+        fprintf(stderr, "picoweb: --ide-prefix requires --picowal-device\n");
         return 1;
     }
     if (blob_prefix_set && !blob_root_cli) {
@@ -595,6 +736,38 @@ int main(int argc, char** argv) {
                 "a replica)\n");
         return 1;
     }
+    /* Clustered data: the control plane is the sole primary selector.
+     * Reject autonomous gossip promotion, and require a working fence for
+     * writable startup (fail closed if the operator forgot it). */
+    if (picowal_cluster_cli) {
+        if (!picowal_device_cli) {
+            fprintf(stderr, "picoweb: --picowal-cluster requires --picowal-device\n");
+            return 1;
+        }
+        if (picowal_followers_cli || picowal_node_id_cli) {
+            fprintf(stderr, "picoweb: --picowal-cluster is incompatible with "
+                    "--picowal-followers/--picowal-node-id: under clustered fencing the "
+                    "picocluster control plane is the only primary selector, so picoweb's "
+                    "own gossip promotion must stay disabled\n");
+            return 1;
+        }
+        bool fence_configured = picowal_fence_sock_cli && picowal_fence_group_cli &&
+                                picowal_fence_node_cli && picowal_fence_epoch_set;
+        if (!picowal_replica_of_cli) {
+            /* Writable primary: fencing is mandatory. */
+            if (!fence_configured) {
+                fprintf(stderr, "picoweb: --picowal-cluster writable startup requires the fence "
+                        "(--picowal-fence-sock=PATH --picowal-fence-group=NAME "
+                        "--picowal-fence-epoch=N --picowal-fence-node=ID); refusing to accept "
+                        "clustered writes without a control-plane fence\n");
+                return 1;
+            }
+        }
+    } else if (picowal_fence_sock_cli || picowal_fence_group_cli ||
+               picowal_fence_node_cli || picowal_fence_epoch_set) {
+        fprintf(stderr, "picoweb: --picowal-fence-* flags require --picowal-cluster\n");
+        return 1;
+    }
     if (blob_root_cli &&
         (backend != PICOWEB_BACKEND_TLS || !tls_cert_cli || !tls_key_cli)) {
         fprintf(stderr,
@@ -629,15 +802,55 @@ int main(int argc, char** argv) {
                               picowal_prefix_cli, picowal_format)) {
             return 1;
         }
+        /* Install the mandatory control-plane write fence BEFORE any
+         * writer path (background threads, repl feed, HTTP) can run, so a
+         * clustered primary can never accept a write it hasn't proven it
+         * owns. Only the writable primary is fenced; a replica is already
+         * read-only. */
+        if (picowal_cluster_cli && !picowal_replica_of_cli) {
+            picowal_fence = picowal_fence_create(picowal_fence_sock_cli,
+                                                 picowal_fence_group_cli,
+                                                 (uint64_t)picowal_fence_epoch_cli,
+                                                 picowal_fence_node_cli);
+            if (!picowal_fence) {
+                fprintf(stderr, "picoweb: failed to create control-plane fence client "
+                        "(sock='%s', group='%s', node='%s')\n",
+                        picowal_fence_sock_cli, picowal_fence_group_cli, picowal_fence_node_cli);
+                return 1;
+            }
+            picowal_db_set_fence(api_picowal_db(), picoweb_fence_thunk, picowal_fence);
+            int probe = picowal_fence_probe(picowal_fence);
+            if (probe != 0) {
+                /* Not fatal: leadership may still be settling. Writes stay
+                 * refused (fail closed) until a live check succeeds. */
+                fprintf(stderr, "picoweb: control-plane fence not yet authorizing "
+                        "(group='%s', epoch=%llu, node='%s', status=%d); clustered writes "
+                        "refused until the local picowald confirms this node is the committed "
+                        "primary\n", picowal_fence_group_cli,
+                        (unsigned long long)picowal_fence_epoch_cli, picowal_fence_node_cli, probe);
+            } else {
+                fprintf(stderr, "picoweb: control-plane write fence active "
+                        "(group='%s', epoch=%llu, node='%s')\n", picowal_fence_group_cli,
+                        (unsigned long long)picowal_fence_epoch_cli, picowal_fence_node_cli);
+            }
+        }
         picowal_db_start_background_threads(api_picowal_db());
-        if (static_pack_card >= 0 || pico_route_card >= 0) {
+        /* Shared write token gating api_require_pw_auth() -- used by IDE's
+         * raw card CRUD (always enabled below), static_pack/pico_route's
+         * raw writes when configured, and the metadata permissions-pack
+         * gate -- whenever --oidc-cookie-auth isn't enabled. IDE is now
+         * unconditionally enabled whenever picowal is configured (not
+         * gated on --picowal-static-card/--picowal-code-card), so set this
+         * up unconditionally too rather than only for the latter two. */
+        {
             const char* token = picowal_write_token_cli;
             if (!token) token = getenv("PICOWAL_WRITE_TOKEN");
             if (token && token[0]) {
                 api_set_write_token(token);
             } else {
                 fprintf(stderr, "picoweb: warning: no --picowal-write-token/PICOWAL_WRITE_TOKEN set; "
-                        "raw picowal PUT/DELETE writes will be refused (503) unless --oidc-cookie-auth is enabled\n");
+                        "raw picowal PUT/DELETE writes (ide/static/code/permissions) will be refused "
+                        "(503) unless --oidc-cookie-auth is enabled\n");
             }
         }
         if (static_pack_card >= 0) {
@@ -653,6 +866,14 @@ int main(int argc, char** argv) {
                         "(card=%ld, prefix='%s')\n", pico_route_card, pico_route_prefix_cli);
                 return 1;
             }
+        }
+        /* IDE is enabled whenever picowal is configured -- it hosts the
+         * PicoScript editor/compiler/runtime and the authenticated raw
+         * card CRUD the IDE uses to save/load source, independent of
+         * whether --picowal-static-card/--picowal-code-card are set. */
+        if (!ide_init(ide_prefix_cli)) {
+            fprintf(stderr, "picoweb: failed to enable IDE routes (prefix='%s')\n", ide_prefix_cli);
+            return 1;
         }
         if (picowal_repl_enable) {
             const char* token = picowal_write_token_cli;
@@ -736,6 +957,21 @@ int main(int argc, char** argv) {
         }
     } else {
         (void)api_oidc_init(false, oidc_cookie_ttl_sec, NULL, NULL, NULL);
+    }
+    if (picosts_issuer_cli) {
+        const char* cookie_key = picosts_cookie_key_cli;
+        if (!cookie_key) cookie_key = getenv("PICOSTS_COOKIE_KEY");
+        if (!cookie_key || !cookie_key[0]) {
+            fprintf(stderr, "picoweb: --picosts-issuer requires --picosts-cookie-key "
+                    "or PICOSTS_COOKIE_KEY (signs the stateless cluster-safe session cookie)\n");
+            return 1;
+        }
+        if (!api_picosts_init(picosts_issuer_cli, picosts_client_id_cli,
+                              picosts_audience_cli, cookie_key)) {
+            fprintf(stderr, "picoweb: failed to enable PicoSTS login provider (issuer='%s')\n",
+                    picosts_issuer_cli);
+            return 1;
+        }
     }
 
     char tls_cert_path[PATH_MAX];

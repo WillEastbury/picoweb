@@ -143,6 +143,80 @@ assert_code 204 "validation transition allowed" -X PUT --data '{"name":"Cara","1
 assert_code 409 "validation delete ref blocked" -X DELETE \
             "http://127.0.0.1:$PORT/wal/13/1"
 
+echo
+echo "== rich logical-type validation (bool/uintN/intN/decimal/ascii/utf8/date/time/datetime/array_u16/blob/lookup + nullable/readonly/max_lengths) =="
+assert_code 204 "PUT  metadata schema widgets (rich types)" -X PUT --data \
+  '{"fields":"sku,qty,price,active,tag,notes,released,opens,updated,tags,thumb,country_id","required":"sku,qty","nullable":"notes","readonly":"sku","max_lengths":"sku=8;tags=3","joins":"13=country_id","types":"sku=ascii;qty=uint16;price=decimal;active=bool;tag=utf8;notes=string;released=date;opens=time;updated=datetime;tags=array_u16;thumb=blob;country_id=lookup"}' \
+  "http://127.0.0.1:$PORT/wal/metadata/schema/20"
+
+good_widget='{"sku":"SKU-01","qty":10,"price":19.99,"active":true,"tag":"blue","notes":"ok","released":"2024-01-31","opens":"09:30:00","updated":"2024-01-31T09:30:00","tags":[1,2,3],"thumb":"aGVsbG8=","country_id":1}'
+assert_code 204 "rich types: good write" -X PUT --data "$good_widget" "http://127.0.0.1:$PORT/wal/20/200"
+array_query=$(curl -sS --max-time 5 -X POST --data-binary $'S:tags\nF:20' "http://127.0.0.1:$PORT/wal/query")
+if printf '%s' "$array_query" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["rows"][0]["tags"] == [1,2,3]'; then
+    echo "ok   query preserves selected array fields as valid JSON"
+else
+    echo "FAIL query array JSON output: $array_query"
+    fail=$((fail + 1))
+fi
+assert_code 400 "rich types: uint16 out of range" -X PUT --data \
+  '{"sku":"SKU-01","qty":70000,"country_id":1}' "http://127.0.0.1:$PORT/wal/20/201"
+assert_code 400 "rich types: bad date" -X PUT --data \
+  '{"sku":"SKU-01","qty":1,"released":"2024-13-40","country_id":1}' "http://127.0.0.1:$PORT/wal/20/202"
+assert_code 400 "rich types: bad time" -X PUT --data \
+  '{"sku":"SKU-01","qty":1,"opens":"25:99","country_id":1}' "http://127.0.0.1:$PORT/wal/20/203"
+assert_code 400 "rich types: bad datetime" -X PUT --data \
+  '{"sku":"SKU-01","qty":1,"updated":"not-a-datetime","country_id":1}' "http://127.0.0.1:$PORT/wal/20/204"
+assert_code 400 "rich types: array_u16 element out of range" -X PUT --data \
+  '{"sku":"SKU-01","qty":1,"tags":[1,99999],"country_id":1}' "http://127.0.0.1:$PORT/wal/20/205"
+assert_code 400 "rich types: array_u16 exceeds max_lengths" -X PUT --data \
+  '{"sku":"SKU-01","qty":1,"tags":[1,2,3,4],"country_id":1}' "http://127.0.0.1:$PORT/wal/20/206"
+assert_code 400 "rich types: blob invalid base64" -X PUT --data \
+  '{"sku":"SKU-01","qty":1,"thumb":"not base64!!","country_id":1}' "http://127.0.0.1:$PORT/wal/20/207"
+assert_code 204 "rich types: blob as numeric byte array" -X PUT --data \
+  '{"sku":"SKU-01","qty":1,"thumb":[1,2,255],"country_id":1}' "http://127.0.0.1:$PORT/wal/20/208"
+assert_code 400 "rich types: ascii field with non-ascii byte" -X PUT --data \
+  '{"sku":"SKU-\u00e9","qty":1,"country_id":1}' "http://127.0.0.1:$PORT/wal/20/209"
+assert_code 400 "rich types: sku exceeds max_lengths" -X PUT --data \
+  '{"sku":"WAY-TOO-LONG","qty":1,"country_id":1}' "http://127.0.0.1:$PORT/wal/20/210"
+assert_code 409 "rich types: lookup target does not exist" -X PUT --data \
+  '{"sku":"SKU-01","qty":1,"country_id":999}' "http://127.0.0.1:$PORT/wal/20/211"
+assert_code 204 "rich types: nullable field accepts null" -X PUT --data \
+  '{"sku":"SKU-01","qty":1,"notes":null,"country_id":1}' "http://127.0.0.1:$PORT/wal/20/212"
+assert_code 409 "rich types: readonly field cannot change on existing record" -X PUT --data \
+  '{"sku":"SKU-999","qty":11,"price":19.99,"active":true,"tag":"blue","notes":"ok","released":"2024-01-31","opens":"09:30:00","updated":"2024-01-31T09:30:00","tags":[1,2,3],"thumb":"aGVsbG8=","country_id":1}' \
+  "http://127.0.0.1:$PORT/wal/20/200"
+assert_code 204 "rich types: non-readonly field can change on existing record" -X PUT --data "$good_widget" \
+  "http://127.0.0.1:$PORT/wal/20/200"
+
+assert_code 204 "PUT  generic array schema with max_lengths" -X PUT --data \
+  '{"fields":"tags","types":"tags=array","max_lengths":"tags=5"}' \
+  "http://127.0.0.1:$PORT/wal/schema/24"
+large_array_doc=$(python3 -c 'import json; print(json.dumps({"tags": list(range(200))}, separators=(",", ":")))')
+assert_code 400 "generic array cannot bypass max_lengths via oversized parser capture" -X PUT --data \
+  "$large_array_doc" "http://127.0.0.1:$PORT/wal/24/1"
+
+echo
+echo "== rich schema JSON round-trip preserves new metadata keys (ordinals/lookup_labels/module/public_read/children/list_columns) =="
+rich_schema_doc='{"fields":"sku,qty,country_id","required":"sku,qty","nullable":"notes","readonly":"sku","max_lengths":"sku=8","ordinals":"sku=0;qty=1;country_id=2","lookup_labels":"country_id=city","joins":"13=country_id","types":"sku=ascii;qty=uint16;country_id=lookup","module":"catalog","public_read":true,"children":"21,22","list_columns":"sku,qty"}'
+assert_code 204 "PUT  rich schema with all new metadata keys" -X PUT --data "$rich_schema_doc" \
+            "http://127.0.0.1:$PORT/wal/metadata/schema/23"
+assert_code 200 "GET  rich schema round-trip" "http://127.0.0.1:$PORT/wal/schema/23"
+roundtrip_out=$(cat /tmp/picowal-test-body)
+if echo "$roundtrip_out" | grep -q '"ordinals":"sku=0;qty=1;country_id=2"' && \
+   echo "$roundtrip_out" | grep -q '"lookup_labels":"country_id=city"' && \
+   echo "$roundtrip_out" | grep -q '"module":"catalog"' && \
+   echo "$roundtrip_out" | grep -q '"public_read":true' && \
+   echo "$roundtrip_out" | grep -q '"children":"21,22"' && \
+   echo "$roundtrip_out" | grep -q '"list_columns":"sku,qty"' && \
+   echo "$roundtrip_out" | grep -q '"nullable":"notes"' && \
+   echo "$roundtrip_out" | grep -q '"readonly":"sku"' && \
+   echo "$roundtrip_out" | grep -q '"max_lengths":"sku=8"'; then
+    echo "ok   rich schema round-trip preserved every new metadata key"
+else
+    echo "FAIL rich schema round-trip lost a metadata key: $roundtrip_out"
+    fail=$((fail + 1))
+fi
+
 query_body=$'S:name,countries.city\nF:orders,countries\nW:countries.country|==|UK'
 assert_code 200 "POST query join named packs" -X POST --data-binary "$query_body" \
             "http://127.0.0.1:$PORT/wal/query"
@@ -206,6 +280,48 @@ kill "$PID" 2>/dev/null
 sleep 0.3
 start_server
 assert_code 200 "GET persists after restart" "http://127.0.0.1:$PORT/wal/12/999"
+
+# Permissions pack (metadata pack 3 -- RBAC/RLS design metadata). Unlike
+# name/schema (packs 1/2), permissions mutations always require credentials
+# (api_require_pw_auth), independent of --oidc-cookie-auth, since this is
+# new sensitive design surface -- so restart with a write token configured.
+kill "$PID" 2>/dev/null
+sleep 0.3
+TOKEN="picowal-perm-test-token"
+start_server --picowal-write-token="$TOKEN"
+PH='X-PW-Write-Token: '"$TOKEN"
+
+assert_code 401 "permissions PUT without credentials rejected" -X PUT \
+            --data '{"roles":["admin"],"permissions":[],"rowPolicies":[]}' \
+            "http://127.0.0.1:$PORT/wal/metadata/permissions/12"
+assert_code 204 "permissions PUT with write token" -X PUT -H "$PH" \
+            --data '{"roles":["admin","viewer"],"permissions":[{"role":"viewer","pack":12,"actions":["read"]}],"rowPolicies":[{"pack":12,"role":"viewer","predicate":"status|==|Placed"}]}' \
+            "http://127.0.0.1:$PORT/wal/metadata/permissions/12"
+assert_code 200 "GET permissions" -H "$PH" "http://127.0.0.1:$PORT/wal/metadata/permissions/12"
+perm_out=$(cat /tmp/picowal-test-body)
+if echo "$perm_out" | grep -q '"roles":\["admin","viewer"\]' && \
+   echo "$perm_out" | grep -q '"rowPolicies":' ; then
+    echo "ok   permissions output round-trips roles/permissions/rowPolicies"
+else
+    echo "FAIL permissions output: $perm_out"
+    fail=$((fail + 1))
+fi
+
+assert_code 200 "GET metadata wrapper includes pack3/permissions" -H "$PH" \
+            "http://127.0.0.1:$PORT/wal/metadata/12"
+meta3_out=$(cat /tmp/picowal-test-body)
+if echo "$meta3_out" | grep -q '"pack3":' && echo "$meta3_out" | grep -q '"permissions":'; then
+    echo "ok   metadata wrapper includes pack3 and permissions alias"
+else
+    echo "FAIL metadata wrapper missing pack3/permissions: $meta3_out"
+    fail=$((fail + 1))
+fi
+
+assert_code 401 "permissions DELETE without credentials rejected" -X DELETE \
+            "http://127.0.0.1:$PORT/wal/metadata/permissions/12"
+assert_code 204 "permissions DELETE with write token" -X DELETE -H "$PH" \
+            "http://127.0.0.1:$PORT/wal/metadata/permissions/12"
+assert_code 404 "GET permissions after delete" -H "$PH" "http://127.0.0.1:$PORT/wal/metadata/permissions/12"
 
 # Auth gate check: when OIDC cookie auth is enabled, /wal routes require
 # both X-PW-Auth header and a valid short-lived session cookie.

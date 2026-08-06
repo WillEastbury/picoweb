@@ -301,7 +301,7 @@ static int make_listen_socket(int port) {
     struct sockaddr_in sa;
     memset(&sa, 0, sizeof(sa));
     sa.sin_family      = AF_INET;
-    sa.sin_addr.s_addr = htonl(INADDR_ANY);
+    sa.sin_addr.s_addr = pw_listen_addr_be();
     sa.sin_port        = htons((uint16_t)port);
     if (bind(fd, (struct sockaddr*)&sa, sizeof(sa)) != 0)
         metal_die("bind :%d: %s", port, strerror(errno));

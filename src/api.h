@@ -132,6 +132,26 @@ bool api_oidc_init(bool cookie_auth_enabled, uint32_t cookie_ttl_sec,
                    const char* entra_client_id,
                    const char* entra_tenant);
 
+/* Registers an external PicoSTS OIDC authority as an additional login
+ * provider (POST {picowal-prefix}auth/login with provider="picosts").
+ * Requires --oidc-cookie-auth to also be enabled (via api_oidc_init).
+ * client_id/audience default to "spa"/"api" (PicoSTS's own defaults) if
+ * NULL/empty. cookie_key signs the stateless cluster-safe session cookie
+ * (HMAC-SHA256) issued on successful picosts login -- required, since
+ * picosts sessions never use the node-local session table. Returns false
+ * on invalid config (missing issuer/cookie_key, values too long). */
+bool api_picosts_init(const char* issuer, const char* client_id,
+                      const char* audience, const char* cookie_key);
+bool api_picosts_enabled(void);
+const char* api_picosts_issuer(void);
+const char* api_picosts_client_id(void);
+const char* api_picosts_audience(void);
+
+/* Accessor for the configured --picowal-prefix (default "/wal/"), so other
+ * modules (ide.c) can report it via /ide/config without re-parsing CLI
+ * flags. Returns "" if picowal isn't enabled. */
+const char* api_picowal_prefix(void);
+
 /* Resolve principal id from the pw_session cookie. Returns true on
  * success and writes a NUL-terminated principal id into out_principal. */
 bool api_principal_from_cookie(const char* cookie, size_t cookie_len,

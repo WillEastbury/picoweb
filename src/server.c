@@ -45,6 +45,16 @@ static size_t g_zc_threshold = 0;
 /* Listen socket per worker                                       */
 /* ============================================================== */
 
+uint32_t pw_listen_addr_be(void) {
+    const char* s = getenv("PICOWEB_LISTEN_ADDR");
+    if (s && s[0]) {
+        struct in_addr a;
+        if (inet_pton(AF_INET, s, &a) == 1) return a.s_addr;
+        metal_die("bad PICOWEB_LISTEN_ADDR: %s", s);
+    }
+    return htonl(INADDR_ANY);
+}
+
 static int make_listen_socket(int port) {
     int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     if (fd < 0) metal_die("socket");
@@ -62,7 +72,7 @@ static int make_listen_socket(int port) {
     struct sockaddr_in sa;
     memset(&sa, 0, sizeof(sa));
     sa.sin_family = AF_INET;
-    sa.sin_addr.s_addr = htonl(INADDR_ANY);
+    sa.sin_addr.s_addr = pw_listen_addr_be();
     sa.sin_port = htons((uint16_t)port);
     if (bind(fd, (struct sockaddr*)&sa, sizeof(sa)) != 0)
         metal_die("bind :%d", port);

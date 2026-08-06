@@ -10,6 +10,7 @@
 #define PWV_PACK_USERS   0U
 #define PWV_PACK_NAMES   1U
 #define PWV_PACK_SCHEMA  2U
+#define PWV_PACK_PERMISSIONS 3U
 
 #define PWV_MAX_FIELDS        64
 #define PWV_MAX_TOKEN_LEN     96
@@ -198,10 +199,22 @@ static bool parse_json_object(const char* json, jobject_t* out) {
             f->text[0] = '\0';
             p = e;
         } else if (*p == '[') {
+            const char* start = p;
             const char* e = skip_json_value(p);
             if (!e || e == p) return false;
             f->kind = JV_ARRAY;
-            f->text[0] = '\0';
+            /* Capture the raw "[...]" span (bounded) so array_u16/blob
+             * logical-type checks can inspect element values below;
+             * left empty (and thus treated as opaque) if it doesn't fit
+             * PWV_MAX_VALUE_LEN -- fail-closed on those checks rather
+             * than validating a truncated array. */
+            size_t rawn = (size_t)(e - start);
+            if (rawn < sizeof(f->text)) {
+                memcpy(f->text, start, rawn);
+                f->text[rawn] = '\0';
+            } else {
+                f->text[0] = '\0';
+            }
             p = e;
         } else {
             f->kind = JV_NUMBER;
@@ -252,7 +265,8 @@ static bool parse_u32_dec(const char* s, uint32_t max, uint32_t* out) {
 }
 
 static bool is_system_pack(uint16_t pack_id) {
-    return pack_id == PWV_PACK_USERS || pack_id == PWV_PACK_NAMES || pack_id == PWV_PACK_SCHEMA;
+    return pack_id == PWV_PACK_USERS || pack_id == PWV_PACK_NAMES ||
+           pack_id == PWV_PACK_SCHEMA || pack_id == PWV_PACK_PERMISSIONS;
 }
 
 static bool load_record_json(picowal_db_t* db, uint16_t pack_id, uint32_t record_id,
@@ -362,8 +376,167 @@ static bool parse_number_record_id(const jfield_t* f, uint32_t* out_record) {
     return parse_u32_dec(f->text, PICOWAL_RECORD_MAX, out_record);
 }
 
+/* ---- rich logical-type helpers (bool/uintN/intN/number/decimal/ascii/
+ * utf8/date/time/datetime/array_u16/blob/lookup/object/array) ----
+ * These extend the original string/number/integer/bool/boolean/object/
+ * array primitive set with the PicoWAL GUI's richer field-type palette,
+ * while keeping every previously-accepted schema `types` value behaving
+ * exactly as before (string/number/integer/bool/boolean/object/array). */
+
+/* Parses a JSON-number lexeme (already captured in f->text) as a whole
+ * integer. Rejects fractional/exponent lexemes so uintN/intN/lookup
+ * checks don't silently truncate "3.5" to 3. */
+static bool parse_json_whole_int(const jfield_t* f, long long* out) {
+    if (!f || f->kind != JV_NUMBER || !out) return false;
+    for (const char* p = f->text; *p; p++) {
+        if (*p == '.' || *p == 'e' || *p == 'E') return false;
+    }
+    errno = 0;
+    char* end = NULL;
+    long long v = strtoll(f->text, &end, 10);
+    if (!end || *end != '\0' || errno == ERANGE) return false;
+    *out = v;
+    return true;
+}
+
+static bool int_in_range(const jfield_t* f, long long lo, long long hi) {
+    long long v;
+    if (!parse_json_whole_int(f, &v)) return false;
+    return v >= lo && v <= hi;
+}
+
+/* ISO-ish date/time/datetime format checks: lightweight structural +
+ * range validation (not a full Gregorian calendar validator), matching
+ * the rest of this file's "good enough to catch real mistakes, not a
+ * full RFC/ISO parser" style (see is_email_like above). */
+static bool is_date_like(const char* s) {
+    if (!s || strlen(s) != 10) return false;
+    if (!isdigit((unsigned char)s[0]) || !isdigit((unsigned char)s[1]) ||
+        !isdigit((unsigned char)s[2]) || !isdigit((unsigned char)s[3])) return false;
+    if (s[4] != '-') return false;
+    if (!isdigit((unsigned char)s[5]) || !isdigit((unsigned char)s[6])) return false;
+    if (s[7] != '-') return false;
+    if (!isdigit((unsigned char)s[8]) || !isdigit((unsigned char)s[9])) return false;
+    int mm = (s[5] - '0') * 10 + (s[6] - '0');
+    int dd = (s[8] - '0') * 10 + (s[9] - '0');
+    return mm >= 1 && mm <= 12 && dd >= 1 && dd <= 31;
+}
+
+static bool is_time_like(const char* s) {
+    size_t n = s ? strlen(s) : 0;
+    if (n != 5 && n != 8) return false;
+    if (!isdigit((unsigned char)s[0]) || !isdigit((unsigned char)s[1]) || s[2] != ':' ||
+        !isdigit((unsigned char)s[3]) || !isdigit((unsigned char)s[4])) return false;
+    if (n == 8 && (s[5] != ':' || !isdigit((unsigned char)s[6]) || !isdigit((unsigned char)s[7]))) return false;
+    int hh = (s[0] - '0') * 10 + (s[1] - '0');
+    int mi = (s[3] - '0') * 10 + (s[4] - '0');
+    int ss = (n == 8) ? (s[6] - '0') * 10 + (s[7] - '0') : 0;
+    return hh <= 23 && mi <= 59 && ss <= 59;
+}
+
+static bool is_datetime_like(const char* s) {
+    size_t n = s ? strlen(s) : 0;
+    if (n < 19) return false;
+    if (s[10] != 'T' && s[10] != ' ') return false;
+    char datepart[11];
+    memcpy(datepart, s, 10);
+    datepart[10] = '\0';
+    if (!is_date_like(datepart)) return false;
+    char timepart[9];
+    memcpy(timepart, s + 11, 8);
+    timepart[8] = '\0';
+    return is_time_like(timepart);
+}
+
+/* Validates a captured "[...]" raw array span contains only integers in
+ * [lo, hi] (used by array_u16 -- 0..65535 -- and blob-as-byte-array --
+ * 0..255). Nested strings/objects/arrays are rejected (fail-closed), not
+ * silently skipped. */
+static bool array_ints_in_range(const char* raw, long lo, long hi) {
+    if (!raw || raw[0] != '[') return false;
+    const char* p = skip_ws(raw + 1);
+    if (*p == ']') return true; /* empty array is valid */
+    for (;;) {
+        p = skip_ws(p);
+        char* end = NULL;
+        errno = 0;
+        long long v = strtoll(p, &end, 10);
+        if (end == p || errno == ERANGE) return false;
+        if (v < lo || v > hi) return false;
+        p = skip_ws(end);
+        if (*p == ',') { p = skip_ws(p + 1); continue; }
+        if (*p == ']') return true;
+        return false;
+    }
+}
+
+/* base64: RFC 4648 alphabet, '=' padding only at the very end, length a
+ * multiple of 4 (matches what a browser btoa()/atob() round-trip and
+ * BareMetal.Binary's setSigningKey() decoder both produce/expect). */
+static bool is_base64_like(const char* s) {
+    if (!s) return false;
+    size_t n = strlen(s);
+    if (n == 0) return true;
+    if (n % 4 != 0) return false;
+    size_t pad = 0;
+    for (size_t i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (c == '=') { pad++; continue; }
+        if (pad > 0) return false; /* padding must trail everything else */
+        if (!(isalnum(c) || c == '+' || c == '/')) return false;
+    }
+    return pad <= 2;
+}
+
+static bool validate_one_field_type(const jfield_t* f, const char* expect,
+                                    int* out_http_status, char* err, size_t err_cap) {
+    bool ok;
+    if (strcmp(expect, "string") == 0) ok = (f->kind == JV_STRING);
+    else if (strcmp(expect, "number") == 0 || strcmp(expect, "integer") == 0 ||
+             strcmp(expect, "decimal") == 0) ok = (f->kind == JV_NUMBER);
+    else if (strcmp(expect, "bool") == 0 || strcmp(expect, "boolean") == 0) ok = (f->kind == JV_BOOL);
+    else if (strcmp(expect, "object") == 0) ok = (f->kind == JV_OBJECT);
+    else if (strcmp(expect, "array") == 0) ok = (f->kind == JV_ARRAY);
+    else if (strcmp(expect, "ascii") == 0) {
+        ok = (f->kind == JV_STRING);
+        if (ok) {
+            for (const unsigned char* p = (const unsigned char*)f->text; *p; p++) {
+                if (*p > 0x7F) { ok = false; break; }
+            }
+        }
+    }
+    else if (strcmp(expect, "utf8") == 0) ok = (f->kind == JV_STRING);
+    else if (strcmp(expect, "uint8") == 0) ok = int_in_range(f, 0, 255);
+    else if (strcmp(expect, "uint16") == 0) ok = int_in_range(f, 0, 65535);
+    else if (strcmp(expect, "uint32") == 0) ok = int_in_range(f, 0, 4294967295LL);
+    else if (strcmp(expect, "int8") == 0) ok = int_in_range(f, -128, 127);
+    else if (strcmp(expect, "int16") == 0) ok = int_in_range(f, -32768, 32767);
+    else if (strcmp(expect, "int32") == 0) ok = int_in_range(f, -2147483648LL, 2147483647LL);
+    else if (strcmp(expect, "date") == 0) ok = (f->kind == JV_STRING) && is_date_like(f->text);
+    else if (strcmp(expect, "time") == 0) ok = (f->kind == JV_STRING) && is_time_like(f->text);
+    else if (strcmp(expect, "datetime") == 0) ok = (f->kind == JV_STRING) && is_datetime_like(f->text);
+    else if (strcmp(expect, "array_u16") == 0) ok = (f->kind == JV_ARRAY) && array_ints_in_range(f->text, 0, 65535);
+    else if (strcmp(expect, "blob") == 0) {
+        ok = (f->kind == JV_STRING && is_base64_like(f->text)) ||
+             (f->kind == JV_ARRAY && array_ints_in_range(f->text, 0, 255));
+    }
+    else if (strcmp(expect, "lookup") == 0) ok = int_in_range(f, 0, (long long)PICOWAL_RECORD_MAX);
+    else {
+        if (out_http_status) *out_http_status = 500;
+        set_err(err, err_cap, "schema has unsupported type");
+        return false;
+    }
+    if (!ok) {
+        if (out_http_status) *out_http_status = 400;
+        set_err(err, err_cap, "field type mismatch");
+        return false;
+    }
+    return true;
+}
+
 static bool validate_field_types(const jobject_t* body_obj,
                                  const kv_map_t* types, size_t types_n,
+                                 char nullable_extra[][PWV_MAX_TOKEN_LEN], size_t nullable_extra_n,
                                  int* out_http_status, char* err, size_t err_cap) {
     for (size_t i = 0; i < types_n; i++) {
         const jfield_t* f = json_object_get(body_obj, types[i].field);
@@ -378,23 +551,90 @@ static bool validate_field_types(const jobject_t* body_obj,
             allow_null = true;
             expect[elen - 1] = '\0';
         }
+        if (!allow_null && list_has_token(nullable_extra, nullable_extra_n, types[i].field)) {
+            allow_null = true;
+        }
 
         if (f->kind == JV_NULL && allow_null) continue;
 
-        bool ok = false;
-        if (strcmp(expect, "string") == 0) ok = (f->kind == JV_STRING);
-        else if (strcmp(expect, "number") == 0 || strcmp(expect, "integer") == 0) ok = (f->kind == JV_NUMBER);
-        else if (strcmp(expect, "bool") == 0 || strcmp(expect, "boolean") == 0) ok = (f->kind == JV_BOOL);
-        else if (strcmp(expect, "object") == 0) ok = (f->kind == JV_OBJECT);
-        else if (strcmp(expect, "array") == 0) ok = (f->kind == JV_ARRAY);
-        else {
-            if (out_http_status) *out_http_status = 500;
-            set_err(err, err_cap, "schema has unsupported type");
-            return false;
+        if (!validate_one_field_type(f, expect, out_http_status, err, err_cap)) return false;
+    }
+    return true;
+}
+
+/* max_lengths: "field=N;..." assignment map. Applies to string-kind
+ * values (string/ascii/utf8) as a character-count cap, and to
+ * array-kind values (array_u16) as an element-count cap -- matching the
+ * field builder's single "max length" input covering either a string's
+ * length or an array's item count depending on the field's logical
+ * type. */
+static bool validate_max_lengths(const jobject_t* body_obj,
+                                 const kv_map_t* max_lengths, size_t max_lengths_n,
+                                 int* out_http_status, char* err, size_t err_cap) {
+    for (size_t i = 0; i < max_lengths_n; i++) {
+        const jfield_t* f = json_object_get(body_obj, max_lengths[i].field);
+        if (!f || f->kind == JV_NULL) continue;
+
+        char* end = NULL;
+        errno = 0;
+        long max_len = strtol(max_lengths[i].value, &end, 10);
+        if (!end || *end != '\0' || errno == ERANGE || max_len < 0) continue; /* malformed schema value: skip */
+
+        if (f->kind == JV_STRING) {
+            if (strlen(f->text) > (size_t)max_len) {
+                if (out_http_status) *out_http_status = 400;
+                set_err(err, err_cap, "field exceeds max length");
+                return false;
+            }
+        } else if (f->kind == JV_ARRAY) {
+            if (f->text[0] != '[') {
+                if (out_http_status) *out_http_status = 400;
+                set_err(err, err_cap, "array too large to validate max length");
+                return false;
+            }
+            long count = 0;
+            const char* p = skip_ws(f->text + 1);
+            if (*p != ']') {
+                count = 1;
+                for (; *p; p++) {
+                    if (*p == ',') count++;
+                }
+            }
+            if (count > max_len) {
+                if (out_http_status) *out_http_status = 400;
+                set_err(err, err_cap, "field exceeds max length");
+                return false;
+            }
         }
-        if (!ok) {
-            if (out_http_status) *out_http_status = 400;
-            set_err(err, err_cap, "field type mismatch");
+    }
+    return true;
+}
+
+/* readonly: CSV of field names that may not change value once a record
+ * exists. New records (POST, or PUT creating a not-yet-existing record)
+ * are unaffected -- there is no prior value to protect. */
+static bool validate_readonly_fields(picowal_db_t* db, uint16_t pack_id, uint32_t record_id,
+                                     picowal_validate_op_t op, const jobject_t* body_obj,
+                                     char readonly[][PWV_MAX_TOKEN_LEN], size_t readonly_n,
+                                     int* out_http_status, char* err, size_t err_cap) {
+    if (readonly_n == 0 || op != PWV_OP_PUT || record_id > PICOWAL_RECORD_MAX) return true;
+
+    char old_json[PWV_MAX_SCHEMA_LEN];
+    if (!load_record_json(db, pack_id, record_id, old_json, sizeof(old_json))) return true; /* new record */
+    jobject_t old_obj;
+    if (!parse_json_object(old_json, &old_obj)) return true;
+
+    for (size_t i = 0; i < readonly_n; i++) {
+        const jfield_t* newf = json_object_get(body_obj, readonly[i]);
+        if (!newf) continue; /* field omitted from the write -- nothing changed */
+        const jfield_t* oldf = json_object_get(&old_obj, readonly[i]);
+        bool same;
+        if (!oldf) same = (newf->kind == JV_NULL);
+        else if (oldf->kind != newf->kind) same = false;
+        else same = (strcmp(oldf->text, newf->text) == 0);
+        if (!same) {
+            if (out_http_status) *out_http_status = 409;
+            set_err(err, err_cap, "field is read-only");
             return false;
         }
     }
@@ -508,6 +748,7 @@ static bool validate_regex_rules(const jobject_t* body_obj, const kv_map_t* rege
 }
 
 static bool validate_write(picowal_db_t* db, uint16_t pack_id, uint32_t record_id,
+                           picowal_validate_op_t op,
                            const char* body, size_t body_len,
                            int* out_http_status, char* err, size_t err_cap) {
     if (!body || body_len == 0 || body_len > PICOWAL_DATA_MAX) {
@@ -567,11 +808,33 @@ static bool validate_write(picowal_db_t* db, uint16_t pack_id, uint32_t record_i
         }
     }
 
+    char nullable[PWV_MAX_FIELDS][PWV_MAX_TOKEN_LEN];
+    size_t nullable_n = 0;
+    const jfield_t* f_nullable = json_object_get(&schema_obj, "nullable");
+    if (f_nullable && f_nullable->kind == JV_STRING && f_nullable->text[0]) {
+        nullable_n = parse_csv_list(f_nullable->text, nullable, PWV_MAX_FIELDS);
+    }
+
     const jfield_t* f_types = json_object_get(&schema_obj, "types");
     if (f_types && f_types->kind == JV_STRING && f_types->text[0]) {
         kv_map_t types[PWV_MAX_FIELDS];
         size_t types_n = parse_assign_map(f_types->text, types, PWV_MAX_FIELDS);
-        if (!validate_field_types(&body_obj, types, types_n, out_http_status, err, err_cap)) return false;
+        if (!validate_field_types(&body_obj, types, types_n, nullable, nullable_n, out_http_status, err, err_cap)) return false;
+    }
+
+    const jfield_t* f_max_lengths = json_object_get(&schema_obj, "max_lengths");
+    if (f_max_lengths && f_max_lengths->kind == JV_STRING && f_max_lengths->text[0]) {
+        kv_map_t max_lengths[PWV_MAX_FIELDS];
+        size_t max_lengths_n = parse_assign_map(f_max_lengths->text, max_lengths, PWV_MAX_FIELDS);
+        if (!validate_max_lengths(&body_obj, max_lengths, max_lengths_n, out_http_status, err, err_cap)) return false;
+    }
+
+    const jfield_t* f_readonly = json_object_get(&schema_obj, "readonly");
+    if (f_readonly && f_readonly->kind == JV_STRING && f_readonly->text[0]) {
+        char readonly[PWV_MAX_FIELDS][PWV_MAX_TOKEN_LEN];
+        size_t readonly_n = parse_csv_list(f_readonly->text, readonly, PWV_MAX_FIELDS);
+        if (!validate_readonly_fields(db, pack_id, record_id, op, &body_obj, readonly, readonly_n,
+                                      out_http_status, err, err_cap)) return false;
     }
 
     const jfield_t* f_email = json_object_get(&schema_obj, "email");
@@ -678,7 +941,7 @@ bool picowal_validate_mutation(picowal_db_t* db,
     switch (op) {
     case PWV_OP_PUT:
     case PWV_OP_POST:
-        return validate_write(db, pack_id, record_id, body, body_len, out_http_status, err, err_cap);
+        return validate_write(db, pack_id, record_id, op, body, body_len, out_http_status, err, err_cap);
     case PWV_OP_DELETE:
         return validate_delete_refs(db, pack_id, record_id, out_http_status, err, err_cap);
     default:

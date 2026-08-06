@@ -21,6 +21,7 @@ static size_t   g_prefix_len = 0;
 static bool     g_enabled = false;
 
 bool pico_route_enabled(void) { return g_enabled; }
+const char* pico_route_prefix(void) { return g_enabled ? g_prefix : ""; }
 
 static int pico_route_storage_hook(pv_ctx *ctx, int hook, int rd, int rs1, int rs2);
 

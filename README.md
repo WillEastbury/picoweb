@@ -41,6 +41,8 @@ the CPU.
 - [Build](#build)
 - [Run](#run)
 - [Optional API backends](#optional-api-backends)
+- [PicoSTS login provider](#picosts-login-provider-external-oidc-authority)
+- [Hosted PicoScript IDE](#hosted-picoscript-ide-ide)
 - [Filesystem conventions](#filesystem-conventions)
   - [Virtual hosts](#virtual-hosts)
   - [`_chrome/` — header/footer wrap for HTML](#_chrome--headerfooter-wrap-for-html)
@@ -193,6 +195,7 @@ picoweb can expose two lightweight data APIs in the same binary:
 - **JSON file API** (existing): `--api-root=DIR [--api-prefix=/api/]`
 - **picowal raw-volume API** (new): `--picowal-device=PATH [--picowal-prefix=/wal/]`
 - **OIDC cookie auth for picowal** (optional): `--oidc-cookie-auth --oidc-google-client-id=... --oidc-entra-client-id=... [--oidc-cookie-ttl-sec=900] [--oidc-entra-tenant=...]`
+- **PicoSTS login provider** (optional, external OIDC authority): `--picosts-issuer=URL --picosts-cookie-key=KEY [--picosts-client-id=spa] [--picosts-audience=api]` (requires `--oidc-cookie-auth`; see "PicoSTS login provider" below)
 
 `picowal` uses a directory-based write-ahead-log (WAL) + `base.dat`
 transactional engine (see "Storage engine" below for the on-disk layout,
@@ -203,14 +206,38 @@ transactions, durability, and checkpointing) and maps keys as
 - `record`: `0..4194303`
 - route shape: `/{prefix}{card}/{record}` (default `/wal/{card}/{record}`)
 - query endpoint: `POST /wal/query` with picowal query text (`S:`, `F:`, `W:`) including joined pack references
-- list endpoint: `GET /wal/list/{pack}` returns `{pack, records:[{record,data}], count}` for app-shell list views
+- list endpoint: `GET /wal/list/{pack}` returns `{pack, records:[{record,data}], count}` for app-shell list views.
+  When `--picowal-partition-nodes` is configured, this fans out to every node in the tenant's pool
+  (ownership is per-record, so a full-pack listing has no single owner) and merges the results the
+  same way `/wal/query` already does, de-duplicating records defensively by id; the merged response
+  gains `partial`/`shards_ok`/`shards_total` fields if any shard was unreachable. An inbound
+  `X-PW-Partition-Hop` request is served from the local shard only, to avoid fan-out loops.
 - report endpoint: `POST /wal/report` (query DSL body, or JSON `{"query":"..."}`) returns wrapped report JSON
 - dashboard endpoint: `POST /wal/dashboard` (multiple query panels separated by `---`; optional `T:` title per panel)
 - schema endpoint: `/wal/schema/{pack}` (`PUT/GET/HEAD/DELETE`, `POST` create-only)
 - metadata wrappers:
   - `/wal/metadata/name/{pack}` → pack 1
   - `/wal/metadata/schema/{pack}` → pack 2
-  - `/wal/metadata/{pack}` → combined fetch (`pack1` + `pack2`)
+  - `/wal/metadata/permissions/{pack}` → pack 3 (`GET/HEAD/PUT/DELETE`) — persists a
+    picoscript-style RBAC/RLS **design** document `{roles:[...], permissions:[{role,pack,actions}],
+    rowPolicies:[{pack,role,predicate}]}`. **This pack is reserved metadata, not an enforcement
+    boundary**: picoweb stores and replicates it so the IDE's Permissions panel (and any other
+    tooling) can design/document intended access control, but no request path currently checks it
+    before allowing a read/write/query — see "Permissions pack (metadata pack 3) — design-time only"
+    below. Unlike pack 1/2 writes (open by default when neither `--oidc-cookie-auth` nor
+    `--picowal-write-token` is configured), pack 3 mutations always require credentials via the same
+    `api_require_pw_auth()` gate as `/ide/card/`/static/code raw writes.
+  - `/wal/metadata/{pack}` → combined fetch (`pack1` + `pack2` + `pack3`, with `pack3`'s value
+    also mirrored under a `permissions` key for discoverability)
+- metadata cluster replication: when `--picowal-partition-nodes` is configured, every
+  `PUT`/`DELETE` against `/wal/metadata/name|schema|permissions/{pack}` (packs 1/2/3) is
+  replicated to **every** node in the tenant's pool, not just applied locally — metadata is
+  expected to read identically from any node, unlike per-record data (which is sharded by
+  ownership; see "Virtual-partition ownership routing" below). If a peer can't be reached or
+  rejects the mutation, the response is `502 Bad Gateway` describing how many peers failed
+  rather than silently reporting success while nodes have drifted apart. An inbound
+  `X-PW-Partition-Hop` request (i.e. this node is itself the replication target of another
+  node's fan-out) applies the mutation locally only, to avoid replication loops.
 - metadata-derived form spec:
   - `/wal/forms/{pack}` (`GET/HEAD`) → returns a minimal JS handoff payload: `{pack, entity, schema, app}` where `schema` is pack 2 metadata as-is and `app` is expanded model metadata
   - example browser client: `/forms.html` (builds controls client-side from `schema` and submits to `/wal/{pack}[/{record}]`)
@@ -224,9 +251,14 @@ transactions, durability, and checkpointing) and maps keys as
     - `title`, `icon`, `pages`, `nav`, `list_columns`, `layout`, `actions`, `page_size`, `default_sort`
     - `field_labels` and `field_placeholders` (`field=value;...`)
 - auth endpoints (when `--oidc-cookie-auth` is enabled):
-  - `POST /wal/auth/login` body: `{"provider":"google|entra","access_token":"..."}`  
-    validates token with provider, then sets short-lived `HttpOnly` cookie
-  - `POST /wal/auth/logout` clears cookie
+  - `POST /wal/auth/login` body: `{"provider":"google|entra|picosts","access_token":"..."}`
+    validates the token with the named provider, then sets a short-lived `HttpOnly` `Path=/` cookie
+    (covers `/wal/`, `/site/`, `/app/`, `/ide/` alike). `google`/`entra` sessions are tracked in a
+    node-local table; `picosts` sessions are stateless (HMAC-signed, no server-side table --
+    see "PicoSTS login provider" below), which is what makes them cluster-safe.
+  - `GET /wal/auth/me` returns `{"principal":"<sub>"}` for the current session, or `401`
+  - `POST /wal/auth/logout` clears the cookie (best-effort server-side revoke for
+    table-backed sessions; stateless `picosts` sessions only support client-side clearing)
   - all other `/wal/*` routes require `X-PW-Auth: 1` and a valid cookie
 - CORS is enabled on API responses when an `Origin` header is present:
   - preflight `OPTIONS` for `/api/*` and `/wal/*` returns `204`
@@ -253,10 +285,65 @@ from pack 2 metadata and enforces:
 
 - lookup referential integrity (`joins`: `<targetPack>=<fk_field>` CSV)
 - required fields (`required`: CSV)
-- type checks (`types`: `field=type;...` where type is `string|number|boolean|object|array` and `?` allows null)
+- nullable fields (`nullable`: CSV — also settable per-field via a trailing `?` on the
+  field's `types` entry, e.g. `email=string?`; either form allows a JSON `null` even if
+  the field is also `required`)
+- read-only fields (`readonly`: CSV — a `PUT` to an *existing* record may not change the
+  value of a field listed here; `409` if it tries. New records via `POST`, or a `PUT`
+  creating a not-yet-existing record, are unaffected)
+- max length (`max_lengths`: `field=N;...` — a character-count cap for string-kind
+  fields, or an element-count cap for `array_u16` fields)
+- type checks (`types`: `field=type;...`). Supported `type` values:
+  - primitives (unchanged): `string`, `number`, `integer`, `bool`/`boolean`, `object`, `array`
+  - rich logical types: `uint8`/`uint16`/`uint32`/`int8`/`int16`/`int32` (range-checked
+    whole integers), `decimal` (any JSON number), `ascii` (string, all bytes ≤ 0x7F),
+    `utf8` (string, any), `date` (`YYYY-MM-DD`), `time` (`HH:MM` or `HH:MM:SS`),
+    `datetime` (`YYYY-MM-DDTHH:MM:SS`, `T` or space separator), `array_u16` (JSON array
+    of integers `0..65535`), `blob` (a base64 string, or a JSON array of integers
+    `0..255`), `lookup` (a non-negative integer record id — pair with a `joins` entry for
+    it to also be checked against the target pack's existing records)
+  - any of the above accepts a trailing `?` (e.g. `qty=uint16?`) to allow `null`
 - email checks (`email`: CSV field list)
 - regex checks (`regex`: `field=pattern;...`)
 - transition rules (`transitions`: `field=from>to|from2>to2;...`)
+
+Pack-level and per-field **design metadata** that the server stores and returns
+unchanged but does not itself validate or enforce (consumed by the IDE's Packs & Schemas
+field builder and typed Cards editor): `module` (string, groups packs in the pack
+navigator), `public_read` (bool, a documentation-only visibility flag), `children` (CSV
+of child pack ids, used to render master-child grids), `list_columns` (CSV), `ordinals`
+(`field=N;...`, display order), `lookup_labels` (`field=displayField;...`, which field of
+the lookup target pack to show), `field_labels`/`field_placeholders`
+(`field=value;...`, pretty label/input placeholder — pre-existing keys also used by the
+`/wal/forms/{pack}` GUI form spec).
+
+### Permissions pack (metadata pack 3) — design-time only, not an enforcement boundary
+
+`/wal/metadata/permissions/{pack}` stores a document shaped like:
+
+```json
+{
+  "roles": ["admin", "viewer"],
+  "permissions": [{"role": "viewer", "pack": 12, "actions": ["read"]}],
+  "rowPolicies": [{"pack": 12, "role": "viewer", "predicate": "status|==|Placed"}],
+  "assignments": [{"principal": "user@example.com", "roles": ["viewer"]}]
+}
+```
+
+`assignments` (`[{principal, roles:[...]}]`) maps a PicoSTS subject to the role(s) above,
+so operators can document/track which principals are intended to hold which roles. Like
+the rest of this document, it is stored and cluster-replicated verbatim but **not read by
+picoweb to authorize anything**.
+
+This is the same `{roles, permissions, rowPolicies}` RBAC/RLS design model already used by the
+picoscript WebIDE's RBAC designer (`rowPolicies` predicates use the same `field|op|value` syntax
+as the query `W:` clause). **picoweb persists and cluster-replicates this document, but does not
+currently enforce it**: no `/wal/`, `/ide/`, `/site/`, or `/app/` request path consults pack 3
+before allowing a read, write, delete, or query. Treat it as documentation of intended access
+control captured alongside the schema (useful for code review, downstream authorization services,
+or a future enforcement layer), not as an actual security control — reads/writes are gated only by
+the mechanisms described above (`--oidc-cookie-auth` cookies or `--picowal-write-token`, both
+independent of anything stored in pack 3).
 
 Query language (multi-line body):
 
@@ -353,13 +440,24 @@ bypassing the on-disk `wwwroot` tree and the `/wal/` JSON-schema pipeline
 entirely (both operate on raw bytes):
 
 - **static content**: `--picowal-static-card=N [--picowal-static-prefix=/site/]`
-  - `GET/HEAD /{prefix}{record}[.ext]` returns the raw bytes stored at
-    `(card, record)`; an omitted record segment means record `0`; the
-    optional `.ext` suffix drives `Content-Type` via MIME sniffing (falls
-    back to `application/octet-stream`)
+  - `GET/HEAD /{prefix}{record}[.ext]` and `GET/HEAD /{prefix}{record}/{filename.ext}`
+    both return the raw bytes stored at `(card, record)`; an omitted record
+    segment means record `0`. The optional extension drives `Content-Type`
+    via MIME sniffing (falls back to `application/octet-stream`) and is
+    taken from the trailing filename's last `.` when present (e.g.
+    `/site/0/index.html` and `/site/0.html` both serve record `0` as
+    `text/html`) -- the filename is never part of the picowal key, only
+    used for MIME, so this is how a small multi-file bundle (`index.html`
+    at record 0, `app.js` at record 1, ...) gets human-readable URLs
+    without touching the filesystem.
   - `PUT /{prefix}{record}[.ext]` writes the request body verbatim to
     `(card, record)` — no JSON validation, any byte content is accepted
   - `DELETE /{prefix}{record}[.ext]` removes the record (`404` if absent)
+  - partition-aware for all of GET/HEAD/PUT/DELETE when
+    `--picowal-partition-nodes` is configured (see "Virtual-partition
+    ownership routing" below): a node that doesn't own a given record's
+    virtual partition redirects or transparently proxies to the true
+    owner, so static content is reachable through any node in the pool
 - **dynamic PicoScript routes**: `--picowal-code-card=N [--picowal-code-prefix=/app/]`
   - the code card's record `0` holds a compiled PicoScript bytecode program
     (see `picoscript_build.py emit --as bytecode --hex`, then pack the hex
@@ -399,6 +497,342 @@ Example:
           --picowal-write-token=change-me-to-a-real-secret \
           8080 wwwroot
 ```
+
+---
+
+## PicoSTS login provider (external OIDC authority)
+
+picoweb treats [PicoSTS](../developercli/sts/README.md) (or any compatible
+OIDC authority) purely as an **identity authority** — picoweb never issues
+tokens, never talks to `/token` itself, and does not port any of PicoSTS's
+own service logic into this repo. The browser does the Authorization Code +
+PKCE dance directly against PicoSTS; picoweb's job is to validate the
+resulting access token and turn it into its own session cookie:
+
+```sh
+./picoweb --picowal-device=/var/lib/picowal --picowal-format \
+          --oidc-cookie-auth --oidc-cookie-ttl-sec=900 \
+          --picosts-issuer=https://sts.example.com \
+          --picosts-client-id=spa --picosts-audience=api \
+          --picosts-cookie-key="$(openssl rand -hex 32)" \
+          --ide-prefix=/ide/ \
+          8080 wwwroot
+```
+
+- `--picosts-issuer=URL` (required to enable the provider) — PicoSTS's
+  issuer/authority URL, trimmed of any trailing `/`
+- `--picosts-client-id=ID` — SPA client id registered with PicoSTS (default `spa`)
+- `--picosts-audience=AUD` — expected access-token `aud` claim (default `api`)
+- `--picosts-cookie-key=KEY` (or `PICOSTS_COOKIE_KEY` env var; required) —
+  HMAC-SHA256 key signing the stateless session cookie described below
+
+Login flow (`POST {picowal-prefix}auth/login` with
+`{"provider":"picosts","access_token":"..."}`, same endpoint google/entra use):
+
+1. `GET {issuer}/userinfo` with `Authorization: Bearer <token>` must
+   succeed and return a `sub` claim.
+2. The token is independently decoded as a JWT (payload only — this never
+   verifies the JWT signature, matching the "validate through userinfo +
+   payload checks" contract; PicoSTS's signing key/JWKS aren't consumed
+   here): its `iss` must match `--picosts-issuer`, `aud` must match
+   `--picosts-audience`, `exp`/`nbf` must be valid for the current time,
+   and `sub` must agree with the userinfo `sub`.
+3. On success, picoweb issues a **stateless** `pw_session` cookie: `v1.` +
+   base64url(`exp|sub`) + `.` + hex(HMAC-SHA256 over the tag+payload,
+   keyed by `--picosts-cookie-key`), using the constant-time compare
+   already used elsewhere in this codebase for MAC checks. There is no
+   node-local session table entry for `picosts` logins — any node in a
+   cluster configured with the **same** `--picosts-cookie-key` can
+   independently verify the cookie and recover the subject, which is what
+   makes `/ide/`, `/site/`, `/app/` and `/wal/` all work correctly behind
+   a load balancer that doesn't pin a client to one node. `google`/`entra`
+   logins keep using the pre-existing node-local session table.
+
+`GET {picowal-prefix}auth/me` returns `{"principal":"<sub>"}` for the
+current session (`401` if absent/invalid/expired) — used by the IDE (and
+any other SPA) to discover who's signed in.
+
+---
+
+## Hosted PicoScript IDE (`/ide/`)
+
+Whenever `--picowal-device` is configured, picoweb also serves the
+**actual, upstream PicoScript WebIDE portal** — not a hand-rolled
+substitute — compiled straight into the executable with no filesystem
+dependency at runtime, under `--ide-prefix` (default `/ide/`):
+
+- `GET /ide/` — the real portal vendored verbatim from the sibling
+  `picoscript` repo's generated `docs/index.html` (built by that repo's
+  own `gen_site.py`): the full **Guide & Reference / Code Editor /
+  Showcase** navigation (the hosted bridge relabels upstream `WebIDE` to
+  **Code Editor** and opens it by default), file sidebar
+  (New/Open/Save/Save as/Rename/Delete/Package/
+  Schema/Event/Ontology/RBAC-RLS designers), [Monaco](https://microsoft.github.io/monaco-editor/)
+  editor (falls back to a plain `<textarea>` if Monaco fails to load —
+  network blocked, CSP, slow CDN — a timeout guards this, not just script
+  `onerror`), dialect tabs (C/BASIC/Python/English/COBOL/Report/Workflow),
+  **Compile & Run** / **Compile & Step** / **Step** / **Reset**, and the
+  debug tabs (Disassembly/Registers/Watches/Output). `tools/gen_ide_assets.py`
+  injects `tools/ide_server_bridge.js` right before `</body>` at
+  build-generation time — the vendored HTML/CSS/JS above it is never
+  hand-edited, so re-running `../picoscript/gen_site.py` and regenerating
+  always drops in cleanly (see "Regenerating IDE assets" below).
+- `GET /ide/picowal.html` — the rebuilt **PicoWAL workspace** (its own
+  compiled-in asset, for CSS isolation), shown as a full-width portal tab
+  from the top-level **PicoWAL** control via a same-origin `<iframe>`.
+  The portal topbar remains visible and owns the only login/logout controls;
+  `?embedded=1` removes duplicate workspace chrome. See
+  "PicoWAL workspace" below.
+- `GET /ide/pico_hooks.js`, `/ide/picoc.js`, `/ide/picovm.js` — the
+  PicoScript compiler/runtime JS (`PicoCompile.compile(src, lang)` /
+  `PicoVM`), served from compiled-in byte arrays generated from the
+  sibling `picoscript` repo's `vm/*.js` (see "Regenerating IDE assets"
+  below). Kept for backward compatibility with any external tooling that
+  fetches them directly — the vendored portal above inlines its own copy
+  of the compiler/VM and no longer requests these itself.
+- `GET /ide/config` — JSON `{ide_prefix, wal_prefix, static_prefix,
+  code_prefix, picosts_enabled, picosts_issuer, picosts_client_id,
+  picosts_audience}` so neither page ever needs its own copy of the CLI
+  flags picoweb was started with.
+- `GET/HEAD/PUT/DELETE /ide/card/{pack}/{record}` — authenticated raw-byte
+  picowal CRUD (no schema validation, `PICOWAL_DATA_MAX` per record;
+  `pack` 0..1023, `record` 0..4194303) used by the bridge to save/load
+  PicoScript source and by the PicoWAL workspace's Fast Serial (BSO1)
+  panel. **Every** method (including reads) requires credentials via the
+  same `api_require_pw_auth` gate as static-pack/pico-route writes
+  (`X-PW-Auth: 1` + session cookie when `--oidc-cookie-auth` is enabled,
+  otherwise `X-PW-Write-Token`). Partition-aware for all of
+  GET/HEAD/PUT/DELETE, same as static content.
+
+### The server bridge (`tools/ide_server_bridge.js`)
+
+This is the *only* place that wires the vendored, upstream WebIDE to a
+running picoweb instance — everything else in the portal is untouched
+upstream code:
+
+- Fetches `/ide/config` on load and points the WebIDE's own "live server"
+  concept (`liveServerUrl()`/`liveServerSet()`, upstream concepts already
+  used by the Cards/Query/Schema panels) at this instance's same-origin
+  `config.wal_prefix` (default `/wal`) — **hosted mode is live by
+  default**, not the upstream localStorage simulator. An explicit
+  "offline simulator" checkbox next to the existing live-server status bar
+  is the only way back to the simulator (`liveServerSet("")`), persisted
+  in `localStorage` across reloads.
+- Overrides the upstream `liveFetch(path, opts)` so every live-mode
+  request — `/list/{pack}`, `/{pack}`, `/schema/{pack}`, which resolve to
+  `/wal/list/{pack}`, `/wal/{pack}`, `/wal/schema/{pack}` once the live
+  server is `/wal` — carries `credentials:"include"`, `X-PW-Auth: 1`, and
+  a JSON/text `Content-Type` default, matching the auth contract every
+  other picoweb write path already uses.
+- Replaces `schemaPushLive()` so pushing a `schemas/<pack>.schema.json`
+  file to the live server translates the WebIDE's simple
+  `{fields:[{name,type,...}]}` model into `picowal_validate.c`'s
+  server-native CSV/assignment-map shape (`fields`/`required`/`nullable`/
+  `readonly`/`email` as CSV; `types`/`max_lengths`/`regex`/`transitions`/
+  `lookup_labels` as `field=value;...` assignments; `joins` as
+  `targetPack=fkField,...`) instead of sending the WebIDE's own shape
+  verbatim — `PicoWebBridge.transformSchemaToServerNative()` is exposed
+  for testing/inspection and preserves any rich per-field metadata
+  (`required`/`nullable`/`readonly`/`maxLength`/`email`/`regex`/`join`/
+  `transitions`) a hand-edited `{ } JSON` schema might already carry.
+- Adds a compact PicoSTS login/logout/status control into the portal's
+  existing topbar (Authorization Code + PKCE, reusing `/wal/auth/login`,
+  `/wal/auth/me`, `/wal/auth/logout` — see "PicoSTS" above) without
+  altering the portal's own layout.
+- Adds **Save Source** / **Load Source** (authenticated
+  `{ide_prefix}card/{pack}/{record}`), **Deploy Bytecode** (`PUT` the last
+  `Compile`d bytecode to `--picowal-code-prefix`) and **Publish Static**
+  (`PUT` the active static file to `--picowal-static-prefix`) buttons into
+  the WebIDE's existing Compile & Run/Step/Reset controls row, matching
+  its `act`/`ghost` button styling and reporting status through the
+  existing file-sidebar status line (`filesStatus()`).
+- Adds a first-class **PicoWAL** tab next to Guide & Reference / WebIDE /
+  Showcase. It opens `{ide_prefix}picowal.html?embedded=1` as a full portal
+  view, with the same topbar and authentication state as the editor. The
+  iframe isolates CSS only; it shares the same cookie and receives the
+  portal's authenticated principal via same-origin `postMessage`.
+- Points the (not locally vendored) Showcase tab at the real hosted
+  `https://willeastbury.github.io/picoscript/showcase.html` instead of a
+  dead relative link, since only `docs/index.html` itself is vendored.
+
+### PicoWAL workspace (`GET /ide/picowal.html`)
+
+A dedicated, visually-isolated page, normally embedded as the portal's
+full PicoWAL tab — modeled on the real PicoWAL client's
+navy/coral panel language (`picowal/client/js/index.html` + `picowal.js`),
+not a dense flat admin form — giving a full front end for the real
+picowal storage backend. Everything in it talks to the actual `/wal/` API
+(`config.wal_prefix`), never `localStorage`/browser emulation. Left-hand
+navigation (workspace switcher + a module-grouped "known packs" list from
+metadata pack 1) and a right-hand main panel per section:
+
+- **Packs & Schemas** — numeric pack id (`0..1023`) plus a name field
+  (`/wal/metadata/name/{pack}`) and a rich visual field builder (ordinal,
+  name, logical type, max length, required/nullable/read-only, and, for
+  `lookup` fields, a target pack + display field) for the schema
+  (`/wal/metadata/schema/{pack}`). Logical types: `bool`, `uint8/16/32`,
+  `int8/16/32`, `number`, `decimal`, `ascii`, `utf8`, `date`, `time`,
+  `datetime`, `array_u16`, `blob`, `lookup`, `object`, `array` — all
+  enforced server-side by the extended `picowal_validate.c` (see below).
+  Pack-level metadata: `module` (groups packs in the pack navigator),
+  `public_read` (a design/documentation flag only — **not enforced**),
+  `children` (CSV of child pack ids, used to render master-child grids),
+  and `list_columns`. The builder writes the server-native shape directly:
+  `fields`/`required`/`nullable`/`readonly`/`children` as CSV; `types`/
+  `max_lengths`/`lookup_labels`/`field_labels`/`field_placeholders`/
+  `ordinals` as `field=value;...` assignments; `joins` as
+  `targetPack=fkField,...` (a lookup field's target pack is whichever join
+  entry's `fkField` matches its name) — and preserves any other top-level
+  schema keys (`title`, `regex`, `email`, `transitions`, `pages`, `nav`,
+  `layout`, `actions`, `page_size`, `default_sort`, ...) untouched when
+  loading and re-saving. A raw-JSON view/edit toggle is available
+  alongside the builder for anything it doesn't have a widget for.
+  "Known packs" lists every pack registered in metadata pack 1 (real
+  cards, via `GET /wal/list/1`) with a Load shortcut.
+- **Cards** — a schema-driven typed card editor (fetches
+  `GET /wal/schema/{pack}` to render the right input per field: number
+  inputs with range hints for `uintN`/`intN`, `date`/`time`/
+  `datetime-local` pickers, a checkbox-ish select for `bool`, comma-list
+  input for `array_u16`, and for `lookup` fields either a `<select>`
+  (target pack has ≤16 records) or a searchable `<datalist>`-backed input
+  (more than 16), showing the configured `lookup_labels` display field but
+  storing the numeric record id) alongside a raw-JSON toggle. Dirty
+  fields are tracked and shown next to the loaded `_version` (if the
+  schema uses one); saving re-reads the record first and warns — but does
+  not silently block — if the server-side version has moved since it was
+  loaded (a client-side optimistic-concurrency check, not a real
+  compare-and-swap: the durable operation is still a full `PUT`). Below
+  the editor: a paginated (10/page), client-side-searchable list plus an
+  MGET panel that fetches a comma-separated list of record ids
+  concurrently; and, when the pack's schema declares `children`,
+  master-child grids for each child pack (found by matching the child's
+  own `joins` back to this pack) with add/edit/delete rows and a
+  "Save All" that issues sequential authenticated writes and reports
+  partial failures per row — **not** an atomic batch. All of this still
+  goes through the real `/wal/{pack}/{record}` API (not `/ide/card/`), so
+  pack 2 schema validation applies exactly as it would for any other
+  client.
+- **Permissions** — a visual editor for the pack-3 RBAC/RLS design
+  document described above (add/remove roles, permission rows
+  `role`/`pack`/`actions`, row-policy rows `role`/`pack`/`predicate`, and
+  a principal → role `assignments` list — `[{principal,roles:[...]}]` —
+  for documenting which PicoSTS subjects are meant to hold which roles),
+  plus a raw-JSON toggle, backed by `/wal/metadata/permissions/{pack}`.
+  The panel repeats the same caveat as the README: **this is
+  design/deployment metadata, not an enforced authorization boundary** —
+  `assignments` in particular is pure documentation; picoweb never reads
+  it to authorize anything.
+- **Query** — a visual S/F/W builder (select fields, including
+  `pack.field` for joins; up to 4 FROM packs; WHERE rows with
+  `== != > < >= <= IN NI`) that syncs to a DSL editor posted straight to
+  `POST /wal/query` (the same cluster fan-out gateway described below),
+  rendering the full JSON response plus a best-effort table view and the
+  `count`/`partial`/`shards_ok`/`shards_total` fields when partitioning is
+  enabled. An optional aggregate panel (SUM/AVG/MIN/MAX/COUNT/FIRST, with
+  an optional GROUP BY field) is computed **entirely in the browser**
+  over the rows the ordinary (non-aggregate) query already returned and
+  is clearly labelled "client-aggregated" in the UI — `picowal_query.c`'s
+  parser has no native aggregate support, so this is not a server
+  capability and does not scale beyond whatever `PWQ_MAX_RESULTS`/scan
+  limits the plain query already has.
+- **Fast Serial (BSO1)** — a parallel **raw binary** card path, entirely
+  separate from the JSON `/wal/` engine above. It vendors
+  [BareMetal.Binary.js](../baremetaljstools/src/BareMetal.Binary.js)
+  byte-for-byte as a compiled-in asset (`GET /ide/baremetal-binary.js`,
+  see "Regenerating IDE assets" below) to derive a BSO1 wire schema from
+  a pack's rich field schema (logical types map onto BareMetal.Binary's
+  `Bool`/`Byte`/`UInt16`/`Int32`/`Decimal`/`String`/`DateOnly`/`TimeOnly`/
+  `DateTime` wire types; `array_u16`/`blob`/`object`/`array`, which
+  BareMetal.Binary has no native wire type for, are carried as their JSON
+  text/CSV representation), accepts a user-supplied base64 HMAC-SHA256
+  signing key (kept only in this page's in-memory JS state for the
+  session — **never** written to `localStorage`/`sessionStorage`/cookies),
+  serializes/deserializes the JSON currently in the Cards tab's editor,
+  shows a byte-size and hex preview, and saves/loads the signed BSO1
+  bytes through the same authenticated, partition-aware
+  `{ide_prefix}card/{pack}/{record}` endpoint used for PicoScript
+  source/static-bundle drafts. This is a genuine second on-disk card
+  format sharing the same picowal key space (pack/record) as the JSON
+  engine, has none of `picowal_validate.c`'s schema/type/lookup
+  enforcement of its own, and is **not queryable** by `/wal/query` (which
+  only understands the JSON card format) — pick a `(pack, record)` that
+  isn't also used for a JSON card in the same deployment unless you
+  intend to overwrite one format with the other.
+
+### Parity with the embedded RP23xxB PicoWAL GUI
+
+This IDE targets **feature parity on picoweb's own JSON-based clustered
+card store**, not byte-for-byte route/wire parity with the RP23xxB
+firmware's `web_server.c` (which uses a `0xCA7D`-tagged binary card
+format, ordinal-numbered fields, and server-side-rendered pages). Rough
+mapping:
+
+| RP23xxB GUI (`picowal/src/httpd/web_server.c`) | picoweb hosted IDE | Notes |
+|---|---|---|
+| `/pack/{n}` paginated list + search | Cards tab list: client-side search + 10/page pager | Same 10/page convention; search/paging done in the browser over `GET /wal/list/{pack}`, not a server-side query |
+| `/pack/{n}/{card}` typed SSR editor | Cards tab visual/raw typed editor | Same logical-type palette (`bool`/`uintN`/`intN`/`decimal`/`ascii`/`utf8`/`date`/`time`/`datetime`/`array_u16`/`blob`/`lookup`/`object`/`array`), client-rendered from JSON schema instead of server-rendered HTML |
+| Lookup ≤16 → `<select>`, >16 → search input | Same ≤16/>16 threshold (`PW_LOOKUP_DROPDOWN_MAX`) | dropdown vs. `<datalist>`-backed search input |
+| Master-child grids (schema ord `6` children + child lookup back-reference) | Child grids under a loaded card, from schema `children` (CSV) + child `joins` | Add/edit/delete rows + "Save All"; **sequential** authenticated writes, reported per-row — not an atomic batch like a single firmware write transaction |
+| `/admin/meta/{n}` schema editor | Packs & Schemas tab field builder | Richer per-field metadata (ordinal/max length/nullable/read-only/lookup target+label) written as the JSON schema's CSV/assignment strings, not binary ordinal field defs |
+| `/query` DSL + results | Query tab: visual S/F/W builder + DSL editor + results table | Adds a client-side aggregate layer (SUM/AVG/MIN/MAX/COUNT/FIRST, optional GROUP BY) since `picowal_query.c` has no native aggregate support — explicitly labelled "client-aggregated" |
+| `0xCA7D` binary card + dirty-delta `PUT` (`picowal.js`) | Fast Serial (BSO1) tab | Uses BareMetal.Binary's BSO1 format (a *different* signed binary envelope) over `{ide_prefix}card/`, not the firmware's `0xCA7D` format, and is a full-record `serialize`/`deserialize` round trip rather than a per-field dirty delta |
+| `/admin` user management | *(not implemented)* | Out of scope — picoweb's principal model is PicoSTS-issued tokens, not a local user table |
+| Server-enforced RBAC/RLS | Permissions tab (design metadata only) | Documented, never enforced — see the in-app warning banner |
+
+**Honest remaining gaps** (also called out in-app):
+
+- **No server-side aggregate query support.** The Query tab's aggregate
+  panel is computed client-side over whatever rows the plain query
+  already returned; it is not a scalable server capability and doesn't
+  benefit from cluster fan-out the way a native aggregate would.
+- **No true dirty-delta PUT.** Unlike `picowal.js`'s `buildDelta()`
+  (encodes and sends only changed fields), the IDE's Cards tab still
+  performs a full `PUT` of the whole record — dirty-field tracking is
+  UI-only (an editor affordance and a changed-field summary in the save
+  message), not a smaller wire payload.
+- **No server-enforced permissions/RBAC/RLS.** The Permissions tab
+  (including the new principal → role `assignments` list) is
+  documentation/design metadata; picoweb does not read any of it to
+  authorize a request.
+- **No atomic master-child batch writes.** "Save All" issues sequential
+  authenticated `PUT`/`POST` calls per row and reports partial failures;
+  a crash or error partway through can leave some child rows saved and
+  others not.
+- **BSO1 cards are not queryable.** Fast Serial (BSO1) records live in a
+  separate raw byte space from JSON cards and are invisible to
+  `/wal/query`, `/wal/list/`, and the schema/validation engine.
+- **`public_read`/readonly/nullable/max length are still just what the
+  schema says.** `public_read` is a design flag, not an access-control
+  gate (picoweb doesn't have a public/private read distinction to
+  enforce). `readonly`/`nullable`/`max_lengths` **are** enforced
+  server-side by `picowal_validate.c`, unlike `public_read`.
+
+### Regenerating IDE assets
+
+`src/ide_assets.c` (the compiled-in portal/workspace HTML/JS) is
+**committed** — a normal `make` never needs the sibling
+`picoscript`/`baremetaljstools` checkouts. To regenerate it after
+`picoscript`'s `docs/index.html` (or `vm/pico_hooks.js` / `picoc.js` /
+`picovm.js`) changes, after `baremetaljstools`'s `src/BareMetal.Binary.js`
+changes, or after editing `tools/ide_server_bridge.js` /
+`tools/ide_picowal_workspace.html`:
+
+```sh
+make gen-ide-assets   # requires python3 + ../picoscript and ../baremetaljstools checked out
+```
+
+`tools/gen_ide_assets.py` reads `../picoscript/docs/index.html` (the
+sibling repo's own generated portal — run that repo's `gen_site.py`
+first if you need a newer version) and injects
+`tools/ide_server_bridge.js` immediately before its last `</body>`; the
+result becomes `IDE_HTML`. `tools/ide_picowal_workspace.html` is read
+directly (it lives in this repo) and becomes `IDE_PICOWAL_HTML`. Neither
+`picoscript` nor `baremetaljstools` is ever modified by this process —
+only read from and vendored/injected into the generated `src/ide_assets.c`.
+
+`BareMetal.Binary.js` is vendored **verbatim** (never modified) from the
+sibling `baremetaljstools` checkout — picoweb does not edit it, only
+embeds it, exactly like the `picoscript` portal/VM/compiler JS above.
 
 ---
 
@@ -546,6 +980,41 @@ trusting a promoted node's writes as authoritative.
 > see `tests/test_gossip_backport.c` for an isolated unit test of both
 > fixes run against the real production file.
 
+### Control-plane-fenced clustering (`--picowal-cluster` + fence)
+
+When picoweb runs as a capsule under **picocluster**, the picowal
+replication above is driven by an external control plane instead of
+picoweb's own gossip election. In this mode the control plane is the
+**only** primary selector and every write on the primary is authorized
+by a mandatory, per-write **fence** — so a partitioned former primary
+cannot keep accepting writes.
+
+- `--picowal-cluster` — mark this volume as control-plane-managed. It
+  **rejects** the autonomous gossip-promotion flags
+  (`--picowal-node-id` / `--picowal-followers`) and **requires the fence
+  below for writable startup** (picoweb refuses to start a clustered
+  writable volume without a working fence).
+- `--picowal-fence-sock=PATH` — the local control plane's data-fence
+  Unix socket. Before every picowal mutation, picoweb asks it "am I
+  still the committed primary for this group at this epoch?" and fails
+  **closed** (HTTP 503) on any denial. A bounded, monotonic lease
+  (≤ 500 ms) avoids a round-trip per write.
+- `--picowal-fence-group=NAME` — the data-group id (the capsule name).
+- `--picowal-fence-epoch=N` — the assignment epoch this instance was
+  launched at; a stale epoch is rejected by the fence.
+- `--picowal-fence-node=ID` — this node's id; must equal the committed
+  primary.
+
+The replication token still comes from `--picowal-write-token` /
+`PICOWAL_WRITE_TOKEN` (the control plane injects the env from a 0600
+file); the fence carries no secret. When these flags are **absent**
+picoweb behaves exactly as before (standalone or gossip-driven), so
+existing deployments are unaffected. Under picocluster, all of this is
+configured automatically by the supervisor — see the picocluster repo's
+`docs/data-plane.md`. `PICOWEB_LISTEN_ADDR=<ipv4>` pins listeners to one
+address so several instances can share a port on distinct per-node
+addresses of one host.
+
 ---
 
 ## Virtual-partition ownership routing & the query/report gateway (`--picowal-partition-nodes`)
@@ -626,6 +1095,49 @@ See `test_picowal_partition.sh` for an end-to-end 3-node test covering
 ownership agreement, redirect/proxy write routing, and the query
 fan-out gateway.
 
+### List gateway: `GET /wal/list/{pack}` also reads across every shard
+
+`GET /wal/list/{pack}` has the same "no single owner" problem as query: a
+full-pack listing must see records regardless of which node happens to own
+each one. When partitioning is enabled, it fans out exactly like
+`/wal/query` — the receiving node serves its own shard in-process, fetches
+every other node's shard over a plain HTTP round trip, and merges the
+per-shard `records` arrays into one response, de-duplicating by record id
+defensively (a node briefly considered "owner" during a partition-pool
+membership change shouldn't be able to double-count a record). A shard
+that's unreachable is skipped rather than failing the whole request, and
+the merged response gains `"partial":true,"shards_ok":N,"shards_total":M`
+exactly like the query gateway. `X-PW-Partition-Hop: 1` again marks
+already-forwarded requests so a node serves them from its local shard only
+instead of fanning out again.
+
+### Metadata (name/schema/permissions) replication across the pool
+
+Metadata packs 1 (name), 2 (schema), and 3 (permissions) are **not**
+sharded like per-record data — every node in the tenant's pool is expected
+to hold an identical copy, so `GET /wal/metadata/...` always stays a local
+read. That means a `PUT`/`DELETE` against any of them has to fan out to
+the **whole** pool instead of routing to a single owner: whichever node
+receives the mutation applies it locally, then forwards the same
+`PUT`/`DELETE` to every other node in the tenant's pool (carrying the same
+cookie/write-token credentials, plus `X-PW-Partition-Hop: 1` so the peer
+applies it locally rather than re-forwarding). If every peer accepts it
+(or, for a `DELETE`, already didn't have the key), the original caller
+sees the normal `204`/`201`; if any peer is unreachable or rejects it, the
+caller gets a `502 Bad Gateway` explaining how many peers failed, rather
+than a `204` that silently hides nodes drifting out of sync.
+
+```sh
+curl -H 'X-PW-Write-Token: ...' -X PUT --data-binary '{"fields":"id,name"}' \
+     http://10.0.0.1:8080/wal/metadata/schema/12
+# applied on 10.0.0.1 AND replicated to 10.0.0.2 / 10.0.0.3 before the
+# response is sent back
+```
+
+See `test_picowal_partition.sh` for coverage of metadata replication (both
+`redirect` and `proxy` partition modes), the list gateway fan-out, and
+confirmation that unauthenticated metadata mutations are rejected.
+
 ### PicoScript `Storage.*` hooks are partition-aware too
 
 Dynamic PicoScript routes (`--picowal-code-card`, see "Static content and
@@ -645,6 +1157,20 @@ PicoScript card behaves identically whether it's running on the record's
 owner or not. See `test_pico_route_partition.sh` for an end-to-end test
 that deploys a router card to 3 partitioned nodes and confirms a card
 added via one node is readable through every node in the pool.
+
+### `static_pack` (`/site/`) and the IDE raw card store (`/ide/card/`) are partition-aware too
+
+Both of these serve/store raw bytes directly on a picowal card the same
+way `Storage.*` does above, so both are partition-aware for **all** of
+GET/HEAD/PUT/DELETE (not just writes, unlike `/wal/`'s REST API, which
+assumes the node pool is itself fully replicated and only proxies
+mutations) -- a node that isn't the current owner of a given `(pack,
+record)` redirects or transparently proxies to the true owner, using the
+request's tenant context (`X-PW-Tenant-Id` / `Host` first component) to
+resolve ownership exactly like `/wal/` does. See `test_ide_partition.sh`
+for an end-to-end test that publishes static content and IDE card data
+via one node in a 3-node proxy-mode pool and confirms both are readable,
+writable, and correctly MIME-typed through every node.
 
 ### Surfacing partition/ownership info to admin & GUI tooling
 
@@ -1062,6 +1588,19 @@ src/
   server.{c,h}     epoll worker loop, conn lifecycle, sendmsg state machine
   simd.{h}         SSE2/NEON inline primitives + scalar fallback
   util.{c,h}       FNV-1a, monotonic time, lowercase, log/die
+  api.{c,h}        JSON file API + picowal REST + OIDC/PicoSTS session auth
+  static_pack.{c,h}  serves static content straight from a picowal card
+  pico_route.{c,h}   dynamic HTTP routes rendered by PicoScript bytecode
+  picowal_partition.{c,h}  virtual-partition ownership routing/proxying
+  ide.{c,h}        hosted PicoScript IDE (/ide/): assets, config, raw card CRUD
+  ide_assets.{c,h} GENERATED (tools/gen_ide_assets.py) compiled-in portal/workspace HTML/JS
+tools/
+  gen_ide_assets.py        regenerates src/ide_assets.c (needs ../picoscript
+                           and ../baremetaljstools)
+  ide_server_bridge.js     bridges the vendored WebIDE portal to picoweb (injected
+                           before </body> in ../picoscript/docs/index.html)
+  ide_picowal_workspace.html  rebuilt PicoWAL workspace page (own repo, hand-authored,
+                           served separately at {ide_prefix}picowal.html)
 wwwroot/
   _default/        fallback vhost
   localhost/       example vhost
@@ -1080,6 +1619,33 @@ Helper scripts at the repo root:
 - `test_pages.sh` — end-to-end test of the `_pages/` and `_chrome/`
   conventions. Sets up fixtures, starts the server, drives `curl` against
   every documented behaviour, prints pass/fail.
+- `test_ide.sh` — single-node IDE smoke test: the vendored upstream WebIDE
+  portal structure (file sidebar, Monaco/textarea editor, Compile & Run/
+  Compile & Step/Step/Reset, Disassembly/Registers/Watches debug panels,
+  Guide & Reference/WebIDE/Showcase nav) at `GET /ide/`, the
+  `tools/ide_server_bridge.js` wiring markers (live server, liveFetch
+  override, schema translation, one PicoSTS control, deploy controls,
+  full PicoWAL portal tab), the rebuilt PicoWAL workspace page at
+  `GET /ide/picowal.html` across all five sub-tabs (Packs & Schemas rich
+  field builder / typed Cards editor + child grids + list pagination +
+  MGET / Permissions incl. assignments / Query builder + client-aggregate
+  / Fast Serial BSO1 panel), route/asset serving (including the vendored
+  `/ide/baremetal-binary.js`), `/ide/config`, authenticated raw card
+  save/load, and the static_pack trailing-filename MIME fix.
+- `test_ide_partition.sh` — 3-node proxy-mode cluster test: static_pack
+  and IDE raw card reads/writes/deletes all work through every node.
+- `test_picowal.sh` — picowal REST API + validator tests, including rich
+  logical-type validation (`bool`/`uintN`/`intN`/`decimal`/`ascii`/`utf8`/
+  `date`/`time`/`datetime`/`array_u16`/`blob`/`lookup`, `nullable`/
+  `readonly`/`max_lengths` enforcement) and a schema JSON round-trip test
+  asserting every new metadata key (`ordinals`, `lookup_labels`, `module`,
+  `public_read`, `children`, `list_columns`, `nullable`, `readonly`,
+  `max_lengths`) survives a save/reload unchanged.
+- `test_picosts_auth.sh` — PicoSTS Authorization Code + PKCE login
+  integration against a minimal fake `/userinfo` endpoint: userinfo/JWT
+  claim validation (positive + 5 negative cases), the stateless cookie
+  format, `Path=/` coverage, and cluster-safety across two independent
+  picoweb processes sharing `--picosts-cookie-key`.
 - `hardened.sh` / `sanitize.sh` — build-and-test loops with paranoid
   compiler flags and ASan/UBSan.
 

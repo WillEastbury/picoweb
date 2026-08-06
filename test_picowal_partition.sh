@@ -7,6 +7,14 @@
 #   - every node computes the SAME owner independently (no coordination)
 #   - a record written via any node in the pool is retrievable from the
 #     owner directly
+#   - metadata packs (name/schema/permissions -- packs 1/2/3) are replicated
+#     to every node in the pool on PUT/DELETE, unlike per-record data (which
+#     is sharded by ownership), so metadata mutated through any one node
+#     reads back identically from every other node
+#   - GET /wal/list/{pack} fans out to every node and merges + de-duplicates
+#     records, the same way /wal/query already does
+#   - metadata mutations (permissions pack specifically) are rejected
+#     without credentials, on every node in the pool
 
 set -u
 cd "$(dirname "$0")"
@@ -69,17 +77,40 @@ curl -sS --max-time 5 -o /dev/null -X PUT -H "$H" --data-binary '{"name":"items"
 curl -sS --max-time 5 -o /dev/null -X PUT -H "$H" \
      --data-binary '{"fields":"id,name,value","required":"id,name","types":"id=string;name=string;value=number"}' \
      "http://127.0.0.1:$PORT_A/wal/metadata/schema/10"
-# schema was only written on node A directly (no replication between these
-# 3 independent volumes -- partitioning here is orthogonal to whole-volume
-# replication); write metadata/name+schema on B and C too so validation
-# passes regardless of which node ends up owning a given record.
-for p in "$PORT_B" "$PORT_C"; do
-    curl -sS --max-time 5 -o /dev/null -X PUT -H "$H" --data-binary '{"name":"items"}' \
-         "http://127.0.0.1:$p/wal/metadata/name/10"
-    curl -sS --max-time 5 -o /dev/null -X PUT -H "$H" \
-         --data-binary '{"fields":"id,name,value","required":"id,name","types":"id=string;name=string;value=number"}' \
-         "http://127.0.0.1:$p/wal/metadata/schema/10"
-done
+curl -sS --max-time 5 -o /dev/null -X PUT -H "$H" \
+     --data-binary '{"roles":["admin","viewer"],"permissions":[{"role":"viewer","pack":10,"actions":["read"]}],"rowPolicies":[]}' \
+     "http://127.0.0.1:$PORT_A/wal/metadata/permissions/10"
+
+echo
+echo "== metadata replication: name/schema/permissions written through node A are readable on B and C =="
+# Metadata packs (name/schema/permissions) are replicated to every node in
+# the tenant's partition pool on PUT/DELETE (unlike per-record data, which
+# is sharded by ownership) -- so a mutation applied through any single node
+# must be visible on every other node without writing it there again.
+name_b=$(curl -sS --max-time 5 -H "$H" "http://127.0.0.1:$PORT_B/wal/metadata/name/10")
+check "node B sees name written via node A" "$(echo "$name_b" | grep -c '"items"')" "1"
+schema_c=$(curl -sS --max-time 5 -H "$H" "http://127.0.0.1:$PORT_C/wal/metadata/schema/10")
+check "node C sees schema written via node A" "$(echo "$schema_c" | grep -c '"fields":"id,name,value"')" "1"
+perm_b=$(curl -sS --max-time 5 -H "$H" "http://127.0.0.1:$PORT_B/wal/metadata/permissions/10")
+check "node B sees permissions written via node A" "$(echo "$perm_b" | grep -c '"role":"viewer"')" "1"
+meta_c=$(curl -sS --max-time 5 -H "$H" "http://127.0.0.1:$PORT_C/wal/metadata/10")
+check "node C combined metadata wrapper includes pack3/permissions" \
+      "$(echo "$meta_c" | grep -c '"pack3":' )=$(echo "$meta_c" | grep -c '"permissions":')" "1=1"
+
+echo
+echo "== unauthenticated metadata mutations are rejected (permissions pack always requires credentials) =="
+noauth_code=$(curl -sS --max-time 5 -o /dev/null -w '%{http_code}' -X PUT \
+              --data-binary '{"roles":[]}' "http://127.0.0.1:$PORT_A/wal/metadata/permissions/11")
+check "PUT permissions without credentials -> 401" "$noauth_code" "401"
+noauth_del=$(curl -sS --max-time 5 -o /dev/null -w '%{http_code}' -X DELETE \
+             "http://127.0.0.1:$PORT_B/wal/metadata/permissions/10")
+check "DELETE permissions without credentials -> 401" "$noauth_del" "401"
+# Confirm the (unauthenticated, thus rejected) delete attempt above did NOT
+# remove the record -- a rejected mutation must not partially apply either
+# locally or via replication.
+still_there=$(curl -sS --max-time 5 -o /dev/null -w '%{http_code}' -H "$H" \
+              "http://127.0.0.1:$PORT_C/wal/metadata/permissions/10")
+check "permissions record untouched by rejected delete" "$still_there" "200"
 
 echo
 echo "== ownership agreement: same record must resolve to the same owner from every node =="
@@ -148,6 +179,27 @@ else
           "${counts[0]}=${counts[0]}=${counts[0]}"
     check "query gateway merged count covers all $rec written records" \
           "$([ "${counts[0]:-0}" -ge "$rec" ] && echo yes || echo no)" "yes"
+
+    echo
+    echo "== list gateway: GET /wal/list/10 fans out and merges records from every node =="
+    # Same records i1..i$rec are spread across all 3 nodes' independent
+    # volumes (ownership routing sent each PUT to whichever node owns that
+    # id) -- GET /wal/list/{pack} through ANY single node must merge them
+    # all, de-duplicated by record id, not just return its own local shard.
+    list_counts=()
+    list_bodies=()
+    for p in "$PORT_A" "$PORT_B" "$PORT_C"; do
+        out=$(curl -sS --max-time 5 -H "$H" "http://127.0.0.1:$p/wal/list/10")
+        c=$(echo "$out" | grep -o '"count":[0-9]*' | head -1 | cut -d: -f2)
+        list_counts+=("$c")
+        list_bodies+=("$out")
+    done
+    check "node A/B/C list counts agree" "${list_counts[0]}=${list_counts[1]}=${list_counts[2]}" \
+          "${list_counts[0]}=${list_counts[0]}=${list_counts[0]}"
+    check "list gateway merged count covers all $rec written records" \
+          "$([ "${list_counts[0]:-0}" -ge "$rec" ] && echo yes || echo no)" "yes"
+    dup_check=$(echo "${list_bodies[0]}" | grep -o '"record":[0-9]*' | sort | uniq -d | wc -l)
+    check "list gateway de-duplicates records (no repeats)" "$dup_check" "0"
 fi
 
 echo
@@ -184,6 +236,15 @@ for p in "$PORT_A" "$PORT_B" "$PORT_C"; do
          --data-binary '{"fields":"id,name,value","required":"id,name","types":"id=string;name=string;value=number"}' \
          "http://127.0.0.1:$p/wal/metadata/schema/10"
 done
+
+echo
+echo "== metadata replication also works in proxy mode: one write, readable everywhere =="
+curl -sS --max-time 5 -o /dev/null -X PUT -H "$H" --data-binary '{"name":"widgets"}' \
+     "http://127.0.0.1:$PORT_B/wal/metadata/name/20"
+name_a=$(curl -sS --max-time 5 -H "$H" "http://127.0.0.1:$PORT_A/wal/metadata/name/20")
+check "node A sees name written via node B (proxy mode)" "$(echo "$name_a" | grep -c 'widgets')" "1"
+name_c=$(curl -sS --max-time 5 -H "$H" "http://127.0.0.1:$PORT_C/wal/metadata/name/20")
+check "node C sees name written via node B (proxy mode)" "$(echo "$name_c" | grep -c 'widgets')" "1"
 
 put_resp=$(curl -sS --max-time 5 -D - -o /tmp/part-proxy-body -X PUT -H "$H" \
            --data-binary "{\"id\":\"i$rec\",\"name\":\"proxied-$rec\",\"value\":$rec}" \

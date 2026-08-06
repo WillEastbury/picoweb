@@ -127,4 +127,29 @@ bool picowal_partition_fetch(const char* node_id,
                               const char* cookie, size_t cookie_len,
                               int* out_status, char** out_body, size_t* out_body_len);
 
+/* Replicates a metadata mutation (PUT with body, or DELETE with body=NULL/
+ * body_len=0) at `path` to every OTHER node in the tenant's configured
+ * partition pool (self is skipped -- the caller must already have applied
+ * it locally before calling this). Metadata packs (name/schema/permissions,
+ * i.e. picowal_db_pack_key packs 1/2/3) are expected to be readable
+ * identically from every node -- unlike per-record data packs, which are
+ * sharded by ownership -- so a mutation must fan out to the WHOLE pool
+ * rather than route to a single owner.
+ *
+ * Returns true iff every peer accepted the mutation (a DELETE that 404s on
+ * a peer -- already absent there -- still counts as converged, not a
+ * failure). On any real peer failure (unreachable, or an unexpected >=400
+ * response), returns false and fills *out_failed / *out_total so the caller
+ * can report a clear 502/partial error rather than silently claiming
+ * success. A no-op (returns true, *out_total=0) when partitioning isn't
+ * enabled, or when the tenant's pool has no peers besides self. */
+bool picowal_partition_replicate_metadata(const char* tenant, size_t tenant_len,
+                                          http_method_t method,
+                                          const char* path, size_t path_len,
+                                          const char* body, size_t body_len,
+                                          const char* write_token, size_t write_token_len,
+                                          const char* cookie, size_t cookie_len,
+                                          int* out_failed, int* out_total,
+                                          char* err, size_t err_cap);
+
 #endif

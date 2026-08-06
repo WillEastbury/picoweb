@@ -96,8 +96,12 @@ USERSPACE_LEGACY_XDP_SRC := \
 
 ALL_SRC := $(wildcard src/*.c) $(wildcard src/pico/*.c)
 # picocompress.c is superseded (see src/pico/); server_tls.c is the legacy
-# AF_XDP path, gated separately below.
-SRC := $(filter-out src/server_tls.c src/pico/picocompress.c,$(ALL_SRC)) $(USERSPACE_TLS_ENGINE_SRC)
+# AF_XDP path, gated separately below. src/pico/test_string_eq.c is a
+# standalone smoke-test with its own main() (see `make test-string-eq`) --
+# it must never be linked into the production binary alongside main.c's
+# main(), so it is filtered out of SRC here rather than relying on nobody
+# ever adding a second *.c file with a main() under src/pico/.
+SRC := $(filter-out src/server_tls.c src/pico/picocompress.c src/pico/test_string_eq.c,$(ALL_SRC)) $(USERSPACE_TLS_ENGINE_SRC)
 
 ifeq ($(WITH_URING),1)
 CFLAGS += -DPICOWEB_WITH_URING
@@ -143,6 +147,23 @@ run: $(BIN)
 # `make` on a new host to confirm what will/won't be compiled in).
 print-config:
 	@echo "NATIVE_ARCH=$(NATIVE_ARCH)  WITH_URING=$(WITH_URING)  WITH_LEGACY_XDP=$(WITH_LEGACY_XDP)"
+
+# Standalone smoke test for the String.Eq hook fix (src/pico/test_string_eq.c).
+# Kept out of the production SRC list (it has its own main()); build+run it
+# explicitly with `make test-string-eq`.
+test-string-eq:
+	$(CC) -O2 -std=c11 -D_GNU_SOURCE -o /tmp/picoweb_test_string_eq \
+		src/pico/test_string_eq.c src/pico/picovm.c
+	/tmp/picoweb_test_string_eq
+
+# Regenerate src/ide_assets.c (compiled-in IDE HTML + PicoScript
+# compiler/runtime JS + vendored BareMetal.Binary BSO1 codec) from the
+# sibling ../picoscript and ../baremetaljstools checkouts. Requires python3
+# and both repos checked out one directory up; normal `make` does NOT need
+# this -- src/ide_assets.c is committed so a clean build never depends on
+# ../picoscript or ../baremetaljstools being present.
+gen-ide-assets:
+	python3 tools/gen_ide_assets.py
 
 clean:
 	rm -f src/*.o src/*.d src/pico/*.o src/pico/*.d userspace/*.o userspace/*.d userspace/*/*.o userspace/*/*.d picoweb picoweb_uring

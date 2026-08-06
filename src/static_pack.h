@@ -27,6 +27,11 @@
 
 bool static_pack_enabled(void);
 
+/* Accessor for the configured --picowal-static-prefix, so other modules
+ * (ide.c's /ide/config) can report it without re-parsing CLI flags.
+ * Returns "" if static-pack isn't enabled. */
+const char* static_pack_prefix(void);
+
 /* Configure once on the main thread, after api_picowal_init() has opened
  * the volume. prefix must start and end with '/'. Returns false (leaves
  * the module disabled) on any validation failure. */
@@ -41,13 +46,24 @@ bool static_pack_path_matches(const char* path, size_t path_len);
  * bytecode, images, ...) not schema-validated JSON. PUT/DELETE always
  * require credentials (see api_require_pw_auth): the X-PW-Auth header +
  * session cookie when --oidc-cookie-auth is enabled, otherwise the
- * X-PW-Write-Token header matching --picowal-write-token. */
+ * X-PW-Write-Token header matching --picowal-write-token.
+ *
+ * Partition-aware for ALL of GET/HEAD/PUT/DELETE (tenant_id resolves the
+ * per-tenant writer set the same way /wal/ does): a node that doesn't own
+ * the requested record's virtual partition redirects or transparently
+ * proxies to the true owner (per --picowal-partition-mode), so static
+ * content is reachable through any node in the cluster, not just its
+ * owner. is_partition_hop marks an already-forwarded request (carries
+ * X-PW-Partition-Hop) so the receiving node serves it locally instead of
+ * forwarding again. */
 void static_pack_dispatch(http_method_t method,
                           const char* path, size_t path_len,
                           const char* body, size_t body_len,
                           const char* cookie, size_t cookie_len,
                           bool has_pw_auth_header,
                           const char* write_token, size_t write_token_len,
+                          const char* tenant_id, size_t tenant_id_len,
+                          bool is_partition_hop,
                           api_resp_t* resp);
 
 #endif

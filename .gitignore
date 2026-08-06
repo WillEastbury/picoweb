@@ -7,3 +7,8 @@ src/*.o
 *.log
 *.d
 /tmp/
+tools/tests/node_modules/
+tools/tests/.tmp/
+tools/tests/screenshots/
+tools/tests/test-results/
+tools/tests/playwright-report/

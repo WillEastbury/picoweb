@@ -4,6 +4,7 @@
 #include "api_blob.h"
 #include "static_pack.h"
 #include "pico_route.h"
+#include "ide.h"
 #include "picowal_repl.h"
 #include "picowal_repl_client.h"
 #include "picowal_gossip.h"
@@ -12,6 +13,8 @@
 #include "picowal_query.h"
 #include "picowal_validate.h"
 #include "security_headers.h"
+#include "../userspace/crypto/hmac.h"
+#include "../userspace/crypto/util.h"
 
 #include <ctype.h>
 #include <errno.h>
@@ -47,6 +50,15 @@ static size_t g_picowal_prefix_len = 0;
 #define AUTH_PROVIDER_CAP      16
 #define AUTH_SESSIONS_MAX      2048
 
+/* "v1."-tagged stateless HMAC-signed cookie value (PicoSTS sessions; see
+ * gen_stateless_cookie/parse_stateless_cookie below) is longer than the
+ * opaque random AUTH_COOKIE_VALUE_CAP hex ids used by google/entra's
+ * node-local session table, so cookie extraction needs a bigger buffer
+ * that fits either format. */
+#define AUTH_STATELESS_COOKIE_CAP 384
+#define STATELESS_COOKIE_TAG "v1."
+static bool parse_stateless_cookie(const char* value, char* out_sub, size_t out_sub_cap);
+
 typedef struct {
     bool used;
     int64_t exp_unix;
@@ -70,6 +82,7 @@ bool api_enabled(void)              { return g_enabled; }
 bool api_picowal_enabled(void)      { return g_picowal_enabled; }
 size_t api_max_request_body(void)   { return API_REQ_BODY_CAP; }
 picowal_db_t* api_picowal_db(void)  { return g_picowal; }
+const char* api_picowal_prefix(void) { return g_picowal_enabled ? g_picowal_prefix : ""; }
 
 static bool valid_prefix(const char* prefix, size_t cap, const char* label) {
     size_t pl = prefix ? strlen(prefix) : 0;
@@ -99,6 +112,7 @@ bool api_path_matches(const char* path, size_t path_len) {
     if (pico_route_path_matches(path, path_len)) return true;
     if (picowal_repl_path_matches(path, path_len)) return true;
     if (picowal_gossip_path_matches(path, path_len)) return true;
+    if (ide_path_matches(path, path_len)) return true;
     return false;
 }
 
@@ -223,12 +237,90 @@ bool api_oidc_init(bool cookie_auth_enabled, uint32_t cookie_ttl_sec,
         memcpy(g_oidc_entra_tenant, entra_tenant, n + 1);
     }
 
-    if (g_oidc_cookie_auth) {
-        if (!g_oidc_google_client_id[0] || !g_oidc_entra_client_id[0]) {
-            fprintf(stderr, "api: OIDC cookie auth requires both Google and Entra client ids\n");
-            return false;
-        }
+    /* Note: this function no longer hard-requires both Google and Entra to
+     * be configured together -- a deployment may run with just one of
+     * google/entra/picosts (see api_picosts_init below). main.c enforces
+     * that --oidc-cookie-auth has at least one provider configured across
+     * all three init calls, since api_picosts_init is a separate function. */
+    return true;
+}
+
+/* ----- PicoSTS provider (external OIDC authority, Authorization Code +
+ * PKCE from the browser) -----
+ *
+ * picoweb never talks to PicoSTS's /token endpoint itself (the SPA does the
+ * code+PKCE exchange directly in the browser); this module only validates
+ * the resulting access_token presented to POST {picowal-prefix}auth/login
+ * with {"provider":"picosts","access_token":"..."}:
+ *   1. GET {issuer}/userinfo with "Authorization: Bearer <token>" succeeds
+ *      and returns a "sub" claim.
+ *   2. The token itself is a JWT; its payload "iss" matches
+ *      --picosts-issuer, "aud" matches --picosts-audience, "exp"/"nbf" are
+ *      valid for the current time, and "sub" agrees with the userinfo sub.
+ * On success, picoweb issues a stateless HMAC-SHA256-signed pw_session
+ * cookie (see gen_stateless_cookie/parse_stateless_cookie below) instead of
+ * the node-local in-memory session table used by google/entra, so any node
+ * in the cluster sharing --picosts-cookie-key accepts the session --
+ * required for partition-routed /ide/, /site/, /app/ traffic to work
+ * regardless of which node a browser happens to land on. */
+static bool     g_picosts_enabled = false;
+static char     g_picosts_issuer[256] = {0};
+static char     g_picosts_client_id[128] = {0};
+static char     g_picosts_audience[128] = {0};
+static uint8_t  g_picosts_cookie_key[128] = {0};
+static size_t   g_picosts_cookie_key_len = 0;
+
+bool api_picosts_enabled(void)          { return g_picosts_enabled; }
+const char* api_picosts_issuer(void)    { return g_picosts_enabled ? g_picosts_issuer : ""; }
+const char* api_picosts_client_id(void) { return g_picosts_enabled ? g_picosts_client_id : ""; }
+const char* api_picosts_audience(void)  { return g_picosts_enabled ? g_picosts_audience : ""; }
+
+bool api_picosts_init(const char* issuer, const char* client_id,
+                      const char* audience, const char* cookie_key) {
+    g_picosts_enabled = false;
+    if (!issuer || !issuer[0]) {
+        fprintf(stderr, "api: --picosts-issuer requires a non-empty URL\n");
+        return false;
     }
+    if (!cookie_key || !cookie_key[0]) {
+        fprintf(stderr, "api: --picosts-issuer requires --picosts-cookie-key "
+                "(or PICOSTS_COOKIE_KEY) -- stateless session cookies must be signed\n");
+        return false;
+    }
+    size_t il = strlen(issuer);
+    if (il >= sizeof(g_picosts_issuer)) {
+        fprintf(stderr, "api: --picosts-issuer too long\n");
+        return false;
+    }
+    /* Trim a single trailing '/' so "{issuer}/userinfo" never double-slashes. */
+    while (il > 0 && issuer[il - 1] == '/') il--;
+    if (il == 0) {
+        fprintf(stderr, "api: --picosts-issuer requires a non-empty URL\n");
+        return false;
+    }
+    memcpy(g_picosts_issuer, issuer, il);
+    g_picosts_issuer[il] = '\0';
+
+    const char* cid = (client_id && client_id[0]) ? client_id : "spa";
+    const char* aud = (audience && audience[0]) ? audience : "api";
+    size_t cl = strlen(cid), al = strlen(aud);
+    if (cl >= sizeof(g_picosts_client_id) || al >= sizeof(g_picosts_audience)) {
+        fprintf(stderr, "api: --picosts-client-id/--picosts-audience too long\n");
+        return false;
+    }
+    memcpy(g_picosts_client_id, cid, cl + 1);
+    memcpy(g_picosts_audience, aud, al + 1);
+
+    size_t kl = strlen(cookie_key);
+    if (kl == 0 || kl >= sizeof(g_picosts_cookie_key)) {
+        fprintf(stderr, "api: --picosts-cookie-key must be 1..%zu bytes\n",
+                sizeof(g_picosts_cookie_key) - 1);
+        return false;
+    }
+    memcpy(g_picosts_cookie_key, cookie_key, kl);
+    g_picosts_cookie_key_len = kl;
+
+    g_picosts_enabled = true;
     return true;
 }
 
@@ -380,9 +472,12 @@ static bool cookie_extract(const char* cookie, size_t cookie_len,
 bool api_principal_from_cookie(const char* cookie, size_t cookie_len,
                                char* out_principal, size_t out_cap) {
     if (!out_principal || out_cap < 2) return false;
-    char sid[AUTH_COOKIE_VALUE_CAP + 1];
-    if (!cookie_extract(cookie, cookie_len, AUTH_COOKIE_NAME, sid, sizeof(sid))) return false;
-    return auth_session_sub_from_sid(sid, out_principal, out_cap);
+    char val[AUTH_STATELESS_COOKIE_CAP + 1];
+    if (!cookie_extract(cookie, cookie_len, AUTH_COOKIE_NAME, val, sizeof(val))) return false;
+    if (strncmp(val, STATELESS_COOKIE_TAG, sizeof(STATELESS_COOKIE_TAG) - 1) == 0) {
+        return parse_stateless_cookie(val, out_principal, out_cap);
+    }
+    return auth_session_sub_from_sid(val, out_principal, out_cap);
 }
 
 static bool json_extract_string_field(const char* json, const char* key,
@@ -473,6 +568,146 @@ static bool jwt_decode_payload_json(const char* jwt, char* out_json, size_t out_
     if (dec_len + 1 > out_cap) return false;
     memcpy(out_json, tmp, dec_len);
     out_json[dec_len] = '\0';
+    return true;
+}
+
+/* Extracts a bare (unquoted) JSON number field, e.g. "exp":1234567890 or
+ * "nbf":1234567890.5 (fractional part truncated). Used for JWT payload
+ * claims, which encode exp/nbf/iat as numbers, not strings. */
+static bool json_extract_int64_field(const char* json, const char* key, int64_t* out) {
+    if (!json || !key || !out) return false;
+    char needle[96];
+    int nn = snprintf(needle, sizeof(needle), "\"%s\"", key);
+    if (nn <= 0 || (size_t)nn >= sizeof(needle)) return false;
+
+    const char* p = json;
+    while ((p = strstr(p, needle)) != NULL) {
+        p += (size_t)nn;
+        while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+        if (*p != ':') { p++; continue; }
+        p++;
+        while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+        char* end = NULL;
+        long long v = strtoll(p, &end, 10);
+        if (end == p) { p++; continue; }
+        *out = (int64_t)v;
+        return true;
+    }
+    return false;
+}
+
+static const char b64url_chars[] =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+
+/* No padding ('='), URL-safe alphabet -- safe to embed directly in a
+ * Cookie header value (RFC 6265 cookie-octet excludes '=' only at the
+ * start, but we avoid it entirely for simplicity of the "v1." parser). */
+static bool b64url_encode(const uint8_t* in, size_t in_len, char* out, size_t out_cap) {
+    size_t need = ((in_len + 2) / 3) * 4 + 1;
+    if (out_cap < need) return false;
+    size_t o = 0;
+    size_t i = 0;
+    while (i + 3 <= in_len) {
+        uint32_t v = ((uint32_t)in[i] << 16) | ((uint32_t)in[i + 1] << 8) | in[i + 2];
+        out[o++] = b64url_chars[(v >> 18) & 0x3F];
+        out[o++] = b64url_chars[(v >> 12) & 0x3F];
+        out[o++] = b64url_chars[(v >> 6) & 0x3F];
+        out[o++] = b64url_chars[v & 0x3F];
+        i += 3;
+    }
+    size_t rem = in_len - i;
+    if (rem == 1) {
+        uint32_t v = (uint32_t)in[i] << 16;
+        out[o++] = b64url_chars[(v >> 18) & 0x3F];
+        out[o++] = b64url_chars[(v >> 12) & 0x3F];
+    } else if (rem == 2) {
+        uint32_t v = ((uint32_t)in[i] << 16) | ((uint32_t)in[i + 1] << 8);
+        out[o++] = b64url_chars[(v >> 18) & 0x3F];
+        out[o++] = b64url_chars[(v >> 12) & 0x3F];
+        out[o++] = b64url_chars[(v >> 6) & 0x3F];
+    }
+    out[o] = '\0';
+    return true;
+}
+
+static void hex_encode(const uint8_t* in, size_t in_len, char* out) {
+    static const char hex[] = "0123456789abcdef";
+    for (size_t i = 0; i < in_len; i++) {
+        out[i * 2] = hex[(in[i] >> 4) & 0xF];
+        out[i * 2 + 1] = hex[in[i] & 0xF];
+    }
+    out[in_len * 2] = '\0';
+}
+
+/* Stateless cluster-safe session cookie: "v1.<b64url(exp|sub)>.<hex hmac>".
+ * The HMAC covers the tag+payload ("v1." + b64url part) so every node
+ * sharing --picosts-cookie-key can verify/derive the subject without any
+ * node-local session table -- required for partition-routed requests that
+ * may land on any node in the cluster. */
+static bool gen_stateless_cookie(const char* sub, uint32_t ttl_sec,
+                                 char* out, size_t out_cap) {
+    if (!sub || !sub[0] || g_picosts_cookie_key_len == 0) return false;
+    int64_t exp = now_unix_sec() + (int64_t)ttl_sec;
+    char payload[AUTH_SUB_CAP + 32];
+    int pn = snprintf(payload, sizeof(payload), "%lld|%s", (long long)exp, sub);
+    if (pn <= 0 || (size_t)pn >= sizeof(payload)) return false;
+
+    char b64[sizeof(payload) * 4 / 3 + 8];
+    if (!b64url_encode((const uint8_t*)payload, (size_t)pn, b64, sizeof(b64))) return false;
+
+    char mac_input[sizeof(STATELESS_COOKIE_TAG) - 1 + sizeof(b64)];
+    int mn = snprintf(mac_input, sizeof(mac_input), STATELESS_COOKIE_TAG "%s", b64);
+    if (mn <= 0 || (size_t)mn >= sizeof(mac_input)) return false;
+
+    uint8_t tag[HMAC_SHA256_TAG_LEN];
+    hmac_sha256(g_picosts_cookie_key, g_picosts_cookie_key_len, mac_input, (size_t)mn, tag);
+    char mac_hex[HMAC_SHA256_TAG_LEN * 2 + 1];
+    hex_encode(tag, sizeof(tag), mac_hex);
+
+    int on = snprintf(out, out_cap, "%s.%s", mac_input, mac_hex);
+    return on > 0 && (size_t)on < out_cap;
+}
+
+/* Verifies a "v1." stateless cookie and, on success, writes its subject
+ * into out_sub. Rejects on bad MAC (constant-time compare) or expiry. */
+static bool parse_stateless_cookie(const char* value, char* out_sub, size_t out_sub_cap) {
+    size_t tag_len = sizeof(STATELESS_COOKIE_TAG) - 1;
+    if (g_picosts_cookie_key_len == 0) return false;
+    if (!value || strncmp(value, STATELESS_COOKIE_TAG, tag_len) != 0) return false;
+
+    const char* b64 = value + tag_len;
+    const char* last_dot = strrchr(b64, '.');
+    if (!last_dot) return false;
+    size_t b64_len = (size_t)(last_dot - b64);
+    const char* mac_hex = last_dot + 1;
+    size_t mac_hex_len = strlen(mac_hex);
+    if (mac_hex_len != HMAC_SHA256_TAG_LEN * 2 || b64_len == 0) return false;
+
+    size_t mac_input_len = tag_len + b64_len;
+    uint8_t tag[HMAC_SHA256_TAG_LEN];
+    hmac_sha256(g_picosts_cookie_key, g_picosts_cookie_key_len, value, mac_input_len, tag);
+    char expect_hex[HMAC_SHA256_TAG_LEN * 2 + 1];
+    hex_encode(tag, sizeof(tag), expect_hex);
+    if (!crypto_consttime_eq((const uint8_t*)expect_hex, (const uint8_t*)mac_hex, mac_hex_len)) {
+        return false;
+    }
+
+    uint8_t payload[256];
+    size_t payload_len = 0;
+    if (!b64url_decode(b64, b64_len, payload, sizeof(payload) - 1, &payload_len)) return false;
+    payload[payload_len] = '\0';
+
+    char* bar = memchr(payload, '|', payload_len);
+    if (!bar) return false;
+    *bar = '\0';
+    int64_t exp = strtoll((const char*)payload, NULL, 10);
+    if (exp <= now_unix_sec()) return false;
+
+    const char* sub = (const char*)bar + 1;
+    size_t sub_len = payload_len - (size_t)((const uint8_t*)sub - payload);
+    if (sub_len == 0 || sub_len + 1 > out_sub_cap) return false;
+    memcpy(out_sub, sub, sub_len);
+    out_sub[sub_len] = '\0';
     return true;
 }
 
@@ -620,6 +855,84 @@ static bool oidc_validate_entra(const char* access_token, char* out_sub, size_t 
     return true;
 }
 
+/* Validates an access token issued by an external PicoSTS authority (see
+ * developercli/sts/README.md): calls {issuer}/userinfo with the bearer
+ * token (must succeed and return "sub"), then independently decodes the
+ * JWT payload and checks iss/aud/exp/nbf/sub -- treating PicoSTS purely as
+ * an OIDC authority, never porting its issuing logic into picoweb. */
+static bool oidc_validate_picosts(const char* access_token, char* out_sub, size_t out_sub_cap,
+                                  char* err, size_t err_cap) {
+    if (!g_picosts_enabled) {
+        if (err && err_cap) snprintf(err, err_cap, "picosts not configured");
+        return false;
+    }
+    char authz[API_REQ_BODY_CAP + 64];
+    int an = snprintf(authz, sizeof(authz), "Authorization: Bearer %s", access_token);
+    if (an <= 0 || (size_t)an >= sizeof(authz)) {
+        if (err && err_cap) snprintf(err, err_cap, "token too large");
+        return false;
+    }
+    char url[320];
+    int un = snprintf(url, sizeof(url), "%s/userinfo", g_picosts_issuer);
+    if (un <= 0 || (size_t)un >= sizeof(url)) {
+        if (err && err_cap) snprintf(err, err_cap, "issuer url too long");
+        return false;
+    }
+    char* argv[] = { "curl", "-fsS", "--max-time", "5", "-H", authz, url, NULL };
+    char userinfo[4096];
+    if (!run_curl_capture(argv, userinfo, sizeof(userinfo), err, err_cap)) return false;
+
+    char userinfo_sub[AUTH_SUB_CAP + 1];
+    if (!json_extract_string_field(userinfo, "sub", userinfo_sub, sizeof(userinfo_sub))) {
+        if (err && err_cap) snprintf(err, err_cap, "picosts userinfo missing sub");
+        return false;
+    }
+
+    char jwt_payload[2048];
+    if (!jwt_decode_payload_json(access_token, jwt_payload, sizeof(jwt_payload))) {
+        if (err && err_cap) snprintf(err, err_cap, "picosts token is not JWT");
+        return false;
+    }
+
+    char iss[256] = {0};
+    char aud[256] = {0};
+    char jwt_sub[AUTH_SUB_CAP + 1] = {0};
+    int64_t exp = 0, nbf = 0;
+    (void)json_extract_string_field(jwt_payload, "iss", iss, sizeof(iss));
+    (void)json_extract_string_field(jwt_payload, "aud", aud, sizeof(aud));
+    (void)json_extract_string_field(jwt_payload, "sub", jwt_sub, sizeof(jwt_sub));
+    bool has_exp = json_extract_int64_field(jwt_payload, "exp", &exp);
+    bool has_nbf = json_extract_int64_field(jwt_payload, "nbf", &nbf);
+
+    if (!iss[0] || strcmp(iss, g_picosts_issuer) != 0) {
+        if (err && err_cap) snprintf(err, err_cap, "picosts issuer mismatch");
+        return false;
+    }
+    if (!aud[0] || strcmp(aud, g_picosts_audience) != 0) {
+        if (err && err_cap) snprintf(err, err_cap, "picosts audience mismatch");
+        return false;
+    }
+    int64_t now_sec = now_unix_sec();
+    if (!has_exp || exp <= now_sec) {
+        if (err && err_cap) snprintf(err, err_cap, "picosts token expired or missing exp");
+        return false;
+    }
+    if (has_nbf && nbf > now_sec) {
+        if (err && err_cap) snprintf(err, err_cap, "picosts token not yet valid (nbf)");
+        return false;
+    }
+    if (!jwt_sub[0] || strcmp(jwt_sub, userinfo_sub) != 0) {
+        if (err && err_cap) snprintf(err, err_cap, "picosts token/userinfo sub mismatch");
+        return false;
+    }
+    if (strlen(userinfo_sub) >= out_sub_cap) {
+        if (err && err_cap) snprintf(err, err_cap, "picosts sub too long");
+        return false;
+    }
+    memcpy(out_sub, userinfo_sub, strlen(userinfo_sub) + 1);
+    return true;
+}
+
 static bool parse_login_request(const char* body, size_t body_len,
                                 char* out_provider, size_t provider_cap,
                                 char* out_token, size_t token_cap) {
@@ -637,14 +950,18 @@ static bool parse_login_request(const char* body, size_t body_len,
 static void resp_cookie_status(api_resp_t* r, int status, const char* reason,
                                const char* cookie_value, uint32_t max_age) {
     r->status = status;
+    /* Path=/ (not the picowal prefix) so the cookie also covers /ide/,
+     * /site/, /app/ and any other route gated by api_require_pw_auth --
+     * a session established via /wal/auth/login must be usable everywhere
+     * a browser-authenticated request can land. */
     int n = snprintf(r->head, sizeof(r->head),
                      "HTTP/1.1 %d %s\r\n"
                      "Server: picoweb\r\n"
-                     "Set-Cookie: " AUTH_COOKIE_NAME "=%s; Max-Age=%u; Path=%s; HttpOnly; Secure; SameSite=Lax\r\n"
+                     "Set-Cookie: " AUTH_COOKIE_NAME "=%s; Max-Age=%u; Path=/; HttpOnly; Secure; SameSite=Lax\r\n"
                      "Content-Length: 0\r\n"
                      PICOWEB_SECURITY_HEADERS
                      "Cache-Control: no-store\r\n",
-                     status, reason, cookie_value ? cookie_value : "", max_age, g_picowal_prefix);
+                     status, reason, cookie_value ? cookie_value : "", max_age);
     if (n > 0 && (size_t)n < sizeof(r->head)) {
         r->head_len = (size_t)n;
     } else {
@@ -654,12 +971,19 @@ static void resp_cookie_status(api_resp_t* r, int status, const char* reason,
 }
 
 static bool auth_require_cookie(const char* cookie, size_t cookie_len, api_resp_t* resp) {
-    char sid[AUTH_COOKIE_VALUE_CAP + 1];
-    if (!cookie_extract(cookie, cookie_len, AUTH_COOKIE_NAME, sid, sizeof(sid))) {
+    char val[AUTH_STATELESS_COOKIE_CAP + 1];
+    if (!cookie_extract(cookie, cookie_len, AUTH_COOKIE_NAME, val, sizeof(val))) {
         resp_status_only(resp, 401, "Unauthorized");
         return false;
     }
-    if (!auth_is_valid_session(sid)) {
+    bool ok;
+    if (strncmp(val, STATELESS_COOKIE_TAG, sizeof(STATELESS_COOKIE_TAG) - 1) == 0) {
+        char sub[AUTH_SUB_CAP + 1];
+        ok = parse_stateless_cookie(val, sub, sizeof(sub));
+    } else {
+        ok = auth_is_valid_session(val);
+    }
+    if (!ok) {
         resp_status_only(resp, 401, "Unauthorized");
         return false;
     }
@@ -1176,6 +1500,7 @@ static bool split_shard_rows(const char* json, size_t len,
 static bool picowal_query_run_fanout(const char* tenant, size_t tenant_len,
                                      const char* query_text, size_t query_len,
                                      const char* write_token, size_t write_token_len,
+                                     const char* cookie, size_t cookie_len,
                                      char** out_json, size_t* out_len,
                                      char* err, size_t err_cap) {
     char nodes[PP_FANOUT_MAX_NODES][PICOWAL_PARTITION_NODE_ID_MAX];
@@ -1219,7 +1544,7 @@ static bool picowal_query_run_fanout(const char* tenant, size_t tenant_len,
             int status = 0;
             if (!picowal_partition_fetch(nodes[i], M_POST, qpath, (size_t)qn,
                                          query_text, query_len,
-                                         write_token, write_token_len, NULL, 0,
+                                         write_token, write_token_len, cookie, cookie_len,
                                          &status, &shard_json, &shard_len)) {
                 continue;
             }
@@ -1287,6 +1612,7 @@ static bool picowal_query_run_fanout(const char* tenant, size_t tenant_len,
 static bool picowal_build_report(const char* body, size_t body_len,
                                  const char* tenant_id, size_t tenant_id_len,
                                  const char* write_token, size_t write_token_len,
+                                 const char* cookie, size_t cookie_len,
                                  bool is_partition_hop,
                                  char** out_json, size_t* out_len,
                                  int* out_status, char* err, size_t err_cap) {
@@ -1321,6 +1647,7 @@ static bool picowal_build_report(const char* body, size_t body_len,
     if (!is_partition_hop && picowal_partition_enabled()) {
         qok = picowal_query_run_fanout(tenant_id, tenant_id_len, query_buf, strlen(query_buf),
                                        write_token, write_token_len,
+                                       cookie, cookie_len,
                                        &result_json, &result_len, qerr, sizeof(qerr));
     } else {
         qok = picowal_query_run(g_picowal, query_buf, &result_json, &result_len, qerr, sizeof(qerr));
@@ -1423,6 +1750,250 @@ static bool picowal_build_list_payload(uint32_t pack_id, char** out_json, size_t
     if (out_status) *out_status = 200;
     *out_json = out;
     *out_len = o;
+    return true;
+}
+
+/* ---------- partition list gateway (GET /wal/list/{pack} fan-out) ---------- */
+
+#define PP_LIST_FANOUT_MAX_NODES 64
+
+/* Extracts the leading decimal "record":N value from one list-record
+ * element (our own {"record":N,"data":{...}} shape). Returns UINT32_MAX if
+ * not found/parseable. */
+static uint32_t list_elem_record_id(const char* elem, size_t elem_len) {
+    static const char MARK[] = "\"record\":";
+    const char* p = (const char*)memmem(elem, elem_len, MARK, sizeof(MARK) - 1);
+    if (!p) return UINT32_MAX;
+    p += sizeof(MARK) - 1;
+    const char* end = elem + elem_len;
+    uint64_t v = 0;
+    bool any = false;
+    while (p < end && *p >= '0' && *p <= '9') {
+        v = v * 10u + (uint64_t)(*p - '0');
+        any = true;
+        p++;
+        if (v > PICOWAL_RECORD_MAX) break;
+    }
+    return (any && v <= PICOWAL_RECORD_MAX) ? (uint32_t)v : UINT32_MAX;
+}
+
+typedef void (*list_elem_cb_t)(const char* elem, size_t elem_len, uint32_t record, void* user);
+
+/* Splits the raw content of a JSON array (no enclosing '[' ']') into its
+ * top-level comma-separated elements and invokes cb() once per element.
+ * Every element here is one of our own {"record":N,"data":{...}} objects
+ * (not arbitrary/untrusted JSON), but "data" is user-supplied and may
+ * itself contain braces/commas inside string values, so this tracks
+ * string-literal state (honoring '\\' escapes) while brace-counting,
+ * rather than naively splitting on top-level commas/braces. */
+static void for_each_json_array_element(const char* arr, size_t arr_len, list_elem_cb_t cb, void* user) {
+    size_t i = 0;
+    while (i < arr_len) {
+        while (i < arr_len && (arr[i] == ',' || isspace((unsigned char)arr[i]))) i++;
+        if (i >= arr_len || arr[i] != '{') break;
+        size_t start = i;
+        int depth = 0;
+        bool in_str = false;
+        for (; i < arr_len; i++) {
+            char c = arr[i];
+            if (in_str) {
+                if (c == '\\' && i + 1 < arr_len) { i++; continue; }
+                if (c == '"') in_str = false;
+                continue;
+            }
+            if (c == '"') { in_str = true; continue; }
+            if (c == '{') depth++;
+            else if (c == '}') {
+                depth--;
+                if (depth == 0) { i++; break; }
+            }
+        }
+        size_t elen = i - start;
+        if (elen == 0) break;
+        cb(arr + start, elen, list_elem_record_id(arr + start, elen), user);
+    }
+}
+
+/* Splits one shard's /wal/list/{pack} payload ({"pack":P,"records":[...],
+ * "count":N}) into the raw "records" array body. Mirrors split_shard_rows's
+ * approach for /wal/query shards: this is our own same-binary wire format
+ * between cluster nodes (not arbitrary/untrusted JSON), so a cheap
+ * marker-based split is fine instead of a full JSON parser. The closing
+ * "],\"count\":" marker is matched by its LAST occurrence in the buffer, so
+ * a record's "data" payload containing that literal substring (extremely
+ * unlikely, but not otherwise impossible) can't be misparsed as the array
+ * terminator. */
+static bool split_shard_list(const char* json, size_t len,
+                             const char** arr_start, size_t* arr_len) {
+    static const char MARK[] = "\"records\":[";
+    static const char TAIL[] = "],\"count\":";
+    size_t mark_len = sizeof(MARK) - 1;
+    size_t tail_len = sizeof(TAIL) - 1;
+    const char* m = (const char*)memmem(json, len, MARK, mark_len);
+    if (!m) return false;
+    const char* body_start = m + mark_len;
+
+    const char* found = NULL;
+    for (size_t i = (size_t)(body_start - json); i + tail_len <= len; i++) {
+        if (memcmp(json + i, TAIL, tail_len) == 0) found = json + i;
+    }
+    if (!found || found < body_start) return false;
+
+    *arr_start = body_start;
+    *arr_len = (size_t)(found - body_start);
+    return true;
+}
+
+typedef struct {
+    char* buf;
+    size_t len;
+    size_t cap;
+    size_t emitted;
+    uint8_t* seen_bits; /* dedup bitset over record ids [0, PICOWAL_RECORD_MAX] */
+    bool oom;
+} list_merge_ctx_t;
+
+static void list_merge_cb(const char* elem, size_t elem_len, uint32_t record, void* userp) {
+    list_merge_ctx_t* ctx = (list_merge_ctx_t*)userp;
+    if (ctx->oom) return;
+    if (record != UINT32_MAX) {
+        size_t byte = record / 8;
+        uint8_t bit = (uint8_t)(1u << (record % 8));
+        if (ctx->seen_bits[byte] & bit) return; /* defensive de-dup across shards */
+        ctx->seen_bits[byte] |= bit;
+    }
+    size_t need = ctx->len + elem_len + 2;
+    if (need > ctx->cap) {
+        size_t new_cap = ctx->cap ? ctx->cap * 2 : 4096;
+        while (new_cap < need) new_cap *= 2;
+        char* grown = (char*)realloc(ctx->buf, new_cap);
+        if (!grown) { ctx->oom = true; return; }
+        ctx->buf = grown;
+        ctx->cap = new_cap;
+    }
+    if (ctx->emitted > 0) ctx->buf[ctx->len++] = ',';
+    memcpy(ctx->buf + ctx->len, elem, elem_len);
+    ctx->len += elem_len;
+    ctx->emitted++;
+}
+
+/* Fans GET /wal/list/{pack} out to every node in the tenant's configured
+ * partition pool and merges the per-shard record arrays into one, since
+ * ownership is per-record: a full-pack listing has no single owner and
+ * must visit every node that might hold a shard of it (same rationale as
+ * picowal_query_run_fanout). The local shard is served in-process; every
+ * other node is visited over a fresh HTTP/1.1 round trip. Merged records
+ * are de-duplicated defensively by record id (a node briefly considered
+ * "owner" during a partition-pool membership change could otherwise cause
+ * the same record to be double-counted). A shard that errors or is
+ * unreachable is skipped (not fatal) and reflected in "partial"/
+ * "shards_ok"/"shards_total"; the call only fails if every shard failed. */
+static bool picowal_build_list_payload_fanout(const char* tenant, size_t tenant_len,
+                                              uint32_t pack_id,
+                                              const char* write_token, size_t write_token_len,
+                                              const char* cookie, size_t cookie_len,
+                                              char** out_json, size_t* out_len,
+                                              int* out_status, char* err, size_t err_cap) {
+    if (!out_json || !out_len) return false;
+    *out_json = NULL;
+    *out_len = 0;
+    if (out_status) *out_status = 500;
+
+    char nodes[PP_LIST_FANOUT_MAX_NODES][PICOWAL_PARTITION_NODE_ID_MAX];
+    int n_nodes = picowal_partition_all_nodes(tenant, tenant_len, nodes, PP_LIST_FANOUT_MAX_NODES);
+    if (n_nodes <= 0) {
+        snprintf(err, err_cap, "partition routing enabled but no nodes configured");
+        return false;
+    }
+
+    char lpath[PICOWAL_PARTITION_NODE_ID_MAX + 32];
+    int ln = snprintf(lpath, sizeof(lpath), "%slist/%u", g_picowal_prefix, pack_id);
+    if (ln <= 0 || (size_t)ln >= sizeof(lpath)) {
+        snprintf(err, err_cap, "list path too long");
+        return false;
+    }
+
+    list_merge_ctx_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.seen_bits = (uint8_t*)calloc((PICOWAL_RECORD_MAX / 8) + 1, 1);
+    if (!ctx.seen_bits) {
+        snprintf(err, err_cap, "oom");
+        return false;
+    }
+
+    int shards_ok = 0;
+    for (int i = 0; i < n_nodes && !ctx.oom; i++) {
+        char* shard_json = NULL;
+        size_t shard_len = 0;
+        bool owned = false;
+
+        if (picowal_partition_owner_is_self(nodes[i])) {
+            int lstatus = 500;
+            char lerr[128] = {0};
+            if (!picowal_build_list_payload(pack_id, &shard_json, &shard_len, &lstatus, lerr, sizeof(lerr))) continue;
+            owned = true;
+        } else {
+            int status = 0;
+            if (!picowal_partition_fetch(nodes[i], M_GET, lpath, (size_t)ln, NULL, 0,
+                                         write_token, write_token_len, cookie, cookie_len,
+                                         &status, &shard_json, &shard_len)) {
+                continue;
+            }
+            if (status != 200) { free(shard_json); continue; }
+            owned = true;
+        }
+
+        const char* arr = NULL;
+        size_t arr_len = 0;
+        if (!split_shard_list(shard_json, shard_len, &arr, &arr_len)) {
+            if (owned) free(shard_json);
+            continue;
+        }
+        for_each_json_array_element(arr, arr_len, list_merge_cb, &ctx);
+        if (owned) free(shard_json);
+        shards_ok++;
+    }
+
+    if (ctx.oom) {
+        free(ctx.buf);
+        free(ctx.seen_bits);
+        snprintf(err, err_cap, "oom");
+        return false;
+    }
+    free(ctx.seen_bits);
+
+    if (shards_ok == 0) {
+        free(ctx.buf);
+        snprintf(err, err_cap, "all partition shards failed or unreachable");
+        return false;
+    }
+
+    size_t out_cap = ctx.len + 160;
+    char* out = (char*)malloc(out_cap);
+    if (!out) {
+        free(ctx.buf);
+        snprintf(err, err_cap, "oom");
+        return false;
+    }
+    int n;
+    if (shards_ok == n_nodes) {
+        n = snprintf(out, out_cap, "{\"pack\":%u,\"records\":[%.*s],\"count\":%zu}",
+                    pack_id, (int)ctx.len, ctx.buf ? ctx.buf : "", ctx.emitted);
+    } else {
+        n = snprintf(out, out_cap, "{\"pack\":%u,\"records\":[%.*s],\"count\":%zu,"
+                    "\"partial\":true,\"shards_ok\":%d,\"shards_total\":%d}",
+                    pack_id, (int)ctx.len, ctx.buf ? ctx.buf : "", ctx.emitted,
+                    shards_ok, n_nodes);
+    }
+    free(ctx.buf);
+    if (n <= 0 || (size_t)n >= out_cap) {
+        free(out);
+        snprintf(err, err_cap, "merge render failed");
+        return false;
+    }
+    if (out_status) *out_status = 200;
+    *out_json = out;
+    *out_len = (size_t)n;
     return true;
 }
 
@@ -1932,10 +2503,49 @@ static int delete_file(const char* coll, size_t coll_len,
     return 0;
 }
 
+/* Fans a just-applied local metadata mutation out to every other node in
+ * the tenant's partition pool (see picowal_partition_replicate_metadata)
+ * and folds the result into *resp: on full success resp is left untouched
+ * (caller's 204/201 stands); on partial/total replication failure resp is
+ * overwritten with a 502 carrying replicated/total counts, since a
+ * metadata pack (name/schema/permissions) is expected to be identical on
+ * every node and silently reporting success would let nodes drift apart
+ * without any client ever finding out. */
+static void replicate_metadata_or_502(http_method_t method,
+                                      const char* path, size_t path_len,
+                                      const char* body, size_t body_len,
+                                      const char* tenant_id, size_t tenant_id_len,
+                                      const char* write_token, size_t write_token_len,
+                                      const char* cookie, size_t cookie_len,
+                                      bool is_partition_hop,
+                                      api_resp_t* resp) {
+    if (is_partition_hop || !picowal_partition_enabled()) return;
+    int failed = 0, total = 0;
+    char rerr[160] = {0};
+    if (picowal_partition_replicate_metadata(tenant_id, tenant_id_len, method,
+                                             path, path_len, body, body_len,
+                                             write_token, write_token_len,
+                                             cookie, cookie_len,
+                                             &failed, &total, rerr, sizeof(rerr))) {
+        return;
+    }
+    char msg[256];
+    snprintf(msg, sizeof(msg),
+            "metadata applied locally but replication incomplete: %s\n",
+            rerr[0] ? rerr : "peer replication failed");
+    resp_text_error(resp, 502, "Bad Gateway", msg);
+}
+
 static void dispatch_picowal_pack_record(http_method_t method, uint16_t meta_pack,
+                                         const char* path, size_t path_len,
                                          const char* rec, size_t rec_len,
                                          const char* body, size_t body_len,
                                          const char* location_coll,
+                                         const char* tenant_id, size_t tenant_id_len,
+                                         bool has_pw_auth_header,
+                                         const char* write_token, size_t write_token_len,
+                                         const char* cookie, size_t cookie_len,
+                                         bool is_partition_hop,
                                          api_resp_t* resp) {
     uint32_t pack_id = 0;
     if (!parse_u32_dec(rec, rec_len, PICOWAL_CARD_MAX, &pack_id)) {
@@ -1962,6 +2572,23 @@ static void dispatch_picowal_pack_record(http_method_t method, uint16_t meta_pac
             return;
         }
         resp_get_body(resp, buf, (size_t)got, method == M_HEAD);
+        return;
+    }
+
+    /* The permissions pack (3 -- RBAC/RLS design metadata) is new surface
+     * added for the IDE's Permissions panel and is more sensitive than
+     * name/schema (it encodes intended role/action/row-policy design), so
+     * it always requires credentials via api_require_pw_auth(), the same
+     * "always authenticated, independent of --oidc-cookie-auth" convention
+     * static_pack/pico_route/ide's raw card writes already use. name (1)
+     * and schema (2) deliberately keep their long-standing behavior --
+     * open when no auth mechanism is configured at all, gated by cookie
+     * auth like any other /wal/ route otherwise -- so existing deployments
+     * relying on that (see test_picowal.sh) are unaffected. */
+    if (meta_pack == 3 &&
+        (method == M_PUT || method == M_POST || method == M_DELETE) &&
+        !api_require_pw_auth(cookie, cookie_len, has_pw_auth_header,
+                             write_token, write_token_len, resp)) {
         return;
     }
 
@@ -1993,6 +2620,9 @@ static void dispatch_picowal_pack_record(http_method_t method, uint16_t meta_pac
         } else {
             resp_status_only(resp, 204, "No Content");
         }
+        replicate_metadata_or_502(method, path, path_len, body, body_len,
+                                  tenant_id, tenant_id_len, write_token, write_token_len,
+                                  cookie, cookie_len, is_partition_hop, resp);
         return;
     }
 
@@ -2007,6 +2637,9 @@ static void dispatch_picowal_pack_record(http_method_t method, uint16_t meta_pac
             return;
         }
         resp_status_only(resp, 204, "No Content");
+        replicate_metadata_or_502(method, path, path_len, NULL, 0,
+                                  tenant_id, tenant_id_len, write_token, write_token_len,
+                                  cookie, cookie_len, is_partition_hop, resp);
         return;
     }
 
@@ -2045,16 +2678,31 @@ static void dispatch_picowal(http_method_t method,
         char sub[AUTH_SUB_CAP + 1];
         char err[256] = {0};
         bool ok = false;
+        bool is_picosts = (strcmp(provider, "picosts") == 0);
         if (strcmp(provider, "google") == 0) {
             ok = oidc_validate_google(token, sub, sizeof(sub), err, sizeof(err));
         } else if (strcmp(provider, "entra") == 0) {
             ok = oidc_validate_entra(token, sub, sizeof(sub), err, sizeof(err));
+        } else if (is_picosts) {
+            ok = oidc_validate_picosts(token, sub, sizeof(sub), err, sizeof(err));
         } else {
-            resp_text_error(resp, 400, "Bad Request", "provider must be google or entra\n");
+            resp_text_error(resp, 400, "Bad Request", "provider must be google, entra or picosts\n");
             return;
         }
         if (!ok) {
             resp_text_error(resp, 401, "Unauthorized", err[0] ? err : "token validation failed\n");
+            return;
+        }
+        if (is_picosts) {
+            /* Stateless cookie: no node-local session table entry, so any
+             * node sharing --picosts-cookie-key accepts it -- required for
+             * partition-routed /ide/, /site/, /app/ traffic. */
+            char cookie_val[AUTH_STATELESS_COOKIE_CAP + 1];
+            if (!gen_stateless_cookie(sub, g_oidc_cookie_ttl_sec, cookie_val, sizeof(cookie_val))) {
+                resp_text_error(resp, 500, "Internal Server Error", "session create failed\n");
+                return;
+            }
+            resp_cookie_status(resp, 204, "No Content", cookie_val, g_oidc_cookie_ttl_sec);
             return;
         }
         char sid[AUTH_COOKIE_VALUE_CAP + 1];
@@ -2080,11 +2728,51 @@ static void dispatch_picowal(http_method_t method,
             resp_text_error(resp, 403, "Forbidden", "missing X-PW-Auth header\n");
             return;
         }
-        char sid[AUTH_COOKIE_VALUE_CAP + 1];
-        if (cookie_extract(cookie, cookie_len, AUTH_COOKIE_NAME, sid, sizeof(sid))) {
-            auth_revoke_session(sid);
+        /* Stateless (picosts) cookies have no server-side session to
+         * revoke -- clearing the cookie client-side (Max-Age=0 below) is
+         * the only "logout" a stateless token supports; table-backed
+         * (google/entra) sessions are additionally revoked server-side. */
+        char val[AUTH_STATELESS_COOKIE_CAP + 1];
+        if (cookie_extract(cookie, cookie_len, AUTH_COOKIE_NAME, val, sizeof(val)) &&
+            strncmp(val, STATELESS_COOKIE_TAG, sizeof(STATELESS_COOKIE_TAG) - 1) != 0) {
+            auth_revoke_session(val);
         }
         resp_cookie_status(resp, 204, "No Content", "", 0);
+        return;
+    }
+
+    if (path_len == g_picowal_prefix_len + 7 &&
+        memcmp(path + g_picowal_prefix_len, "auth/me", 7) == 0) {
+        if (!g_oidc_cookie_auth) {
+            resp_status_only(resp, 404, "Not Found");
+            return;
+        }
+        if (method != M_GET && method != M_HEAD) {
+            resp_status_only(resp, 405, "Method Not Allowed");
+            return;
+        }
+        char principal[AUTH_SUB_CAP + 1];
+        if (!api_principal_from_cookie(cookie, cookie_len, principal, sizeof(principal))) {
+            resp_status_only(resp, 401, "Unauthorized");
+            return;
+        }
+        char esc[AUTH_SUB_CAP * 2 + 1];
+        if (!json_escape_copy(principal, esc, sizeof(esc))) {
+            resp_text_error(resp, 500, "Internal Server Error", "encode failed\n");
+            return;
+        }
+        char* out = (char*)malloc(sizeof(esc) + 32);
+        if (!out) {
+            resp_text_error(resp, 500, "Internal Server Error", "oom\n");
+            return;
+        }
+        int n = snprintf(out, sizeof(esc) + 32, "{\"principal\":\"%s\"}", esc);
+        if (n <= 0) {
+            free(out);
+            resp_text_error(resp, 500, "Internal Server Error", "encode failed\n");
+            return;
+        }
+        resp_get_body(resp, out, (size_t)n, method == M_HEAD);
         return;
     }
 
@@ -2102,13 +2790,32 @@ static void dispatch_picowal(http_method_t method,
         size_t mn = path_len - (g_picowal_prefix_len + 9);
 
         if (mn > 5 && memcmp(mp, "name/", 5) == 0) {
-            dispatch_picowal_pack_record(method, 1, mp + 5, mn - 5,
-                                         body, body_len, "metadata/name", resp);
+            dispatch_picowal_pack_record(method, 1, path, path_len, mp + 5, mn - 5,
+                                         body, body_len, "metadata/name",
+                                         tenant_id, tenant_id_len, has_pw_auth_header,
+                                         write_token, write_token_len,
+                                         cookie, cookie_len, is_partition_hop, resp);
             return;
         }
         if (mn > 7 && memcmp(mp, "schema/", 7) == 0) {
-            dispatch_picowal_pack_record(method, 2, mp + 7, mn - 7,
-                                         body, body_len, "metadata/schema", resp);
+            dispatch_picowal_pack_record(method, 2, path, path_len, mp + 7, mn - 7,
+                                         body, body_len, "metadata/schema",
+                                         tenant_id, tenant_id_len, has_pw_auth_header,
+                                         write_token, write_token_len,
+                                         cookie, cookie_len, is_partition_hop, resp);
+            return;
+        }
+        if (mn > 12 && memcmp(mp, "permissions/", 12) == 0) {
+            /* Pack 3 -- persists the picoscript RBAC/RLS design model
+             * {roles, permissions:[{role,pack,actions}], rowPolicies:[...]}
+             * as an actual picowal metadata card. This is design/deployment
+             * metadata surfaced to operators via the IDE; it is NOT yet an
+             * enforced server authorization boundary (see README). */
+            dispatch_picowal_pack_record(method, 3, path, path_len, mp + 12, mn - 12,
+                                         body, body_len, "metadata/permissions",
+                                         tenant_id, tenant_id_len, has_pw_auth_header,
+                                         write_token, write_token_len,
+                                         cookie, cookie_len, is_partition_hop, resp);
             return;
         }
         if (memchr(mp, '/', mn) != NULL) {
@@ -2126,32 +2833,38 @@ static void dispatch_picowal(http_method_t method,
             resp_text_error(resp, 400, "Bad Request", "invalid metadata pack id\n");
             return;
         }
-        uint32_t k1 = 0, k2 = 0;
+        uint32_t k1 = 0, k2 = 0, k3 = 0;
         (void)picowal_db_pack_key(1, pack_id, &k1);
         (void)picowal_db_pack_key(2, pack_id, &k2);
+        (void)picowal_db_pack_key(3, pack_id, &k3);
 
         char p1[PICOWAL_DATA_MAX + 1];
         char p2[PICOWAL_DATA_MAX + 1];
+        char p3[PICOWAL_DATA_MAX + 1];
         int n1 = picowal_db_get_key(g_picowal, k1, p1, PICOWAL_DATA_MAX);
         int n2 = picowal_db_get_key(g_picowal, k2, p2, PICOWAL_DATA_MAX);
-        if (n1 < 0 && n2 < 0) {
+        int n3 = picowal_db_get_key(g_picowal, k3, p3, PICOWAL_DATA_MAX);
+        if (n1 < 0 && n2 < 0 && n3 < 0) {
             resp_status_only(resp, 404, "Not Found");
             return;
         }
         if (n1 > 0) p1[n1] = '\0';
         if (n2 > 0) p2[n2] = '\0';
+        if (n3 > 0) p3[n3] = '\0';
 
-        size_t cap = (size_t)(PICOWAL_DATA_MAX * 2 + 256);
+        size_t cap = (size_t)(PICOWAL_DATA_MAX * 3 + 256);
         char* out = (char*)malloc(cap);
         if (!out) {
             resp_text_error(resp, 500, "Internal Server Error", "oom\n");
             return;
         }
         int n = snprintf(out, cap,
-                         "{\"pack\":%u,\"pack1\":%s,\"pack2\":%s}",
+                         "{\"pack\":%u,\"pack1\":%s,\"pack2\":%s,\"pack3\":%s,\"permissions\":%s}",
                          pack_id,
                          (n1 >= 0) ? p1 : "null",
-                         (n2 >= 0) ? p2 : "null");
+                         (n2 >= 0) ? p2 : "null",
+                         (n3 >= 0) ? p3 : "null",
+                         (n3 >= 0) ? p3 : "null");
         if (n <= 0 || (size_t)n >= cap) {
             free(out);
             resp_text_error(resp, 500, "Internal Server Error", "metadata render failed\n");
@@ -2218,7 +2931,16 @@ static void dispatch_picowal(http_method_t method,
         size_t out_len = 0;
         int status = 500;
         char err[128] = {0};
-        if (!picowal_build_list_payload(pack_id, &out, &out_len, &status, err, sizeof(err))) {
+        bool ok;
+        if (!is_partition_hop && picowal_partition_enabled()) {
+            ok = picowal_build_list_payload_fanout(tenant_id, tenant_id_len, pack_id,
+                                                   write_token, write_token_len,
+                                                   cookie, cookie_len,
+                                                   &out, &out_len, &status, err, sizeof(err));
+        } else {
+            ok = picowal_build_list_payload(pack_id, &out, &out_len, &status, err, sizeof(err));
+        }
+        if (!ok) {
             if (!err[0]) snprintf(err, sizeof(err), "list generation failed");
             if (status == 400) resp_text_error(resp, 400, "Bad Request", err);
             else resp_text_error(resp, 500, "Internal Server Error", err);
@@ -2239,7 +2961,8 @@ static void dispatch_picowal(http_method_t method,
         int status = 500;
         char err[128] = {0};
         if (!picowal_build_report(body, body_len, tenant_id, tenant_id_len,
-                                  write_token, write_token_len, is_partition_hop,
+                                  write_token, write_token_len, cookie, cookie_len,
+                                  is_partition_hop,
                                   &out, &out_len, &status, err, sizeof(err))) {
             if (!err[0]) snprintf(err, sizeof(err), "report generation failed");
             if (status == 400) resp_text_error(resp, 400, "Bad Request", err);
@@ -2288,10 +3011,13 @@ static void dispatch_picowal(http_method_t method,
 
     if (path_len > g_picowal_prefix_len + 7 &&
         memcmp(path + g_picowal_prefix_len, "schema/", 7) == 0) {
-        dispatch_picowal_pack_record(method, 2,
+        dispatch_picowal_pack_record(method, 2, path, path_len,
                                      path + g_picowal_prefix_len + 7,
                                      path_len - (g_picowal_prefix_len + 7),
-                                     body, body_len, "schema", resp);
+                                     body, body_len, "schema",
+                                     tenant_id, tenant_id_len, has_pw_auth_header,
+                                     write_token, write_token_len,
+                                     cookie, cookie_len, is_partition_hop, resp);
         return;
     }
 
@@ -2320,6 +3046,7 @@ static void dispatch_picowal(http_method_t method,
         if (!is_partition_hop && picowal_partition_enabled()) {
             ok = picowal_query_run_fanout(tenant_id, tenant_id_len, qtxt, body_len,
                                           write_token, write_token_len,
+                                          cookie, cookie_len,
                                           &out_json, &out_len, err, sizeof(err));
         } else {
             ok = picowal_query_run(g_picowal, qtxt, &out_json, &out_len, err, sizeof(err));
@@ -2433,6 +3160,10 @@ static void dispatch_picowal(http_method_t method,
             return;
         }
         if (picowal_db_put_key(g_picowal, key, body, (uint32_t)body_len, false) != 0) {
+            if (errno == EROFS) {
+                resp_text_error(resp, 503, "Service Unavailable", "writes must go to the current primary\n");
+                return;
+            }
             if (errno == ENOSPC) {
                 resp_text_error(resp, 507, "Insufficient Storage", "wal volume full\n");
                 return;
@@ -2486,6 +3217,10 @@ static void dispatch_picowal(http_method_t method,
                     resp_text_error(resp, 507, "Insufficient Storage", "wal volume full\n");
                     return;
                 }
+                if (errno == EROFS) {
+                    resp_text_error(resp, 503, "Service Unavailable", "writes must go to the current primary\n");
+                    return;
+                }
                 if (errno != EEXIST) {
                     resp_text_error(resp, 500, "Internal Server Error", "wal write failed\n");
                     return;
@@ -2514,6 +3249,10 @@ static void dispatch_picowal(http_method_t method,
         }
         if (picowal_db_put_key(g_picowal, key, body, (uint32_t)body_len, true) != 0) {
             if (errno == EEXIST) { resp_status_only(resp, 409, "Conflict"); return; }
+            if (errno == EROFS) {
+                resp_text_error(resp, 503, "Service Unavailable", "writes must go to the current primary\n");
+                return;
+            }
             if (errno == ENOSPC) {
                 resp_text_error(resp, 507, "Insufficient Storage", "wal volume full\n");
                 return;
@@ -2549,6 +3288,10 @@ static void dispatch_picowal(http_method_t method,
         }
         if (picowal_db_delete_key(g_picowal, key) != 0) {
             if (errno == ENOENT) { resp_status_only(resp, 404, "Not Found"); return; }
+            if (errno == EROFS) {
+                resp_text_error(resp, 503, "Service Unavailable", "writes must go to the current primary\n");
+                return;
+            }
             if (errno == ENOSPC) {
                 resp_text_error(resp, 507, "Insufficient Storage", "wal volume full\n");
                 return;
@@ -2579,6 +3322,8 @@ void api_dispatch(http_method_t method,
                   const api_request_context_t* req_ctx,
                   api_resp_t* resp) {
     memset(resp, 0, sizeof(*resp));
+    const char* tenant_id = req_ctx ? req_ctx->tenant_id : NULL;
+    size_t tenant_id_len = tenant_id ? strlen(tenant_id) : 0;
     if (api_blob_path_matches(path, path_len)) {
         api_blob_dispatch(method, path, path_len, body, body_len, resp);
         return;
@@ -2586,7 +3331,8 @@ void api_dispatch(http_method_t method,
     if (static_pack_path_matches(path, path_len)) {
         static_pack_dispatch(method, path, path_len, body, body_len,
                              cookie, cookie_len, has_pw_auth_header,
-                             write_token, write_token_len, resp);
+                             write_token, write_token_len,
+                             tenant_id, tenant_id_len, is_partition_hop, resp);
         return;
     }
     if (pico_route_path_matches(path, path_len)) {
@@ -2602,6 +3348,13 @@ void api_dispatch(http_method_t method,
     if (picowal_gossip_path_matches(path, path_len)) {
         picowal_gossip_dispatch(method, path, path_len, body, body_len,
                                 write_token, write_token_len, resp);
+        return;
+    }
+    if (ide_path_matches(path, path_len)) {
+        ide_dispatch(method, path, path_len, body, body_len,
+                    cookie, cookie_len, has_pw_auth_header,
+                    write_token, write_token_len,
+                    tenant_id, tenant_id_len, is_partition_hop, resp);
         return;
     }
     if (method == M_OPTIONS) {
@@ -2620,8 +3373,6 @@ void api_dispatch(http_method_t method,
     if (g_picowal_enabled &&
         path_len >= g_picowal_prefix_len &&
         memcmp(path, g_picowal_prefix, g_picowal_prefix_len) == 0) {
-        const char* tenant_id = req_ctx ? req_ctx->tenant_id : NULL;
-        size_t tenant_id_len = tenant_id ? strlen(tenant_id) : 0;
         dispatch_picowal(method, path, path_len, body, body_len,
                          cookie, cookie_len, has_pw_auth_header,
                          write_token, write_token_len,

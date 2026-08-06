@@ -1,0 +1,12 @@
+{
+  "name": "picoweb-ide-playwright-tests",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Browser-level acceptance tests for the hosted PicoScript WebIDE + PicoWAL workspace (/ide/). Not part of the picoweb build -- run manually or in CI with Node/Playwright installed.",
+  "scripts": {
+    "test": "playwright test"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.47.0"
+  }
+}

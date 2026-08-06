@@ -63,4 +63,12 @@ void* uring_worker_main(void* arg);
 void* dpdk_worker_main(void* arg);
 void* tls_worker_main(void* arg);
 
+/* IPv4 bind address (network byte order) for listen sockets. Defaults
+ * to INADDR_ANY; PICOWEB_LISTEN_ADDR=<dotted-quad> pins every listener
+ * to a single address so multiple picoweb instances can share one port
+ * on distinct per-node addresses of the same host (used by clustered
+ * picoweb under picocluster, where each node binds its own address).
+ * Aborts via metal_die() on a malformed value. */
+uint32_t pw_listen_addr_be(void);
+
 #endif

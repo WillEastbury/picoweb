@@ -630,7 +630,7 @@ void* uring_worker_main(void* arg) {
 
     struct sockaddr_in sa = { .sin_family = AF_INET,
                               .sin_port = htons((uint16_t)cfg->port),
-                              .sin_addr = { htonl(INADDR_ANY) } };
+                              .sin_addr = { pw_listen_addr_be() } };
     if (bind(lfd, (struct sockaddr*)&sa, sizeof(sa)) < 0)
         metal_die("bind :%d: %s", cfg->port, strerror(errno));
     if (listen(lfd, 4096) < 0)

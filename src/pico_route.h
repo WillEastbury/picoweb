@@ -34,6 +34,11 @@
 
 bool pico_route_enabled(void);
 
+/* Accessor for the configured --picowal-code-prefix, so other modules
+ * (ide.c's /ide/config) can report it without re-parsing CLI flags.
+ * Returns "" if pico_route isn't enabled. */
+const char* pico_route_prefix(void);
+
 /* Configure once on the main thread, after api_picowal_init() has opened
  * the volume. prefix must start and end with '/'. router_card holds the
  * bytecode program at record 0. Returns false on validation failure. */

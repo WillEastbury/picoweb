@@ -140,6 +140,14 @@ struct picowal_db {
     bool read_only;
     bool bg_started;
     volatile bool dirty_unsynced;
+
+    /* Mandatory control-plane write fence (clustered picoweb). When set,
+     * every mutation entry point must obtain authorization from fence_fn
+     * before appending, or it fails closed (EPERM). NULL => unfenced
+     * (standalone / replica). Set once at startup, before writes. */
+    bool (*fence_fn)(void* ctx);
+    void* fence_ctx;
+
     volatile uint64_t schema_gen; /* bumped on every write to pack 1 (name
                                       registry) or pack 2 (schema store) so
                                       picowal_query.c's parsed-query cache
@@ -955,6 +963,29 @@ void picowal_db_set_read_only(picowal_db_t* db, bool read_only) {
     pthread_mutex_unlock(&db->mu);
 }
 
+void picowal_db_set_fence(picowal_db_t* db, bool (*fence_fn)(void*), void* ctx) {
+    if (!db) return;
+    /* Set once at startup before any writer runs; no lock needed and the
+     * hot path reads it without the db lock to avoid holding it across a
+     * fence round-trip. */
+    db->fence_fn = fence_fn;
+    db->fence_ctx = ctx;
+}
+
+/* Authorize a mutation via the control-plane fence, if configured.
+ * Returns 0 when the write may proceed, -1 (errno=EROFS) when it must be
+ * refused (fail closed). EROFS is deliberate: every picowal HTTP write
+ * site already maps it to 503 "writes must go to the primary" (the
+ * read-replica path), so a fenced non-primary is refused consistently
+ * without touching those handlers. Called WITHOUT db->mu held. */
+static int fence_gate(picowal_db_t* db) {
+    if (db->fence_fn && !db->fence_fn(db->fence_ctx)) {
+        errno = EROFS;
+        return -1;
+    }
+    return 0;
+}
+
 const char* picowal_db_path(picowal_db_t* db) { return db ? db->dir_path : NULL; }
 
 uint64_t picowal_db_segment_bytes(picowal_db_t* db) {
@@ -969,6 +1000,7 @@ uint64_t picowal_db_segment_bytes(picowal_db_t* db) {
 
 picowal_txn_t* picowal_db_txn_begin(picowal_db_t* db) {
     if (!db) { errno = EINVAL; return NULL; }
+    if (fence_gate(db) != 0) return NULL;   /* EROFS: not the fenced primary */
     pthread_mutex_lock(&db->mu);
     if (db->read_only) { pthread_mutex_unlock(&db->mu); errno = EROFS; return NULL; }
     picowal_txn_t* txn = (picowal_txn_t*)calloc(1, sizeof(*txn));
@@ -1089,6 +1121,7 @@ int picowal_db_put_key_dur(picowal_db_t* db, uint32_t key, const void* data, uin
                           bool create_only, picowal_durability_t durability, bool* out_replicated) {
     if (out_replicated) *out_replicated = false;
     if (!db || !data || len == 0 || len > PICOWAL_DATA_MAX) { errno = EINVAL; return -1; }
+    if (fence_gate(db) != 0) return -1;   /* EROFS: not the fenced primary */
     pthread_mutex_lock(&db->mu);
     if (db->read_only) { pthread_mutex_unlock(&db->mu); errno = EROFS; return -1; }
     if (create_only) {
@@ -1123,6 +1156,7 @@ int picowal_db_delete_key_dur(picowal_db_t* db, uint32_t key,
                              picowal_durability_t durability, bool* out_replicated) {
     if (out_replicated) *out_replicated = false;
     if (!db) { errno = EINVAL; return -1; }
+    if (fence_gate(db) != 0) return -1;   /* EROFS: not the fenced primary */
     pthread_mutex_lock(&db->mu);
     if (db->read_only) { pthread_mutex_unlock(&db->mu); errno = EROFS; return -1; }
     picowal_index_entry_t* e = index_find(db, key);

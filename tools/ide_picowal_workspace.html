@@ -1,0 +1,1836 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PicoWAL &mdash; picoweb</title>
+<style>
+  :root {
+    --bg:#1a1a2e; --panel:#16213e; --panel-border:#0f3460; --accent:#e94560; --accent-dark:#c73652;
+    --text:#e0e0e0; --muted:#8f95b2; --ok:#4caf50; --err:#ff6b6b; --warn:#ffd166;
+  }
+  * { box-sizing:border-box; }
+  html,body { height:100%; margin:0; }
+  body {
+    background:var(--bg); color:var(--text);
+    font:13px/1.4 -apple-system, "Segoe UI", Roboto, sans-serif;
+    display:flex; flex-direction:column; height:100vh; overflow:hidden;
+  }
+  button { font:inherit; cursor:pointer; }
+  input, select, textarea { font:inherit; }
+  h1,h2,h3,h4,h5,h6 { margin:0 0 8px 0; }
+  .pw-topbar {
+    display:flex; align-items:center; gap:12px; padding:8px 16px;
+    background:var(--panel-border); border-bottom:1px solid #1a1a4e; flex-shrink:0;
+  }
+  .pw-brand { font-weight:700; letter-spacing:.06em; color:var(--accent); font-size:15px; }
+  .pw-brand .pw-sub { color:var(--muted); font-weight:400; font-size:11px; margin-left:8px; letter-spacing:0; }
+  .pw-authbox { margin-left:auto; display:flex; align-items:center; gap:8px; font-size:12px; color:var(--muted); }
+  .pw-btn { background:#22315a; color:var(--text); border:1px solid var(--panel-border); border-radius:5px; padding:5px 12px; font-size:12px; }
+  .pw-btn:hover { background:#2c3d6e; }
+  .pw-btn.pw-accent { background:var(--accent); border-color:var(--accent); color:#fff; }
+  .pw-btn.pw-accent:hover { background:var(--accent-dark); }
+  .pw-btn:disabled { opacity:.5; cursor:not-allowed; }
+  .pw-body { display:flex; flex:1; min-height:0; }
+  .pw-sidebar { width:260px; flex-shrink:0; overflow-y:auto; padding:12px; border-right:1px solid var(--panel-border); }
+  .pw-main { flex:1; overflow-y:auto; padding:16px 20px; }
+  .pw-card-panel { background:var(--panel); border:1px solid var(--panel-border); border-radius:8px; padding:12px; margin-bottom:12px; }
+  .pw-card-panel h6 { font-size:11px; text-transform:uppercase; letter-spacing:.06em; color:var(--muted); margin-bottom:8px; }
+  .pw-navbtn {
+    display:block; width:100%; text-align:left; background:transparent; border:none; color:var(--text);
+    padding:7px 10px; border-radius:5px; font-size:12.5px; margin-bottom:2px;
+  }
+  .pw-navbtn:hover { background:#1c2b52; }
+  .pw-navbtn.active { background:var(--accent); color:#fff; }
+  .pw-tab { display:none; }
+  .pw-tab.active { display:block; }
+  .row { display:flex; gap:6px; align-items:center; margin-bottom:8px; flex-wrap:wrap; }
+  .small { font-size:11.5px; color:var(--muted); }
+  .err { color:var(--err); }
+  .ok { color:var(--ok); }
+  .warn { color:var(--warn); background:#332b12; border:1px solid #4d3f1a; border-radius:6px; padding:8px 10px; margin-bottom:10px; }
+  select, input[type=text], input[type=number], input[type=password], textarea {
+    background:#0f1a35; color:var(--text); border:1px solid var(--panel-border); border-radius:5px; padding:5px 8px;
+  }
+  input:focus, select:focus, textarea:focus { outline:none; border-color:var(--accent); box-shadow:0 0 0 2px rgba(233,69,96,.25); }
+  button:not(.pw-btn):not(.pw-navbtn) {
+    background:#22315a; color:var(--text); border:1px solid var(--panel-border); border-radius:5px; padding:5px 10px; font-size:12px;
+  }
+  button:not(.pw-btn):not(.pw-navbtn):hover { background:#2c3d6e; }
+  table.wal-table { width:100%; border-collapse:collapse; margin-bottom:10px; }
+  table.wal-table td, table.wal-table th { border:1px solid var(--panel-border); padding:5px 7px; font-size:11.5px; word-break:break-all; }
+  table.wal-table th { color:var(--muted); text-align:left; background:#101a34; }
+  table.wal-table tr.pw-module-row th { background:#1c2b52; color:#fff; letter-spacing:.04em; }
+  .chip { display:inline-flex; align-items:center; gap:4px; padding:2px 9px; border-radius:12px; background:#22315a; margin:2px; font-size:11.5px; }
+  .chip button { background:none; border:none; color:var(--err); cursor:pointer; padding:0; font-size:12px; }
+  .pw-form-grid { display:grid; grid-template-columns:150px 1fr; gap:7px 10px; align-items:center; margin-bottom:10px; }
+  .pw-form-grid label { font-size:11.5px; color:var(--muted); text-align:right; }
+  .pw-form-grid input, .pw-form-grid select, .pw-form-grid textarea { width:100%; }
+  .pw-form-grid textarea { height:52px; font:11.5px monospace; }
+  .pw-dirty { outline:2px solid var(--warn) !important; }
+  .pw-readonly { opacity:.55; }
+  .pw-raw { display:none; width:100%; height:170px; font:11.5px monospace; margin-top:8px; }
+  .pw-child-block { border:1px solid var(--panel-border); border-radius:6px; padding:8px; margin-top:10px; background:#101a34; }
+  .pw-child-block h3 { font-size:11.5px; margin:0 0 8px 0; color:var(--muted); }
+  .pw-pager { display:flex; align-items:center; gap:8px; margin:8px 0; }
+  .pw-hexpreview { font:11px monospace; white-space:pre-wrap; word-break:break-all; max-height:150px; overflow:auto; background:#0f1a35; border:1px solid var(--panel-border); padding:8px; border-radius:5px; }
+  .pw-empty { text-align:center; padding:36px 16px; color:var(--muted); }
+  .pw-empty h5 { color:var(--text); font-weight:600; margin-bottom:6px; }
+  .pw-status-bar { font-size:11px; color:var(--muted); padding:4px 16px; border-top:1px solid var(--panel-border); flex-shrink:0; }
+  body.pwx-embedded .pw-topbar { display:none; }
+  body.pwx-embedded .pw-status-bar { padding-left:10px; }
+  body.pwx-embedded .pw-sidebar { width:225px; }
+  body.pwx-embedded .pw-main { padding:12px 14px; }
+  ::-webkit-scrollbar { width:9px; height:9px; }
+  ::-webkit-scrollbar-thumb { background:var(--panel-border); border-radius:5px; }
+</style>
+</head>
+<body>
+<header class="pw-topbar">
+  <div class="pw-brand">&#128451; PicoWAL<span class="pw-sub">real /wal/ storage workspace</span></div>
+  <div class="pw-authbox">
+    <span id="pwx-principal">not signed in</span>
+    <button class="pw-btn" id="pwx-btn-login">Login</button>
+    <button class="pw-btn" id="pwx-btn-logout" style="display:none">Logout</button>
+  </div>
+</header>
+<div class="pw-body">
+  <nav class="pw-sidebar">
+    <div class="pw-card-panel">
+      <h6>Workspace</h6>
+      <button class="pw-navbtn active" data-tab="packs">Packs &amp; Schemas</button>
+      <button class="pw-navbtn" data-tab="cards">Cards</button>
+      <button class="pw-navbtn" data-tab="permissions">Permissions</button>
+      <button class="pw-navbtn" data-tab="query">Query</button>
+      <button class="pw-navbtn" data-tab="fastserial">Fast Serial (BSO1)</button>
+    </div>
+    <div class="pw-card-panel">
+      <h6>Known packs <span class="small" style="float:right">(metadata pack 1)</span></h6>
+      <div class="row"><button onclick="pwPacksRefreshKnown()">Refresh</button></div>
+      <table class="wal-table"><thead><tr><th>pack</th><th>name</th><th></th></tr></thead><tbody id="pw-known-packs"></tbody></table>
+      <div class="small" id="pw-known-packs-empty">No packs loaded yet &mdash; click Refresh.</div>
+    </div>
+  </nav>
+  <main class="pw-main">
+
+    <section id="pw-tab-packs" class="pw-tab active">
+      <div class="pw-card-panel">
+        <h2>Pack &amp; name</h2>
+        <div class="row">
+          <label class="small">pack id (0-1023)</label><input type="number" id="pw-pack-id" min="0" max="1023" value="0" style="width:90px">
+          <button onclick="pwPackLoad()">Load</button>
+        </div>
+        <div class="row">
+          <label class="small">name</label><input type="text" id="pw-pack-name" style="flex:1">
+          <button onclick="pwPackSaveName()">Save name</button>
+          <button onclick="pwPackDeleteName()">Delete name</button>
+        </div>
+        <div id="pw-pack-msg" class="small"></div>
+      </div>
+      <div class="pw-card-panel">
+        <h2>Pack metadata (module / visibility / relationships)</h2>
+        <div class="row">
+          <label class="small">module</label><input type="text" id="pw-schema-module" placeholder="e.g. sales" style="width:160px">
+          <label class="small"><input type="checkbox" id="pw-schema-public-read"> public-read (design flag only, not enforced)</label>
+        </div>
+        <div class="row">
+          <label class="small">children (CSV pack ids)</label><input type="text" id="pw-schema-children" placeholder="13,14" style="width:160px">
+          <label class="small">list columns (CSV)</label><input type="text" id="pw-schema-list-columns" placeholder="name,status" style="flex:1">
+        </div>
+        <div class="small">"children" tells the Cards tab which packs to render as master-child grids under this pack's records
+          (the child pack's own schema <code>joins</code> must point back here). "module" groups packs in the known-packs list.</div>
+      </div>
+      <div class="pw-card-panel">
+        <h2>Schema field builder</h2>
+        <table class="wal-table" id="pw-schema-fields-table">
+          <thead><tr><th>ord</th><th>field</th><th>type</th><th>max len</th><th>req</th><th>null</th><th>r/o</th><th>lookup</th><th>label</th><th></th></tr></thead>
+          <tbody></tbody>
+        </table>
+        <div class="row">
+          <input type="number" id="pw-field-ordinal" placeholder="ord" style="width:55px">
+          <input type="text" id="pw-field-name" placeholder="field name" style="width:130px">
+          <select id="pw-field-type" onchange="pwFieldTypeChanged()">
+            <option>string</option><option>bool</option><option>uint8</option><option>uint16</option>
+            <option>uint32</option><option>int8</option><option>int16</option><option>int32</option>
+            <option>number</option><option>decimal</option><option>ascii</option><option>utf8</option>
+            <option>date</option><option>time</option><option>datetime</option><option>array_u16</option>
+            <option>blob</option><option>lookup</option><option>object</option><option>array</option>
+          </select>
+          <input type="number" id="pw-field-maxlen" placeholder="max len" style="width:75px" min="0">
+        </div>
+        <div class="row">
+          <label class="small"><input type="checkbox" id="pw-field-required"> required</label>
+          <label class="small"><input type="checkbox" id="pw-field-nullable"> nullable</label>
+          <label class="small"><input type="checkbox" id="pw-field-readonly"> read-only</label>
+          <span id="pw-field-lookup-row" style="display:none">
+            <label class="small">lookup pack</label><input type="number" id="pw-field-lookup-pack" min="0" max="1023" style="width:75px">
+            <label class="small">display field</label><input type="text" id="pw-field-lookup-label" placeholder="name" style="width:105px">
+          </span>
+          <label class="small">label</label><input type="text" id="pw-field-label" placeholder="pretty label" style="width:115px">
+          <label class="small">placeholder</label><input type="text" id="pw-field-placeholder" placeholder="hint text" style="width:115px">
+          <button onclick="pwSchemaAddField()">+ field</button>
+        </div>
+        <div class="row">
+          <button class="pw-accent" onclick="pwSchemaSave()">Save schema</button>
+          <button onclick="pwSchemaDelete()">Delete schema</button>
+          <button onclick="pwSchemaToggleRaw()">Raw JSON</button>
+        </div>
+        <textarea id="pw-schema-raw" class="pw-raw" spellcheck="false"></textarea>
+        <div class="row" id="pw-schema-raw-actions" style="display:none">
+          <button onclick="pwSchemaApplyRaw()">Apply raw JSON to field builder</button>
+          <span class="small">server-native shape: fields/required/nullable/readonly/children are CSV; types/max_lengths/lookup_labels/field_labels/field_placeholders
+            are "field=value;..." assignments; joins is "targetPack=fkField,..." (see picowal_validate.c). Unknown keys round-trip untouched.</span>
+        </div>
+        <div id="pw-schema-msg" class="small"></div>
+      </div>
+    </section>
+
+    <section id="pw-tab-cards" class="pw-tab">
+      <div class="pw-card-panel">
+        <h2>List / search / MGET</h2>
+        <div class="row">
+          <label class="small">pack</label><input type="number" id="pw-card-list-pack" min="0" max="1023" value="0" style="width:90px">
+          <button onclick="pwCardsList()">List</button>
+          <input type="text" id="pw-card-list-search" placeholder="client-side search..." style="flex:1" oninput="pwCardsListRender()">
+        </div>
+        <table class="wal-table"><thead><tr><th>record</th><th>preview</th><th></th></tr></thead><tbody id="pw-cards-list"></tbody></table>
+        <div class="pw-pager">
+          <button onclick="pwCardsListPage(-1)">&laquo; prev</button>
+          <span class="small" id="pw-cards-list-page"></span>
+          <button onclick="pwCardsListPage(1)">next &raquo;</button>
+        </div>
+        <div id="pw-cards-list-msg" class="small"></div>
+      </div>
+      <div class="pw-card-panel">
+        <h2>MGET (comma-separated record ids)</h2>
+        <div class="row">
+          <input type="text" id="pw-mget-ids" placeholder="101,102,150" style="flex:1">
+          <button onclick="pwCardsMget()">Fetch concurrently</button>
+        </div>
+        <table class="wal-table"><thead><tr><th>record</th><th>result</th><th></th></tr></thead><tbody id="pw-mget-results"></tbody></table>
+      </div>
+      <div class="pw-card-panel">
+        <h2>Card editor <span class="small">(real /wal/{pack}/{record} &mdash; schema-validated)</span></h2>
+        <div class="row">
+          <label class="small">pack</label><input type="number" id="pw-card-pack" min="0" max="1023" value="0" style="width:90px">
+          <label class="small">record</label><input type="number" id="pw-card-record" min="0" style="width:100px">
+          <button onclick="pwCardGet()">GET</button>
+          <button class="pw-accent" onclick="pwCardPut()">PUT</button>
+          <button onclick="pwCardDelete()">DELETE</button>
+          <button onclick="pwCardCreate()">Create (auto id)</button>
+          <button onclick="pwCardToggleVisual()" id="pw-card-mode-btn">Raw JSON</button>
+        </div>
+        <div class="row small">
+          version=<span id="pw-card-version">?</span>
+          dirty fields: <span id="pw-card-dirty">(none)</span>
+        </div>
+        <div class="pw-empty" id="pw-card-empty">
+          <h5>No card loaded</h5>
+          <p class="small">Enter a pack/record above and click GET, or pick one from the list, to start editing.</p>
+        </div>
+        <div id="pw-card-visual" class="pw-form-grid" style="display:none"></div>
+        <textarea id="pw-card-json" class="pw-raw" style="display:block" spellcheck="false">{}</textarea>
+        <div id="pw-card-msg" class="small"></div>
+        <div id="pw-card-children"></div>
+      </div>
+    </section>
+
+    <section id="pw-tab-permissions" class="pw-tab">
+      <div class="pw-card-panel">
+        <h2>Permissions <span class="small">(RBAC/RLS design metadata &mdash; metadata pack 3)</span></h2>
+        <div class="warn">This is design/deployment metadata only: picoweb does not yet enforce these
+          roles, permissions or row policies as a server-side authorization boundary. Treat it as documentation
+          of intended access control, not an actual security control.</div>
+        <div class="row">
+          <label class="small">pack id</label><input type="number" id="pw-perm-pack" min="0" max="1023" value="0" style="width:90px">
+          <button onclick="pwPermLoad()">Load</button>
+          <button class="pw-accent" onclick="pwPermSave()">Save</button>
+          <button onclick="pwPermDelete()">Delete</button>
+          <button onclick="pwPermToggleRaw()">Raw JSON</button>
+        </div>
+        <div class="row">
+          <label class="small">roles</label>
+          <span id="pw-perm-roles"></span>
+          <input type="text" id="pw-perm-role-new" placeholder="new role" style="width:125px">
+          <button onclick="pwPermAddRole()">+ role</button>
+        </div>
+        <h2 style="margin-top:12px">Permissions (role, pack, actions)</h2>
+        <table class="wal-table"><thead><tr><th>role</th><th>pack</th><th>actions</th><th></th></tr></thead><tbody id="pw-perm-table"></tbody></table>
+        <div class="row">
+          <select id="pw-perm-new-role"></select>
+          <input type="number" id="pw-perm-new-pack" min="0" max="1023" style="width:80px" placeholder="pack">
+          <label class="small"><input type="checkbox" class="pw-perm-action" value="read">read</label>
+          <label class="small"><input type="checkbox" class="pw-perm-action" value="create">create</label>
+          <label class="small"><input type="checkbox" class="pw-perm-action" value="update">update</label>
+          <label class="small"><input type="checkbox" class="pw-perm-action" value="delete">delete</label>
+          <label class="small"><input type="checkbox" class="pw-perm-action" value="query">query</label>
+          <button onclick="pwPermAddPermission()">+ permission</button>
+        </div>
+        <h2 style="margin-top:12px">Row policies (role, pack, predicate)</h2>
+        <table class="wal-table"><thead><tr><th>role</th><th>pack</th><th>predicate</th><th></th></tr></thead><tbody id="pw-rowpolicy-table"></tbody></table>
+        <div class="row">
+          <select id="pw-rp-new-role"></select>
+          <input type="number" id="pw-rp-new-pack" min="0" max="1023" style="width:80px" placeholder="pack">
+          <input type="text" id="pw-rp-new-predicate" placeholder="predicate (query WHERE syntax)" style="flex:1">
+          <button onclick="pwRowPolicyAdd()">+ row policy</button>
+        </div>
+        <textarea id="pw-perm-raw" class="pw-raw" spellcheck="false"></textarea>
+        <div class="row" id="pw-perm-raw-actions" style="display:none">
+          <button onclick="pwPermApplyRaw()">Apply raw JSON</button>
+        </div>
+        <h2 style="margin-top:12px">Principal &rarr; role assignments <span class="small">(documentation only)</span></h2>
+        <div class="warn">Maps a PicoSTS subject (principal) to one or more of the roles above, stored as
+          <code>assignments:[{principal,roles:[...]}]</code> in this same permissions card. picoweb does not read this
+          to authorize anything &mdash; it exists purely so operators can document/track which PicoSTS subjects are
+          intended to hold which roles.</div>
+        <table class="wal-table"><thead><tr><th>principal</th><th>roles</th><th></th></tr></thead><tbody id="pw-assign-table"></tbody></table>
+        <div class="row">
+          <input type="text" id="pw-assign-principal" placeholder="user@example.com or sub claim" style="width:230px">
+          <span id="pw-assign-roles"></span>
+          <button onclick="pwAssignAdd()">+ assignment</button>
+        </div>
+        <div id="pw-perm-msg" class="small"></div>
+      </div>
+    </section>
+
+    <section id="pw-tab-query" class="pw-tab">
+      <div class="pw-card-panel">
+        <h2>Visual query builder <span class="small">(S/F/W, up to 4 FROM packs, joins via pack.field)</span></h2>
+        <div class="row">
+          <label class="small">FROM packs (CSV, first is primary)</label>
+          <input type="text" id="pw-qb-from" placeholder="12,13" style="width:170px">
+          <button onclick="pwQbSyncFields()">Load fields from schema</button>
+        </div>
+        <div class="row">
+          <label class="small">SELECT fields</label>
+          <span id="pw-qb-select" style="flex:1"></span>
+        </div>
+        <table class="wal-table"><thead><tr><th>field</th><th>op</th><th>value</th><th></th></tr></thead><tbody id="pw-qb-where"></tbody></table>
+        <div class="row">
+          <input type="text" id="pw-qb-where-field" placeholder="field or pack.field" style="width:155px">
+          <select id="pw-qb-where-op">
+            <option value="==">==</option><option value="!=">!=</option><option value=">">&gt;</option>
+            <option value="<">&lt;</option><option value=">=">&gt;=</option><option value="<=">&lt;=</option>
+            <option value="IN">IN</option><option value="NI">NI</option>
+          </select>
+          <input type="text" id="pw-qb-where-value" placeholder="value" style="width:155px">
+          <button onclick="pwQbAddWhere()">+ WHERE</button>
+        </div>
+        <div class="row">
+          <button onclick="pwQbSyncDsl()">Sync to DSL below</button>
+          <label class="small"><input type="checkbox" id="pw-qb-agg-enable" onchange="pwQbAggToggle()"> aggregate (client-computed)</label>
+          <select id="pw-qb-agg-fn"><option>SUM</option><option>AVG</option><option>MIN</option><option>MAX</option><option>COUNT</option><option>FIRST</option></select>
+          <label class="small">on field</label><input type="text" id="pw-qb-agg-field" style="width:120px">
+          <label class="small">group by</label><input type="text" id="pw-qb-agg-groupby" placeholder="field (optional)" style="width:120px">
+        </div>
+        <h2>Query DSL <span class="small">(POST {wal_prefix}query &mdash; cluster fan-out when partitioned)</span></h2>
+        <textarea id="pw-query-text" class="pw-raw" style="display:block" spellcheck="false" placeholder="S:field1,field2&#10;F:pack&#10;W:field|==|value"></textarea>
+        <div class="row"><button class="pw-accent" onclick="pwQueryRun()">Run query</button><span class="small" id="pw-query-status"></span></div>
+        <h2>Results</h2>
+        <table class="wal-table" id="pw-query-table-wrap"><thead></thead><tbody></tbody></table>
+        <div id="pw-query-agg-note" class="warn" style="display:none"></div>
+        <table class="wal-table" id="pw-query-agg-table-wrap" style="display:none"><thead></thead><tbody></tbody></table>
+        <pre id="pw-query-raw" class="pw-hexpreview"></pre>
+      </div>
+    </section>
+
+    <section id="pw-tab-fastserial" class="pw-tab">
+      <div class="pw-card-panel">
+        <h2>Fast Serial (BSO1) <span class="small">&mdash; parallel binary card storage</span></h2>
+        <div class="warn">This is a <em>separate</em> raw binary path (BareMetal.Binary's BSO1 wire format,
+          HMAC-signed), stored via the authenticated <code>{ide_prefix}card/{physicalPack}/{record}</code> endpoint
+          used elsewhere in this IDE for PicoScript source/static-bundle drafts &mdash; <strong>not</strong> the JSON
+          <code>/wal/{pack}/{record}</code> path, has no schema/type/lookup validation of its own, and is
+          <strong>not queryable</strong> by the <code>/wal/query</code> DSL engine (which only understands JSON
+          cards). Use it for high-throughput fixed-layout records where wire size matters more than queryability.</div>
+        <div class="row">
+          <label class="small">signing key (base64 HMAC-SHA256, never persisted)</label>
+          <input type="password" id="fs-signing-key" placeholder="base64 key" style="flex:1" autocomplete="off">
+          <button onclick="fsSetKey()">Set key</button>
+          <span class="small" id="fs-key-status">no key set</span>
+        </div>
+        <div class="row">
+          <label class="small">schema pack (source of fields)</label><input type="number" id="fs-schema-pack" min="0" max="1023" style="width:90px">
+          <button onclick="fsDeriveSchema()">Derive BSO1 schema from rich schema</button>
+        </div>
+        <pre id="fs-schema-preview" class="pw-hexpreview">(no schema derived yet)</pre>
+        <div class="row">
+          <label class="small">physical pack</label><input type="number" id="fs-pack" min="0" max="1023" style="width:90px">
+          <label class="small">record</label><input type="number" id="fs-record" min="0" style="width:100px">
+          <button onclick="fsSerialize()">Serialize current card JSON</button>
+          <button onclick="fsDeserialize()">Deserialize bytes -&gt; card JSON</button>
+          <button class="pw-accent" onclick="fsSave()">Save BSO1 (PUT)</button>
+          <button onclick="fsLoad()">Load BSO1 (GET)</button>
+        </div>
+        <div class="small">Serializes the JSON currently in the Cards tab's editor, using the derived schema's
+          field order/types; array_u16/blob/lookup/object/array fields are carried as their JSON text representation
+          since BareMetal.Binary has no native array/object wire type.</div>
+        <div id="fs-msg" class="small"></div>
+        <h2 style="margin-top:10px">Byte size / hex preview</h2>
+        <div class="small" id="fs-size"></div>
+        <div class="pw-hexpreview" id="fs-hex">(nothing serialized yet)</div>
+      </div>
+    </section>
+
+  </main>
+</div>
+<div class="pw-status-bar" id="pwx-config-status">loading config&hellip;</div>
+<script src="baremetal-binary.js"></script>
+<script>
+(function () {
+  "use strict";
+  var PWX_EMBEDDED = new URLSearchParams(location.search).get("embedded") === "1";
+  if (PWX_EMBEDDED) document.body.classList.add("pwx-embedded");
+
+  /* ---------- config ---------- */
+  var config = null;
+  function loadConfig() {
+    /* Relative to this page's own URL ({ide_prefix}picowal.html), matching
+     * the WebIDE's own "config" relative fetch -- both resolve to
+     * {ide_prefix}config. */
+    return fetch("config", { credentials: "same-origin" })
+      .then(function (r) { if (!r.ok) throw new Error("config fetch failed: " + r.status); return r.json(); })
+      .then(function (c) {
+        config = c;
+        document.getElementById("pwx-config-status").textContent =
+          "wal=" + c.wal_prefix + " ide=" + c.ide_prefix +
+          (c.picosts_enabled ? " picosts=" + c.picosts_issuer : " picosts=disabled");
+        if (!c.picosts_enabled) document.getElementById("pwx-btn-login").disabled = true;
+        return c;
+      })
+      .catch(function (e) {
+        document.getElementById("pwx-config-status").textContent = "config error: " + e.message;
+        throw e;
+      });
+  }
+
+  /* ---------- auth: PicoSTS Authorization Code + PKCE (same flow as the
+   * WebIDE topbar widget; this page is independently loadable (iframe or
+   * direct navigation) so it carries its own compact copy). ---------- */
+  function b64urlFromBytes(bytes) {
+    var bin = "";
+    for (var i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+    return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  }
+  function randomString(len) {
+    var arr = new Uint8Array(len);
+    crypto.getRandomValues(arr);
+    return b64urlFromBytes(arr);
+  }
+  function sha256(str) {
+    return crypto.subtle.digest("SHA-256", new TextEncoder().encode(str)).then(function (buf) { return new Uint8Array(buf); });
+  }
+  function currentUrlNoQuery() { return location.origin + location.pathname; }
+
+  document.getElementById("pwx-btn-login").addEventListener("click", function () {
+    if (!config || !config.picosts_enabled) return;
+    var verifier = randomString(64), state = randomString(24);
+    sessionStorage.setItem("picowal_pkce_verifier", verifier);
+    sessionStorage.setItem("picowal_pkce_state", state);
+    sha256(verifier).then(function (digest) {
+      var challenge = b64urlFromBytes(digest);
+      var u = new URL(config.picosts_issuer + "/authorize");
+      u.searchParams.set("response_type", "code");
+      u.searchParams.set("client_id", config.picosts_client_id);
+      u.searchParams.set("redirect_uri", currentUrlNoQuery());
+      u.searchParams.set("scope", "openid");
+      u.searchParams.set("code_challenge", challenge);
+      u.searchParams.set("code_challenge_method", "S256");
+      u.searchParams.set("state", state);
+      location.href = u.toString();
+    });
+  });
+
+  function exchangeCodeForToken(code) {
+    var verifier = sessionStorage.getItem("picowal_pkce_verifier");
+    var body = new URLSearchParams();
+    body.set("grant_type", "authorization_code");
+    body.set("code", code);
+    body.set("redirect_uri", currentUrlNoQuery());
+    body.set("client_id", config.picosts_client_id);
+    body.set("code_verifier", verifier);
+    return fetch(config.picosts_issuer + "/token", {
+      method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body: body.toString()
+    }).then(function (r) {
+      if (!r.ok) throw new Error("token exchange failed: " + r.status);
+      return r.json();
+    }).then(function (tok) {
+      return fetch(config.wal_prefix + "auth/login", {
+        method: "POST", credentials: "include",
+        headers: { "Content-Type": "application/json", "X-PW-Auth": "1" },
+        body: JSON.stringify({ provider: "picosts", access_token: tok.access_token })
+      });
+    }).then(function (r) {
+      if (!r.ok) throw new Error("picoweb login failed: " + r.status);
+      history.replaceState(null, "", currentUrlNoQuery());
+      return refreshMe();
+    });
+  }
+
+  function refreshMe() {
+    if (!config) return Promise.resolve();
+    return fetch(config.wal_prefix + "auth/me", { credentials: "include", headers: { "X-PW-Auth": "1" } })
+      .then(function (r) {
+        if (r.ok) return r.json().then(function (j) {
+          document.getElementById("pwx-principal").textContent = "signed in as " + j.principal;
+          document.getElementById("pwx-btn-login").style.display = "none";
+          document.getElementById("pwx-btn-logout").style.display = "";
+        });
+        document.getElementById("pwx-principal").textContent = "not signed in";
+        document.getElementById("pwx-btn-login").style.display = "";
+        document.getElementById("pwx-btn-logout").style.display = "none";
+      }).catch(function () {});
+  }
+  window.addEventListener("message", function (event) {
+    if (event.origin !== location.origin || !event.data || event.data.type !== "picoweb-auth-state") return;
+    var authed = !!event.data.authed;
+    document.getElementById("pwx-principal").textContent =
+      authed ? ("signed in as " + event.data.principal) : "not signed in";
+    document.getElementById("pwx-btn-login").style.display = authed ? "none" : "";
+    document.getElementById("pwx-btn-logout").style.display = authed ? "" : "none";
+  });
+
+  document.getElementById("pwx-btn-logout").addEventListener("click", function () {
+    if (!config) return;
+    fetch(config.wal_prefix + "auth/logout", { method: "POST", credentials: "include", headers: { "X-PW-Auth": "1" } })
+      .then(refreshMe);
+  });
+
+  function handleOAuthRedirect() {
+    var qs = new URLSearchParams(location.search);
+    var code = qs.get("code"), state = qs.get("state");
+    if (!code || !state) return Promise.resolve();
+    if (state !== sessionStorage.getItem("picowal_pkce_state")) return Promise.resolve();
+    return exchangeCodeForToken(code).catch(function (e) { pwMsg("pw-pack-msg", "login failed: " + e.message, true); });
+  }
+
+  /* ---------- workspace tab switching (sidebar nav) ---------- */
+  var PW_TABS = ["packs", "cards", "permissions", "query", "fastserial"];
+  function pwSwitchTab(name) {
+    PW_TABS.forEach(function (t) {
+      document.getElementById("pw-tab-" + t).classList.toggle("active", t === name);
+    });
+    var btns = document.querySelectorAll(".pw-navbtn");
+    for (var i = 0; i < btns.length; i++) btns[i].classList.toggle("active", btns[i].getAttribute("data-tab") === name);
+    if (name === "packs") pwPacksRefreshKnown();
+  }
+  document.querySelectorAll(".pw-navbtn").forEach(function (btn) {
+    btn.addEventListener("click", function () { pwSwitchTab(btn.getAttribute("data-tab")); });
+  });
+
+  function pwMsg(id, text, isErr) {
+    var el = document.getElementById(id);
+    if (!el) return;
+    el.textContent = text;
+    el.className = "small " + (isErr ? "err" : "ok");
+  }
+  function pwEsc(s) {
+    var d = document.createElement("div");
+    d.textContent = (s === null || s === undefined) ? "" : String(s);
+    return d.innerHTML;
+  }
+  function pwCell(v) {
+    if (v === null || v === undefined) return "";
+    if (typeof v === "object") return pwEsc(JSON.stringify(v));
+    return pwEsc(v);
+  }
+
+  /* Real picowal fetch -- credentials + X-PW-Auth, same contract as every
+   * other authenticated write path in picoweb (static_pack, pico_route,
+   * {ide_prefix}card/). */
+  function walFetch(path, opts) {
+    opts = opts || {};
+    var headers = { "X-PW-Auth": "1" };
+    for (var k in (opts.headers || {})) headers[k] = opts.headers[k];
+    var merged = { credentials: "include" };
+    for (var k2 in opts) merged[k2] = opts[k2];
+    merged.headers = headers;
+    return fetch(config.wal_prefix + path, merged);
+  }
+  /* ---- server-native schema CSV/assignment format (picowal_validate.c):
+   * "fields":"a,b,c" (comma CSV), "required"/"nullable"/"readonly": comma
+   * CSV, "types"/"max_lengths"/"lookup_labels"/"field_labels"/
+   * "field_placeholders" are ';'-separated "field=value" assignments,
+   * "joins" is "targetPack=fkField,..." (a lookup field's target pack is
+   * whichever join entry's fkField equals the field name). Pack-level
+   * metadata: "module" (string), "public_read" (bool, design flag only),
+   * "children" (CSV of child pack ids), "list_columns" (CSV). Any other
+   * top-level schema keys (title, regex, email, transitions, pages, nav,
+   * ...) are preserved verbatim in .extra. ---- */
+  function pwCsvParse(s) {
+    if (!s) return [];
+    return String(s).split(",").map(function (x) { return x.trim(); }).filter(function (x) { return x.length; });
+  }
+  function pwAssignParse(s) {
+    var out = {};
+    if (!s) return out;
+    String(s).split(";").forEach(function (tok) {
+      var t = tok.trim();
+      if (!t) return;
+      var eq = t.indexOf("=");
+      if (eq < 0) return;
+      out[t.slice(0, eq).trim()] = t.slice(eq + 1).trim();
+    });
+    return out;
+  }
+  function pwAssignJoin(map) {
+    return Object.keys(map).filter(function (k) { return map[k] !== undefined && map[k] !== null && map[k] !== ""; })
+      .map(function (k) { return k + "=" + map[k]; }).join(";");
+  }
+  var PW_LOOKUP_DROPDOWN_MAX = 16; /* matches the reference RP GUI's <=16 select / >16 search threshold */
+
+  function pwSchemaModelFromDoc(doc) {
+    var model = { fields: [], module: "", publicRead: false, children: "", listColumns: "", extra: {} };
+    if (!doc || typeof doc !== "object") return model;
+    var names = pwCsvParse(doc.fields);
+    var required = {}; pwCsvParse(doc.required).forEach(function (f) { required[f] = true; });
+    var nullable = {}; pwCsvParse(doc.nullable).forEach(function (f) { nullable[f] = true; });
+    var readonly = {}; pwCsvParse(doc.readonly).forEach(function (f) { readonly[f] = true; });
+    var types = pwAssignParse(doc.types);
+    var maxLengths = pwAssignParse(doc.max_lengths);
+    var lookupLabels = pwAssignParse(doc.lookup_labels);
+    var labels = pwAssignParse(doc.field_labels);
+    var placeholders = pwAssignParse(doc.field_placeholders);
+    var ordinals = pwAssignParse(doc.ordinals);
+    var joinsByField = {};
+    pwCsvParse(doc.joins).forEach(function (tok) {
+      var eq = tok.indexOf("=");
+      if (eq < 0) return;
+      var pack = tok.slice(0, eq).trim(), fk = tok.slice(eq + 1).trim();
+      if (pack && fk) joinsByField[fk] = pack;
+    });
+    model.fields = names.map(function (name, idx) {
+      return {
+        name: name,
+        type: types[name] || "string",
+        required: !!required[name],
+        nullable: !!nullable[name],
+        readonly: !!readonly[name],
+        maxLength: maxLengths[name] || "",
+        ordinal: (ordinals[name] !== undefined) ? ordinals[name] : String(idx),
+        lookupPack: joinsByField[name] || "",
+        lookupLabel: lookupLabels[name] || "",
+        label: labels[name] || "",
+        placeholder: placeholders[name] || ""
+      };
+    });
+    model.fields.sort(function (a, b) { return (parseInt(a.ordinal, 10) || 0) - (parseInt(b.ordinal, 10) || 0); });
+    model.module = doc.module || "";
+    model.publicRead = !!doc.public_read;
+    model.children = doc.children || "";
+    model.listColumns = doc.list_columns || "";
+    Object.keys(doc).forEach(function (k) {
+      if (["fields", "required", "nullable", "readonly", "types", "max_lengths", "lookup_labels",
+           "field_labels", "field_placeholders", "ordinals", "joins", "module", "public_read",
+           "children", "list_columns"].indexOf(k) >= 0) return;
+      model.extra[k] = doc[k];
+    });
+    model._rawJoins = doc.joins || "";
+    return model;
+  }
+  function pwSchemaModelToDoc(model) {
+    var doc = {};
+    Object.keys(model.extra || {}).forEach(function (k) { doc[k] = model.extra[k]; });
+    doc.fields = model.fields.map(function (f) { return f.name; }).join(",");
+    var req = model.fields.filter(function (f) { return f.required; }).map(function (f) { return f.name; });
+    if (req.length) doc.required = req.join(","); else delete doc.required;
+    var nul = model.fields.filter(function (f) { return f.nullable; }).map(function (f) { return f.name; });
+    if (nul.length) doc.nullable = nul.join(","); else delete doc.nullable;
+    var ro = model.fields.filter(function (f) { return f.readonly; }).map(function (f) { return f.name; });
+    if (ro.length) doc.readonly = ro.join(","); else delete doc.readonly;
+    var typeStr = model.fields.map(function (f) { return f.name + "=" + f.type; }).join(";");
+    if (typeStr) doc.types = typeStr; else delete doc.types;
+    var maxLenMap = {}; model.fields.forEach(function (f) { if (f.maxLength !== "" && f.maxLength !== undefined && f.maxLength !== null) maxLenMap[f.name] = f.maxLength; });
+    var maxLenStr = pwAssignJoin(maxLenMap);
+    if (maxLenStr) doc.max_lengths = maxLenStr; else delete doc.max_lengths;
+    var ordMap = {}; model.fields.forEach(function (f, idx) { ordMap[f.name] = (f.ordinal !== "" && f.ordinal !== undefined) ? f.ordinal : String(idx); });
+    var ordStr = pwAssignJoin(ordMap);
+    if (ordStr) doc.ordinals = ordStr; else delete doc.ordinals;
+    var lblMap = {}; model.fields.forEach(function (f) { if (f.label) lblMap[f.name] = f.label; });
+    var lblStr = pwAssignJoin(lblMap);
+    if (lblStr) doc.field_labels = lblStr; else delete doc.field_labels;
+    var phMap = {}; model.fields.forEach(function (f) { if (f.placeholder) phMap[f.name] = f.placeholder; });
+    var phStr = pwAssignJoin(phMap);
+    if (phStr) doc.field_placeholders = phStr; else delete doc.field_placeholders;
+    var lookupLabelMap = {}; model.fields.forEach(function (f) { if (f.type === "lookup" && f.lookupLabel) lookupLabelMap[f.name] = f.lookupLabel; });
+    var lookupLabelStr = pwAssignJoin(lookupLabelMap);
+    if (lookupLabelStr) doc.lookup_labels = lookupLabelStr; else delete doc.lookup_labels;
+    var joinTokens = [];
+    var seenFk = {};
+    model.fields.forEach(function (f) {
+      if (f.type === "lookup" && f.lookupPack !== "") {
+        joinTokens.push(f.lookupPack + "=" + f.name);
+        seenFk[f.name] = true;
+      }
+    });
+    pwCsvParse(model._rawJoins).forEach(function (tok) {
+      var eq = tok.indexOf("=");
+      if (eq < 0) return;
+      var fk = tok.slice(eq + 1).trim();
+      if (!seenFk[fk]) joinTokens.push(tok);
+    });
+    if (joinTokens.length) doc.joins = joinTokens.join(","); else delete doc.joins;
+    if (model.module) doc.module = model.module; else delete doc.module;
+    if (model.publicRead) doc.public_read = true; else delete doc.public_read;
+    if (model.children) doc.children = model.children; else delete doc.children;
+    if (model.listColumns) doc.list_columns = model.listColumns; else delete doc.list_columns;
+    return doc;
+  }
+
+  var PW_LOOKUP_TYPE = "lookup";
+  var pwSchemaModel = { fields: [], module: "", publicRead: false, children: "", listColumns: "", extra: {} };
+  function pwSchemaRenderFields() {
+    var tbody = document.querySelector("#pw-schema-fields-table tbody");
+    tbody.innerHTML = "";
+    pwSchemaModel.fields.forEach(function (f, idx) {
+      var tr = document.createElement("tr");
+      var lookupTxt = (f.type === PW_LOOKUP_TYPE) ? ("pack " + pwEsc(f.lookupPack) + (f.lookupLabel ? ("." + pwEsc(f.lookupLabel)) : "")) : "";
+      tr.innerHTML = "<td>" + pwEsc(f.ordinal) + "</td><td>" + pwEsc(f.name) + "</td><td>" + pwEsc(f.type) + "</td><td>" +
+        pwEsc(f.maxLength) + "</td><td>" + (f.required ? "yes" : "") + "</td><td>" + (f.nullable ? "yes" : "") +
+        "</td><td>" + (f.readonly ? "yes" : "") + "</td><td>" + lookupTxt + "</td><td>" + pwEsc(f.label) +
+        "</td><td><button>&times;</button></td>";
+      tr.querySelector("button").addEventListener("click", function () {
+        pwSchemaModel.fields.splice(idx, 1);
+        pwSchemaRenderFields();
+        pwSchemaSyncRaw();
+      });
+      tbody.appendChild(tr);
+    });
+    if (!pwSchemaModel.fields.length) {
+      var tr2 = document.createElement("tr");
+      tr2.innerHTML = "<td colspan=\"10\" class=\"small\">no fields yet -- add one below</td>";
+      tbody.appendChild(tr2);
+    }
+  }
+  function pwFieldTypeChanged() {
+    var type = document.getElementById("pw-field-type").value;
+    document.getElementById("pw-field-lookup-row").style.display = (type === PW_LOOKUP_TYPE) ? "inline" : "none";
+  }
+  function pwSchemaAddField() {
+    var nameEl = document.getElementById("pw-field-name");
+    var name = nameEl.value.trim();
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) { alert("field name must be a simple identifier"); return; }
+    var type = document.getElementById("pw-field-type").value;
+    var ordinal = document.getElementById("pw-field-ordinal").value || String(pwSchemaModel.fields.length);
+    var maxLength = document.getElementById("pw-field-maxlen").value || "";
+    var required = document.getElementById("pw-field-required").checked;
+    var nullable = document.getElementById("pw-field-nullable").checked;
+    var readonly = document.getElementById("pw-field-readonly").checked;
+    var lookupPack = document.getElementById("pw-field-lookup-pack").value || "";
+    var lookupLabel = document.getElementById("pw-field-lookup-label").value.trim();
+    var label = document.getElementById("pw-field-label").value.trim();
+    var placeholder = document.getElementById("pw-field-placeholder").value.trim();
+    pwSchemaModel.fields = pwSchemaModel.fields.filter(function (f) { return f.name !== name; })
+      .concat([{
+        name: name, type: type, required: required, nullable: nullable, readonly: readonly,
+        maxLength: maxLength, ordinal: ordinal,
+        lookupPack: (type === PW_LOOKUP_TYPE) ? lookupPack : "",
+        lookupLabel: (type === PW_LOOKUP_TYPE) ? lookupLabel : "",
+        label: label, placeholder: placeholder
+      }]);
+    ["pw-field-name", "pw-field-ordinal", "pw-field-maxlen", "pw-field-lookup-pack",
+     "pw-field-lookup-label", "pw-field-label", "pw-field-placeholder"].forEach(function (id) {
+      document.getElementById(id).value = "";
+    });
+    ["pw-field-required", "pw-field-nullable", "pw-field-readonly"].forEach(function (id) {
+      document.getElementById(id).checked = false;
+    });
+    pwSchemaRenderFields();
+    pwSchemaSyncRaw();
+  }
+  function pwSchemaSyncRaw() {
+    pwSchemaModel.module = document.getElementById("pw-schema-module").value.trim();
+    pwSchemaModel.publicRead = document.getElementById("pw-schema-public-read").checked;
+    pwSchemaModel.children = document.getElementById("pw-schema-children").value.trim();
+    pwSchemaModel.listColumns = document.getElementById("pw-schema-list-columns").value.trim();
+    document.getElementById("pw-schema-raw").value = JSON.stringify(pwSchemaModelToDoc(pwSchemaModel), null, 2);
+  }
+  function pwSchemaToggleRaw() {
+    var ta = document.getElementById("pw-schema-raw");
+    var actions = document.getElementById("pw-schema-raw-actions");
+    var show = ta.style.display !== "block";
+    if (show) pwSchemaSyncRaw();
+    ta.style.display = show ? "block" : "none";
+    actions.style.display = show ? "flex" : "none";
+  }
+  function pwSchemaApplyRaw() {
+    try {
+      var doc = JSON.parse(document.getElementById("pw-schema-raw").value);
+      pwSchemaModel = pwSchemaModelFromDoc(doc);
+      pwSchemaRenderFields();
+      pwSchemaRenderPackMeta();
+      pwMsg("pw-schema-msg", "raw JSON applied to field builder", false);
+    } catch (e) {
+      pwMsg("pw-schema-msg", "invalid JSON: " + e.message, true);
+    }
+  }
+  function pwSchemaRenderPackMeta() {
+    document.getElementById("pw-schema-module").value = pwSchemaModel.module || "";
+    document.getElementById("pw-schema-public-read").checked = !!pwSchemaModel.publicRead;
+    document.getElementById("pw-schema-children").value = pwSchemaModel.children || "";
+    document.getElementById("pw-schema-list-columns").value = pwSchemaModel.listColumns || "";
+  }
+
+  function pwPackLoad() {
+    if (!config) return;
+    var pack = document.getElementById("pw-pack-id").value;
+    walFetch("metadata/" + pack).then(function (r) {
+      if (r.status === 404) return null;
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      return r.json();
+    }).then(function (doc) {
+      document.getElementById("pw-pack-name").value = (doc && doc.pack1 && doc.pack1.name) || "";
+      pwSchemaModel = pwSchemaModelFromDoc((doc && doc.pack2) || {});
+      pwSchemaRenderFields();
+      pwSchemaRenderPackMeta();
+      pwSchemaSyncRaw();
+      pwMsg("pw-pack-msg", doc ? ("loaded pack " + pack) : ("no metadata yet for pack " + pack), false);
+    }).catch(function (e) { pwMsg("pw-pack-msg", e.message, true); });
+  }
+  function pwPackSaveName() {
+    if (!config) return;
+    var pack = document.getElementById("pw-pack-id").value;
+    var name = document.getElementById("pw-pack-name").value;
+    walFetch("metadata/name/" + pack, {
+      method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: name })
+    }).then(function (r) { pwMsg("pw-pack-msg", r.ok ? "name saved" : "save failed: " + r.status, !r.ok); })
+      .catch(function (e) { pwMsg("pw-pack-msg", e.message, true); });
+  }
+  function pwPackDeleteName() {
+    if (!config) return;
+    var pack = document.getElementById("pw-pack-id").value;
+    walFetch("metadata/name/" + pack, { method: "DELETE" })
+      .then(function (r) {
+        var ok = r.ok || r.status === 404;
+        pwMsg("pw-pack-msg", ok ? "name deleted" : "delete failed: " + r.status, !ok);
+      }).catch(function (e) { pwMsg("pw-pack-msg", e.message, true); });
+  }
+  function pwSchemaSave() {
+    if (!config) return;
+    var pack = document.getElementById("pw-pack-id").value;
+    var raw = document.getElementById("pw-schema-raw");
+    var doc;
+    if (raw.style.display === "block") {
+      try { doc = JSON.parse(raw.value); } catch (e) { pwMsg("pw-schema-msg", "invalid JSON: " + e.message, true); return; }
+    } else {
+      pwSchemaSyncRaw();
+      doc = pwSchemaModelToDoc(pwSchemaModel);
+    }
+    walFetch("metadata/schema/" + pack, {
+      method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(doc)
+    }).then(function (r) { return r.text().then(function (t) { pwMsg("pw-schema-msg", r.ok ? "schema saved" : "save failed (" + r.status + "): " + t, !r.ok); }); })
+      .catch(function (e) { pwMsg("pw-schema-msg", e.message, true); });
+  }
+  function pwSchemaDelete() {
+    if (!config) return;
+    var pack = document.getElementById("pw-pack-id").value;
+    walFetch("metadata/schema/" + pack, { method: "DELETE" })
+      .then(function (r) {
+        var ok = r.ok || r.status === 404;
+        pwMsg("pw-schema-msg", ok ? "schema deleted" : "delete failed: " + r.status, !ok);
+      }).catch(function (e) { pwMsg("pw-schema-msg", e.message, true); });
+  }
+  function pwPacksRefreshKnown() {
+    if (!config) return;
+    walFetch("list/1").then(function (r) {
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      return r.json();
+    }).then(function (d) {
+      var tbody = document.getElementById("pw-known-packs");
+      tbody.innerHTML = "";
+      var emptyEl = document.getElementById("pw-known-packs-empty");
+      return Promise.all((d.records || []).map(function (rec) {
+        return pwFetchSchemaModel(rec.record).then(function (model) {
+          return { record: rec.record, name: (rec.data && rec.data.name) || "", module: model.module || "Ungrouped" };
+        });
+      })).then(function (packs) {
+        if (emptyEl) emptyEl.style.display = packs.length ? "none" : "block";
+        packs.sort(function (a, b) {
+          var mc = a.module.localeCompare(b.module);
+          return mc || (a.record - b.record);
+        });
+        var activeModule = null;
+        packs.forEach(function (pack) {
+          if (pack.module !== activeModule) {
+            activeModule = pack.module;
+            var group = document.createElement("tr");
+            group.className = "pw-module-row";
+            group.innerHTML = "<th colspan=\"3\">" + pwEsc(activeModule) + "</th>";
+            tbody.appendChild(group);
+          }
+          var tr = document.createElement("tr");
+          tr.innerHTML = "<td>" + pack.record + "</td><td>" + pwEsc(pack.name) + "</td><td><button>Load</button></td>";
+          tr.querySelector("button").addEventListener("click", function () {
+            document.getElementById("pw-pack-id").value = pack.record;
+            pwSwitchTab("packs");
+            pwPackLoad();
+          });
+          tbody.appendChild(tr);
+        });
+      });
+    }).catch(function () {});
+  }
+  /* ---- cards: real /wal/{pack}/{record} JSON CRUD (schema-validated) ---- */
+  var pwCardState = {
+    pack: null, record: null, doc: null, version: null,
+    schemaModel: null, dirty: {}, visual: false, lookupCache: {}
+  };
+  var pwCardsFullList = [];
+  var pwCardsListPageIdx = 0;
+  var PW_CARDS_PAGE_SIZE = 10;
+
+  function pwFetchSchemaModel(pack) {
+    return walFetch("schema/" + pack).then(function (r) {
+      if (r.status === 404) return pwSchemaModelFromDoc({});
+      if (!r.ok) throw new Error("schema HTTP " + r.status);
+      return r.json().then(function (doc) { return pwSchemaModelFromDoc(doc); });
+    }).catch(function () { return pwSchemaModelFromDoc({}); });
+  }
+  function pwLookupOptions(pack) {
+    if (pwCardState.lookupCache[pack]) return Promise.resolve(pwCardState.lookupCache[pack]);
+    return walFetch("list/" + pack).then(function (r) {
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      return r.json();
+    }).then(function (d) {
+      var rows = d.records || [];
+      pwCardState.lookupCache[pack] = rows;
+      return rows;
+    }).catch(function () { return []; });
+  }
+  function pwLookupDisplayValue(row, labelField) {
+    var data = row.data || {};
+    if (labelField && data[labelField] !== undefined) return data[labelField];
+    var k = Object.keys(data).filter(function (x) { return typeof data[x] === "string"; })[0];
+    if (k) return data[k];
+    return "#" + row.record;
+  }
+  function pwCardMarkDirty(name, el) {
+    pwCardState.dirty[name] = true;
+    if (el) el.classList.add("pw-dirty");
+    document.getElementById("pw-card-dirty").textContent = Object.keys(pwCardState.dirty).join(", ") || "(none)";
+  }
+  function pwCardResetDirty() {
+    pwCardState.dirty = {};
+    document.getElementById("pw-card-dirty").textContent = "(none)";
+  }
+  function pwCardValueForInput(field, value) {
+    if (value === null || value === undefined) return "";
+    if (field.type === "array_u16" && Array.isArray(value)) return value.join(",");
+    if ((field.type === "object" || field.type === "array") && typeof value === "object") return JSON.stringify(value);
+    return String(value);
+  }
+  function pwCardParseInputValue(field, raw) {
+    var allowNull = field.nullable && raw === "";
+    if (allowNull) return null;
+    switch (field.type) {
+      case "bool": return raw === "true" || raw === "on" || raw === "1";
+      case "uint8": case "uint16": case "uint32": case "int8": case "int16": case "int32":
+      case "number": case "decimal": case "lookup": {
+        var n = Number(raw);
+        return isNaN(n) ? raw : n;
+      }
+      case "array_u16":
+        return raw.split(",").map(function (x) { return x.trim(); }).filter(function (x) { return x.length; })
+          .map(function (x) { return Number(x); });
+      case "object": case "array":
+        try { return JSON.parse(raw); } catch (e) { return raw; }
+      default: return raw;
+    }
+  }
+  function pwCardBuildFieldInput(field, value, onDirty) {
+    var input;
+    var typeAttr = { date: "date", time: "time", datetime: "datetime-local" }[field.type];
+    if (field.type === "bool") {
+      input = document.createElement("select");
+      ["", "true", "false"].forEach(function (v) {
+        var o = document.createElement("option"); o.value = v; o.textContent = v || "(unset)";
+        if ((value === true && v === "true") || (value === false && v === "false")) o.selected = true;
+        input.appendChild(o);
+      });
+    } else if (field.type === "object" || field.type === "array") {
+      input = document.createElement("textarea");
+      input.value = pwCardValueForInput(field, value);
+    } else if (typeAttr) {
+      input = document.createElement("input");
+      input.type = typeAttr;
+      if (typeAttr === "time" || typeAttr === "datetime-local") input.step = "1";
+      input.value = pwCardValueForInput(field, value);
+    } else if (["uint8", "uint16", "uint32", "int8", "int16", "int32", "number", "decimal"].indexOf(field.type) >= 0) {
+      input = document.createElement("input");
+      input.type = "number";
+      input.value = pwCardValueForInput(field, value);
+    } else {
+      input = document.createElement("input");
+      input.type = "text";
+      input.value = pwCardValueForInput(field, value);
+      if (field.maxLength) input.maxLength = field.maxLength;
+      if (field.placeholder) input.placeholder = field.placeholder;
+    }
+    input.disabled = !!field.readonly;
+    if (field.readonly) input.classList.add("pw-readonly");
+    input.addEventListener("input", function () { onDirty(input); });
+    input.addEventListener("change", function () { onDirty(input); });
+    input.dataset.fieldName = field.name;
+    return input;
+  }
+  function pwCardRenderVisual() {
+    var grid = document.getElementById("pw-card-visual");
+    grid.innerHTML = "";
+    var model = pwCardState.schemaModel;
+    var doc = pwCardState.doc || {};
+    if (!model || !model.fields.length) {
+      grid.innerHTML = "<div class=\"small\">no schema fields for this pack -- use Raw JSON</div>";
+      return;
+    }
+    model.fields.forEach(function (field) {
+      var label = document.createElement("label");
+      label.textContent = (field.label || field.name) + (field.required ? " *" : "");
+      grid.appendChild(label);
+      if (field.type === PW_LOOKUP_TYPE && field.lookupPack !== "") {
+        var wrap = document.createElement("span");
+        pwLookupOptions(field.lookupPack).then(function (rows) {
+          var current = doc[field.name];
+          if (rows.length <= PW_LOOKUP_DROPDOWN_MAX) {
+            var sel = document.createElement("select");
+            if (field.nullable) { var blank = document.createElement("option"); blank.value = ""; blank.textContent = "(unset)"; sel.appendChild(blank); }
+            rows.forEach(function (row) {
+              var o = document.createElement("option");
+              o.value = row.record;
+              o.textContent = row.record + " -- " + pwLookupDisplayValue(row, field.lookupLabel);
+              if (String(current) === String(row.record)) o.selected = true;
+              sel.appendChild(o);
+            });
+            sel.disabled = !!field.readonly;
+            sel.dataset.fieldName = field.name;
+            sel.addEventListener("change", function () { pwCardMarkDirty(field.name, sel); });
+            wrap.appendChild(sel);
+          } else {
+            var listId = "pw-lookup-dl-" + field.name;
+            var dl = document.createElement("datalist");
+            dl.id = listId;
+            rows.forEach(function (row) {
+              var o = document.createElement("option");
+              o.value = row.record;
+              o.label = pwLookupDisplayValue(row, field.lookupLabel);
+              dl.appendChild(o);
+            });
+            var inp = document.createElement("input");
+            inp.type = "text";
+            inp.setAttribute("list", listId);
+            inp.value = (current === undefined || current === null) ? "" : String(current);
+            inp.placeholder = "search " + rows.length + " records (record id)";
+            inp.disabled = !!field.readonly;
+            inp.dataset.fieldName = field.name;
+            inp.addEventListener("input", function () { pwCardMarkDirty(field.name, inp); });
+            wrap.appendChild(dl);
+            wrap.appendChild(inp);
+          }
+        });
+        grid.appendChild(wrap);
+      } else {
+        var input = pwCardBuildFieldInput(field, doc[field.name], function (el) { pwCardMarkDirty(field.name, el); });
+        grid.appendChild(input);
+      }
+    });
+  }
+  function pwCardVisualToJson() {
+    var model = pwCardState.schemaModel;
+    var doc = Object.assign({}, pwCardState.doc || {});
+    if (!model) return doc;
+    var grid = document.getElementById("pw-card-visual");
+    model.fields.forEach(function (field) {
+      var el = grid.querySelector('[data-field-name="' + field.name.replace(/"/g, "") + '"]');
+      if (!el) return;
+      doc[field.name] = pwCardParseInputValue(field, el.value);
+    });
+    return doc;
+  }
+  function pwCardApplyMode() {
+    var jsonEl = document.getElementById("pw-card-json");
+    var visualEl = document.getElementById("pw-card-visual");
+    var btn = document.getElementById("pw-card-mode-btn");
+    if (pwCardState.visual) {
+      jsonEl.style.display = "none";
+      visualEl.style.display = "grid";
+      btn.textContent = "Raw JSON";
+      pwCardRenderVisual();
+    } else {
+      visualEl.style.display = "none";
+      jsonEl.style.display = "block";
+      btn.textContent = "Visual form";
+    }
+  }
+  function pwCardToggleVisual() {
+    if (pwCardState.visual) {
+      pwCardState.doc = pwCardVisualToJson();
+      document.getElementById("pw-card-json").value = JSON.stringify(pwCardState.doc, null, 2);
+    } else {
+      try { pwCardState.doc = JSON.parse(document.getElementById("pw-card-json").value || "{}"); }
+      catch (e) { pwMsg("pw-card-msg", "invalid JSON, cannot switch to visual form: " + e.message, true); return; }
+    }
+    pwCardState.visual = !pwCardState.visual;
+    pwCardApplyMode();
+  }
+  function pwCardShowVersion() {
+    var v = (pwCardState.doc && pwCardState.doc._version !== undefined) ? pwCardState.doc._version : "(none)";
+    document.getElementById("pw-card-version").textContent = v;
+  }
+  function pwCardSetEmptyState(empty) {
+    /* Informational only -- the JSON textarea below always stays usable
+     * (even with nothing loaded yet) so a new card can be composed and
+     * created directly, matching Create (auto id)'s expectations. */
+    var el = document.getElementById("pw-card-empty");
+    if (el) el.style.display = empty ? "block" : "none";
+    document.getElementById("pw-card-json").style.display = pwCardState.visual ? "none" : "block";
+    document.getElementById("pw-card-visual").style.display = (!empty && pwCardState.visual) ? "grid" : "none";
+  }
+  function pwCardLoadInto(pack, record, doc) {
+    pwCardState.pack = pack;
+    pwCardState.record = record;
+    pwCardState.doc = doc;
+    pwCardState.lookupCache = {};
+    pwCardResetDirty();
+    pwCardSetEmptyState(false);
+    document.getElementById("pw-card-json").value = JSON.stringify(doc, null, 2);
+    pwCardShowVersion();
+    pwFetchSchemaModel(pack).then(function (model) {
+      pwCardState.schemaModel = model;
+      if (pwCardState.visual) pwCardRenderVisual();
+      pwRenderChildGrids(pack, record, model);
+    });
+  }
+  function pwCardGet() {
+    if (!config) return;
+    var pack = document.getElementById("pw-card-pack").value, rec = document.getElementById("pw-card-record").value;
+    walFetch(pack + "/" + rec).then(function (r) {
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      return r.text();
+    }).then(function (t) {
+      var doc;
+      try { doc = JSON.parse(t); } catch (e) { doc = null; }
+      if (doc === null) { pwCardSetEmptyState(false); document.getElementById("pw-card-json").value = t; pwMsg("pw-card-msg", "loaded (non-JSON body, raw mode only)", false); return; }
+      pwCardLoadInto(pack, rec, doc);
+      pwMsg("pw-card-msg", "loaded", false);
+    }).catch(function (e) { pwMsg("pw-card-msg", e.message, true); });
+  }
+  function pwCardPut() {
+    if (!config) return;
+    var pack = document.getElementById("pw-card-pack").value, rec = document.getElementById("pw-card-record").value;
+    var doc = pwCardState.visual ? pwCardVisualToJson() : (function () {
+      try { return JSON.parse(document.getElementById("pw-card-json").value); }
+      catch (e) { pwMsg("pw-card-msg", "invalid JSON: " + e.message, true); return null; }
+    })();
+    if (doc === null) return;
+    var loadedVersion = (pwCardState.pack === pack && pwCardState.record === rec &&
+                         pwCardState.doc && pwCardState.doc._version !== undefined) ? pwCardState.doc._version : null;
+    var proceed = (loadedVersion === null) ? Promise.resolve(true) : walFetch(pack + "/" + rec).then(function (r) {
+      if (!r.ok) return true;
+      return r.json().then(function (current) {
+        if (current && current._version !== undefined && current._version !== loadedVersion) {
+          return confirm("Record changed on the server since you loaded it (version " + loadedVersion +
+                         " -> " + current._version + "). Save anyway and overwrite?");
+        }
+        return true;
+      }).catch(function () { return true; });
+    }).catch(function () { return true; });
+    proceed.then(function (go) {
+      if (!go) { pwMsg("pw-card-msg", "save cancelled (stale version)", true); return; }
+      if (doc && doc._version !== undefined && typeof doc._version === "number") doc._version = doc._version + 1;
+      var body = JSON.stringify(doc);
+      walFetch(pack + "/" + rec, { method: "PUT", headers: { "Content-Type": "application/json" }, body: body })
+        .then(function (r) { return r.text().then(function (t) {
+          if (r.ok) {
+            pwCardLoadInto(pack, rec, doc);
+            pwMsg("pw-card-msg", "saved (" + r.status + "), changed: " + (Object.keys(pwCardState.dirty).join(", ") || "(none)"), false);
+          } else {
+            pwMsg("pw-card-msg", "save failed (" + r.status + "): " + t, true);
+          }
+        }); })
+        .catch(function (e) { pwMsg("pw-card-msg", e.message, true); });
+    });
+  }
+  function pwCardDelete() {
+    if (!config) return;
+    var pack = document.getElementById("pw-card-pack").value, rec = document.getElementById("pw-card-record").value;
+    walFetch(pack + "/" + rec, { method: "DELETE" })
+      .then(function (r) { pwMsg("pw-card-msg", r.ok ? "deleted" : "delete failed: " + r.status, !r.ok); })
+      .catch(function (e) { pwMsg("pw-card-msg", e.message, true); });
+  }
+  function pwCardCreate() {
+    if (!config) return;
+    var pack = document.getElementById("pw-card-pack").value;
+    var body = document.getElementById("pw-card-json").value;
+    walFetch(pack, { method: "POST", headers: { "Content-Type": "application/json" }, body: body })
+      .then(function (r) {
+        if (r.status === 201) {
+          var loc = r.headers.get("Location") || "";
+          var m = /\/(\d+)\/(\d+)$/.exec(loc);
+          if (m) document.getElementById("pw-card-record").value = m[2];
+          pwCardSetEmptyState(false);
+          pwMsg("pw-card-msg", "created " + loc, false);
+        } else {
+          return r.text().then(function (t) { pwMsg("pw-card-msg", "create failed (" + r.status + "): " + t, true); });
+        }
+      }).catch(function (e) { pwMsg("pw-card-msg", e.message, true); });
+  }
+  function pwCardsListRender() {
+    var search = (document.getElementById("pw-card-list-search").value || "").toLowerCase();
+    var filtered = pwCardsFullList.filter(function (rec) {
+      if (!search) return true;
+      return (String(rec.record) + JSON.stringify(rec.data)).toLowerCase().indexOf(search) >= 0;
+    });
+    var totalPages = Math.max(1, Math.ceil(filtered.length / PW_CARDS_PAGE_SIZE));
+    if (pwCardsListPageIdx >= totalPages) pwCardsListPageIdx = totalPages - 1;
+    if (pwCardsListPageIdx < 0) pwCardsListPageIdx = 0;
+    var pageRows = filtered.slice(pwCardsListPageIdx * PW_CARDS_PAGE_SIZE, (pwCardsListPageIdx + 1) * PW_CARDS_PAGE_SIZE);
+    var pack = document.getElementById("pw-card-list-pack").value;
+    var tbody = document.getElementById("pw-cards-list");
+    tbody.innerHTML = "";
+    pageRows.forEach(function (rec) {
+      var tr = document.createElement("tr");
+      var preview = JSON.stringify(rec.data);
+      if (preview && preview.length > 80) preview = preview.slice(0, 80) + "...";
+      tr.innerHTML = "<td>" + rec.record + "</td><td>" + pwEsc(preview) + "</td><td><button>Load</button></td>";
+      tr.querySelector("button").addEventListener("click", function () {
+        document.getElementById("pw-card-pack").value = pack;
+        document.getElementById("pw-card-record").value = rec.record;
+        pwCardLoadInto(pack, String(rec.record), rec.data);
+      });
+      tbody.appendChild(tr);
+    });
+    document.getElementById("pw-cards-list-page").textContent =
+      "page " + (pwCardsListPageIdx + 1) + "/" + totalPages + " (" + filtered.length + " of " + pwCardsFullList.length + " shown)";
+  }
+  function pwCardsListPage(delta) {
+    pwCardsListPageIdx += delta;
+    pwCardsListRender();
+  }
+  function pwCardsList() {
+    if (!config) return;
+    var pack = document.getElementById("pw-card-list-pack").value;
+    walFetch("list/" + pack).then(function (r) {
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      return r.json();
+    }).then(function (d) {
+      pwCardsFullList = d.records || [];
+      pwCardsListPageIdx = 0;
+      pwCardsListRender();
+      var note = d.partial ? (" (partial: " + d.shards_ok + "/" + d.shards_total + " shards ok)") : "";
+      pwMsg("pw-cards-list-msg", "count=" + d.count + note, false);
+    }).catch(function (e) { pwMsg("pw-cards-list-msg", e.message, true); });
+  }
+  function pwCardsMget() {
+    if (!config) return;
+    var pack = document.getElementById("pw-card-list-pack").value;
+    var ids = pwCsvParse(document.getElementById("pw-mget-ids").value);
+    var tbody = document.getElementById("pw-mget-results");
+    tbody.innerHTML = "";
+    Promise.all(ids.map(function (id) {
+      return walFetch(pack + "/" + id).then(function (r) {
+        return r.text().then(function (t) { return { id: id, ok: r.ok, status: r.status, text: t }; });
+      }).catch(function (e) { return { id: id, ok: false, status: 0, text: e.message }; });
+    })).then(function (results) {
+      results.forEach(function (res) {
+        var tr = document.createElement("tr");
+        var preview = res.ok ? (res.text.length > 100 ? res.text.slice(0, 100) + "..." : res.text) : ("ERROR " + res.status + ": " + res.text);
+        tr.innerHTML = "<td>" + pwEsc(res.id) + "</td><td>" + pwEsc(preview) + "</td>";
+        if (res.ok) {
+          var btn = document.createElement("button");
+          btn.textContent = "Load";
+          btn.addEventListener("click", function () {
+            document.getElementById("pw-card-pack").value = pack;
+            document.getElementById("pw-card-record").value = res.id;
+            try { pwCardLoadInto(pack, res.id, JSON.parse(res.text)); }
+            catch (e) { pwCardSetEmptyState(false); document.getElementById("pw-card-json").value = res.text; }
+          });
+          var td = document.createElement("td");
+          td.appendChild(btn);
+          tr.appendChild(td);
+        }
+        tbody.appendChild(tr);
+      });
+    });
+  }
+
+  /* ---- master-child grids: parent schema `children` (CSV of child pack
+   * ids) + child schema `joins` (targetPack=fkField) locate the FK field
+   * that points back at the parent. Sequential authenticated writes for
+   * "Save All" -- reported per-row, not claimed atomic. ---- */
+  function pwFindChildFkField(childModel, parentPack) {
+    var found = null;
+    pwCsvParse(childModel._rawJoins).forEach(function (tok) {
+      var eq = tok.indexOf("=");
+      if (eq < 0) return;
+      var pack = tok.slice(0, eq).trim(), fk = tok.slice(eq + 1).trim();
+      if (pack === String(parentPack)) found = fk;
+    });
+    childModel.fields.forEach(function (f) {
+      if (f.type === PW_LOOKUP_TYPE && String(f.lookupPack) === String(parentPack)) found = f.name;
+    });
+    return found;
+  }
+  function pwRenderChildGrids(parentPack, parentRecord, parentModel) {
+    var container = document.getElementById("pw-card-children");
+    container.innerHTML = "";
+    var childPacks = pwCsvParse(parentModel && parentModel.children);
+    if (!childPacks.length) return;
+    childPacks.forEach(function (childPack) {
+      var block = document.createElement("div");
+      block.className = "pw-child-block";
+      block.innerHTML = "<h3>Child pack " + pwEsc(childPack) + "</h3><div class=\"small\">loading...</div>";
+      container.appendChild(block);
+      pwFetchSchemaModel(childPack).then(function (childModel) {
+        var fk = pwFindChildFkField(childModel, parentPack);
+        if (!fk) { block.querySelector(".small").textContent = "no FK field found linking back to pack " + parentPack; return; }
+        return walFetch("list/" + childPack).then(function (r) { return r.ok ? r.json() : { records: [] }; })
+          .then(function (d) {
+            var rows = (d.records || []).filter(function (rec) { return String((rec.data || {})[fk]) === String(parentRecord); });
+            var html = "<table class=\"wal-table\"><thead><tr><th>record</th><th>data (JSON)</th><th></th></tr></thead><tbody></tbody></table>" +
+              "<div class=\"row\"><button data-act=\"add\">+ child row (fk=" + pwEsc(parentRecord) + ")</button>" +
+              "<button data-act=\"saveall\">Save All</button><span class=\"small\" data-role=\"msg\"></span></div>";
+            block.innerHTML = "<h3>Child pack " + pwEsc(childPack) + " (fk field: " + pwEsc(fk) + ")</h3>" + html;
+            var tbody = block.querySelector("tbody");
+            function addRow(record, data) {
+              var tr = document.createElement("tr");
+              var ta = document.createElement("textarea");
+              ta.style.width = "100%"; ta.style.height = "46px"; ta.style.font = "11px monospace";
+              ta.value = JSON.stringify(data, null, 0);
+              var recTd = document.createElement("td"); recTd.textContent = (record === null) ? "(new)" : record;
+              var dataTd = document.createElement("td"); dataTd.appendChild(ta);
+              var actTd = document.createElement("td");
+              var delBtn = document.createElement("button"); delBtn.textContent = "Delete";
+              delBtn.addEventListener("click", function () {
+                if (record === null) { tbody.removeChild(tr); return; }
+                walFetch(childPack + "/" + record, { method: "DELETE" }).then(function (r) {
+                  if (r.ok) tbody.removeChild(tr); else block.querySelector('[data-role="msg"]').textContent = "delete failed: " + r.status;
+                });
+              });
+              actTd.appendChild(delBtn);
+              tr.appendChild(recTd); tr.appendChild(dataTd); tr.appendChild(actTd);
+              tr.dataset.record = (record === null) ? "" : record;
+              tbody.appendChild(tr);
+            }
+            rows.forEach(function (rec) { addRow(rec.record, rec.data); });
+            block.querySelector('[data-act="add"]').addEventListener("click", function () {
+              var prefill = {}; prefill[fk] = isNaN(Number(parentRecord)) ? parentRecord : Number(parentRecord);
+              addRow(null, prefill);
+            });
+            block.querySelector('[data-act="saveall"]').addEventListener("click", function () {
+              var trs = Array.prototype.slice.call(tbody.querySelectorAll("tr"));
+              var okCount = 0, failCount = 0, failMsgs = [];
+              function next(i) {
+                if (i >= trs.length) {
+                  block.querySelector('[data-role="msg"]').textContent =
+                    okCount + " saved, " + failCount + " failed" + (failMsgs.length ? (": " + failMsgs.join("; ")) : "");
+                  return;
+                }
+                var tr = trs[i];
+                var ta = tr.querySelector("textarea");
+                var record = tr.dataset.record;
+                var data;
+                try { data = JSON.parse(ta.value); } catch (e) { failCount++; failMsgs.push("row " + i + " invalid JSON"); next(i + 1); return; }
+                var req = record ? walFetch(childPack + "/" + record, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(data) })
+                                  : walFetch(childPack, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(data) });
+                req.then(function (r) {
+                  if (r.ok) { okCount++; if (!record && r.status === 201) { var loc = r.headers.get("Location") || ""; var m = /\/(\d+)\/(\d+)$/.exec(loc); if (m) { tr.dataset.record = m[2]; tr.firstChild.textContent = m[2]; } } }
+                  else { failCount++; failMsgs.push("row " + i + " HTTP " + r.status); }
+                  next(i + 1);
+                }).catch(function (e) { failCount++; failMsgs.push("row " + i + " " + e.message); next(i + 1); });
+              }
+              next(0);
+            });
+          });
+      });
+    });
+  }
+  /* ---- query: POST {wal_prefix}query + visual S/F/W builder + client aggregate ---- */
+  var pwQb = { fromPacks: [], selectFields: {}, where: [] };
+  function pwRenderQueryTable(rows) {
+    var wrap = document.getElementById("pw-query-table-wrap");
+    if (!rows || !rows.length) {
+      wrap.querySelector("thead").innerHTML = "";
+      wrap.querySelector("tbody").innerHTML = "";
+      return;
+    }
+    var cols = Object.keys(rows[0]);
+    wrap.querySelector("thead").innerHTML = "<tr>" + cols.map(function (c) { return "<th>" + pwEsc(c) + "</th>"; }).join("") + "</tr>";
+    wrap.querySelector("tbody").innerHTML = rows.map(function (row) {
+      return "<tr>" + cols.map(function (c) { return "<td>" + pwCell(row[c]) + "</td>"; }).join("") + "</tr>";
+    }).join("");
+  }
+  function pwQbSyncFields() {
+    var packs = pwCsvParse(document.getElementById("pw-qb-from").value).slice(0, 4);
+    pwQb.fromPacks = packs;
+    var container = document.getElementById("pw-qb-select");
+    container.innerHTML = "";
+    Promise.all(packs.map(function (p) { return pwFetchSchemaModel(p); })).then(function (models) {
+      models.forEach(function (model, idx) {
+        var pack = packs[idx];
+        model.fields.forEach(function (f) {
+          var qualified = (idx === 0) ? f.name : (pack + "." + f.name);
+          var label = document.createElement("label");
+          label.className = "small";
+          var cb = document.createElement("input");
+          cb.type = "checkbox";
+          cb.checked = true;
+          cb.addEventListener("change", function () { pwQb.selectFields[qualified] = cb.checked; });
+          pwQb.selectFields[qualified] = true;
+          label.appendChild(cb);
+          label.appendChild(document.createTextNode(" " + qualified));
+          container.appendChild(label);
+        });
+      });
+    });
+  }
+  function pwQbAddWhere() {
+    var field = document.getElementById("pw-qb-where-field").value.trim();
+    var op = document.getElementById("pw-qb-where-op").value;
+    var value = document.getElementById("pw-qb-where-value").value;
+    if (!field) return;
+    pwQb.where.push({ field: field, op: op, value: value });
+    var tbody = document.getElementById("pw-qb-where");
+    var tr = document.createElement("tr");
+    tr.innerHTML = "<td>" + pwEsc(field) + "</td><td>" + pwEsc(op) + "</td><td>" + pwEsc(value) + "</td><td><button>&times;</button></td>";
+    tr.querySelector("button").addEventListener("click", function () {
+      var idx = pwQb.where.indexOf(pwQb.where.filter(function (w) { return w.field === field && w.op === op && w.value === value; })[0]);
+      if (idx >= 0) pwQb.where.splice(idx, 1);
+      tbody.removeChild(tr);
+    });
+    tbody.appendChild(tr);
+    document.getElementById("pw-qb-where-field").value = "";
+    document.getElementById("pw-qb-where-value").value = "";
+  }
+  function pwQbSyncDsl() {
+    var selected = Object.keys(pwQb.selectFields).filter(function (k) { return pwQb.selectFields[k]; });
+    var lines = [];
+    if (selected.length) lines.push("S:" + selected.join(","));
+    if (pwQb.fromPacks.length) lines.push("F:" + pwQb.fromPacks.join(","));
+    pwQb.where.forEach(function (w) { lines.push("W:" + w.field + "|" + w.op + "|" + w.value); });
+    document.getElementById("pw-query-text").value = lines.join("\n");
+  }
+  function pwQbAggToggle() {
+    var on = document.getElementById("pw-qb-agg-enable").checked;
+    ["pw-qb-agg-fn", "pw-qb-agg-field", "pw-qb-agg-groupby"].forEach(function (id) {
+      document.getElementById(id).disabled = !on;
+    });
+  }
+  function pwAggCompute(rows, fn, field, groupBy) {
+    function numOf(v) { var n = Number(v); return isNaN(n) ? 0 : n; }
+    function aggOne(group) {
+      switch (fn) {
+        case "SUM": return group.reduce(function (a, r) { return a + numOf(r[field]); }, 0);
+        case "AVG": return group.length ? group.reduce(function (a, r) { return a + numOf(r[field]); }, 0) / group.length : 0;
+        case "MIN": return group.reduce(function (a, r) { var n = numOf(r[field]); return (a === null || n < a) ? n : a; }, null);
+        case "MAX": return group.reduce(function (a, r) { var n = numOf(r[field]); return (a === null || n > a) ? n : a; }, null);
+        case "COUNT": return group.length;
+        case "FIRST": return group.length ? group[0][field] : null;
+        default: return null;
+      }
+    }
+    if (!groupBy) return [{}].map(function (o) { o[fn + "(" + field + ")"] = aggOne(rows); return o; });
+    var groups = {};
+    rows.forEach(function (r) {
+      var key = r[groupBy];
+      if (!groups[key]) groups[key] = [];
+      groups[key].push(r);
+    });
+    return Object.keys(groups).map(function (key) {
+      var o = {};
+      o[groupBy] = key;
+      o[fn + "(" + field + ")"] = aggOne(groups[key]);
+      return o;
+    });
+  }
+  function pwQueryRun() {
+    if (!config) return;
+    var text = document.getElementById("pw-query-text").value;
+    walFetch("query", { method: "POST", headers: { "Content-Type": "text/plain" }, body: text })
+      .then(function (r) { return r.text().then(function (t) { return { ok: r.ok, status: r.status, text: t }; }); })
+      .then(function (res) {
+        document.getElementById("pw-query-raw").textContent = res.text;
+        if (!res.ok) { document.getElementById("pw-query-status").textContent = "HTTP " + res.status; return; }
+        var d;
+        try { d = JSON.parse(res.text); } catch (e) { document.getElementById("pw-query-status").textContent = "non-JSON response"; return; }
+        var note = d.partial ? (" partial (" + d.shards_ok + "/" + d.shards_total + " shards ok)") : "";
+        document.getElementById("pw-query-status").textContent = "count=" + d.count + note;
+        var rows = d.rows || [];
+        pwRenderQueryTable(rows);
+        var aggNote = document.getElementById("pw-query-agg-note");
+        var aggWrap = document.getElementById("pw-query-agg-table-wrap");
+        if (document.getElementById("pw-qb-agg-enable").checked) {
+          var fn = document.getElementById("pw-qb-agg-fn").value;
+          var field = document.getElementById("pw-qb-agg-field").value.trim();
+          var groupBy = document.getElementById("pw-qb-agg-groupby").value.trim();
+          var aggRows = pwAggCompute(rows, fn, field, groupBy || null);
+          aggNote.style.display = "block";
+          aggNote.textContent = "client-aggregated (" + fn + " over " + rows.length + " rows fetched from the server; " +
+            "the server query engine has no native aggregate support, so this is computed in the browser, not by picoweb)";
+          aggWrap.style.display = "table";
+          var cols = aggRows.length ? Object.keys(aggRows[0]) : [];
+          aggWrap.querySelector("thead") || (aggWrap.innerHTML = "<thead></thead><tbody></tbody>");
+          aggWrap.querySelector("thead").innerHTML = "<tr>" + cols.map(function (c) { return "<th>" + pwEsc(c) + "</th>"; }).join("") + "</tr>";
+          aggWrap.querySelector("tbody").innerHTML = aggRows.map(function (row) {
+            return "<tr>" + cols.map(function (c) { return "<td>" + pwCell(row[c]) + "</td>"; }).join("") + "</tr>";
+          }).join("");
+        } else {
+          aggNote.style.display = "none";
+          aggWrap.style.display = "none";
+        }
+      }).catch(function (e) { document.getElementById("pw-query-status").textContent = e.message; });
+  }
+
+  /* ---- permissions: RBAC/RLS design metadata, real metadata pack 3 ---- */
+  var pwPermModel = { roles: [], permissions: [], rowPolicies: [], assignments: [] };
+  function pwPermRenderRoles() {
+    var el = document.getElementById("pw-perm-roles");
+    el.innerHTML = "";
+    pwPermModel.roles.forEach(function (r) {
+      var span = document.createElement("span");
+      span.className = "chip";
+      span.appendChild(document.createTextNode(r + " "));
+      var btn = document.createElement("button");
+      btn.textContent = "\u00d7";
+      btn.addEventListener("click", function () { pwPermRemoveRole(r); });
+      span.appendChild(btn);
+      el.appendChild(span);
+    });
+    ["pw-perm-new-role", "pw-rp-new-role"].forEach(function (id) {
+      document.getElementById(id).innerHTML = pwPermModel.roles.map(function (r) { return "<option>" + pwEsc(r) + "</option>"; }).join("");
+    });
+    var assignRoles = document.getElementById("pw-assign-roles");
+    assignRoles.innerHTML = pwPermModel.roles.map(function (r) {
+      return "<label class=\"small\"><input type=\"checkbox\" class=\"pw-assign-role\" value=\"" + pwEsc(r) + "\">" + pwEsc(r) + "</label>";
+    }).join(" ");
+  }
+  function pwPermAddRole() {
+    var input = document.getElementById("pw-perm-role-new");
+    var name = input.value.trim();
+    if (!name) return;
+    if (pwPermModel.roles.indexOf(name) < 0) pwPermModel.roles.push(name);
+    input.value = "";
+    pwPermRenderRoles();
+    pwPermSyncRaw();
+  }
+  function pwPermRemoveRole(name) {
+    pwPermModel.roles = pwPermModel.roles.filter(function (r) { return r !== name; });
+    pwPermModel.permissions = pwPermModel.permissions.filter(function (p) { return p.role !== name; });
+    pwPermModel.rowPolicies = pwPermModel.rowPolicies.filter(function (p) { return p.role !== name; });
+    pwPermModel.assignments.forEach(function (a) { a.roles = (a.roles || []).filter(function (r) { return r !== name; }); });
+    pwPermRenderRoles();
+    pwPermRenderTables();
+    pwPermSyncRaw();
+  }
+  function pwPermRenderTables() {
+    var permBody = document.getElementById("pw-perm-table");
+    permBody.innerHTML = "";
+    pwPermModel.permissions.forEach(function (p, idx) {
+      var tr = document.createElement("tr");
+      tr.innerHTML = "<td>" + pwEsc(p.role) + "</td><td>" + pwEsc(p.pack) + "</td><td>" +
+        pwEsc((p.actions || []).join(", ")) + "</td><td><button>&times;</button></td>";
+      tr.querySelector("button").addEventListener("click", function () {
+        pwPermModel.permissions.splice(idx, 1);
+        pwPermRenderTables();
+        pwPermSyncRaw();
+      });
+      permBody.appendChild(tr);
+    });
+    var rpBody = document.getElementById("pw-rowpolicy-table");
+    rpBody.innerHTML = "";
+    pwPermModel.rowPolicies.forEach(function (p, idx) {
+      var tr = document.createElement("tr");
+      tr.innerHTML = "<td>" + pwEsc(p.role) + "</td><td>" + pwEsc(p.pack) + "</td><td>" +
+        pwEsc(p.predicate || "") + "</td><td><button>&times;</button></td>";
+      tr.querySelector("button").addEventListener("click", function () {
+        pwPermModel.rowPolicies.splice(idx, 1);
+        pwPermRenderTables();
+        pwPermSyncRaw();
+      });
+      rpBody.appendChild(tr);
+    });
+    var assignBody = document.getElementById("pw-assign-table");
+    assignBody.innerHTML = "";
+    (pwPermModel.assignments || []).forEach(function (a, idx) {
+      var tr = document.createElement("tr");
+      tr.innerHTML = "<td>" + pwEsc(a.principal) + "</td><td>" + pwEsc((a.roles || []).join(", ")) + "</td><td><button>&times;</button></td>";
+      tr.querySelector("button").addEventListener("click", function () {
+        pwPermModel.assignments.splice(idx, 1);
+        pwPermRenderTables();
+        pwPermSyncRaw();
+      });
+      assignBody.appendChild(tr);
+    });
+  }
+  function pwPermAddPermission() {
+    var role = document.getElementById("pw-perm-new-role").value;
+    var pack = parseInt(document.getElementById("pw-perm-new-pack").value, 10);
+    if (!role || isNaN(pack)) { alert("add a role first, then choose a role and pack"); return; }
+    var boxes = document.querySelectorAll(".pw-perm-action:checked");
+    var actions = [];
+    for (var i = 0; i < boxes.length; i++) actions.push(boxes[i].value);
+    pwPermModel.permissions = pwPermModel.permissions
+      .filter(function (p) { return !(p.role === role && p.pack === pack); })
+      .concat([{ role: role, pack: pack, actions: actions }]);
+    pwPermRenderTables();
+    pwPermSyncRaw();
+  }
+  function pwRowPolicyAdd() {
+    var role = document.getElementById("pw-rp-new-role").value;
+    var pack = parseInt(document.getElementById("pw-rp-new-pack").value, 10);
+    var predicate = document.getElementById("pw-rp-new-predicate").value.trim();
+    if (!role || isNaN(pack) || !predicate) { alert("add a role first, then choose a role, pack and predicate"); return; }
+    pwPermModel.rowPolicies.push({ role: role, pack: pack, predicate: predicate });
+    document.getElementById("pw-rp-new-predicate").value = "";
+    pwPermRenderTables();
+    pwPermSyncRaw();
+  }
+  function pwAssignAdd() {
+    var principal = document.getElementById("pw-assign-principal").value.trim();
+    if (!principal) { alert("enter a principal (PicoSTS subject/email)"); return; }
+    var boxes = document.querySelectorAll(".pw-assign-role:checked");
+    var roles = [];
+    for (var i = 0; i < boxes.length; i++) roles.push(boxes[i].value);
+    if (!roles.length) { alert("add at least one role above, then check it for this assignment"); return; }
+    pwPermModel.assignments = (pwPermModel.assignments || [])
+      .filter(function (a) { return a.principal !== principal; })
+      .concat([{ principal: principal, roles: roles }]);
+    document.getElementById("pw-assign-principal").value = "";
+    var cbs = document.querySelectorAll(".pw-assign-role"); for (var j = 0; j < cbs.length; j++) cbs[j].checked = false;
+    pwPermRenderTables();
+    pwPermSyncRaw();
+  }
+  function pwPermSyncRaw() {
+    document.getElementById("pw-perm-raw").value = JSON.stringify(pwPermModel, null, 2);
+  }
+  function pwPermToggleRaw() {
+    var ta = document.getElementById("pw-perm-raw");
+    var actions = document.getElementById("pw-perm-raw-actions");
+    var show = ta.style.display !== "block";
+    if (show) pwPermSyncRaw();
+    ta.style.display = show ? "block" : "none";
+    actions.style.display = show ? "flex" : "none";
+  }
+  function pwPermApplyRaw() {
+    try {
+      var doc = JSON.parse(document.getElementById("pw-perm-raw").value);
+      pwPermModel = { roles: doc.roles || [], permissions: doc.permissions || [], rowPolicies: doc.rowPolicies || [], assignments: doc.assignments || [] };
+      pwPermRenderRoles();
+      pwPermRenderTables();
+      pwMsg("pw-perm-msg", "raw JSON applied", false);
+    } catch (e) {
+      pwMsg("pw-perm-msg", "invalid JSON: " + e.message, true);
+    }
+  }
+  function pwPermLoad() {
+    if (!config) return;
+    var pack = document.getElementById("pw-perm-pack").value;
+    walFetch("metadata/permissions/" + pack).then(function (r) {
+      if (r.status === 404) return { roles: [], permissions: [], rowPolicies: [], assignments: [] };
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      return r.json();
+    }).then(function (doc) {
+      pwPermModel = { roles: doc.roles || [], permissions: doc.permissions || [], rowPolicies: doc.rowPolicies || [], assignments: doc.assignments || [] };
+      pwPermRenderRoles();
+      pwPermRenderTables();
+      pwPermSyncRaw();
+      pwMsg("pw-perm-msg", "loaded pack " + pack, false);
+    }).catch(function (e) { pwMsg("pw-perm-msg", e.message, true); });
+  }
+  function pwPermSave() {
+    if (!config) return;
+    var pack = document.getElementById("pw-perm-pack").value;
+    var raw = document.getElementById("pw-perm-raw");
+    var doc = pwPermModel;
+    if (raw.style.display === "block") {
+      try { doc = JSON.parse(raw.value); } catch (e) { pwMsg("pw-perm-msg", "invalid JSON: " + e.message, true); return; }
+    }
+    walFetch("metadata/permissions/" + pack, {
+      method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(doc)
+    }).then(function (r) { return r.text().then(function (t) { pwMsg("pw-perm-msg", r.ok ? "saved" : "save failed (" + r.status + "): " + t, !r.ok); }); })
+      .catch(function (e) { pwMsg("pw-perm-msg", e.message, true); });
+  }
+  function pwPermDelete() {
+    if (!config) return;
+    var pack = document.getElementById("pw-perm-pack").value;
+    walFetch("metadata/permissions/" + pack, { method: "DELETE" })
+      .then(function (r) {
+        var ok = r.ok || r.status === 404;
+        pwMsg("pw-perm-msg", ok ? "deleted" : "delete failed: " + r.status, !ok);
+      }).catch(function (e) { pwMsg("pw-perm-msg", e.message, true); });
+  }
+
+  /* ---- Fast Serial (BSO1) ---- */
+  var fsState = { schema: null, richFields: [], bytes: null, keySet: false };
+  var FS_TYPE_TO_WIRE = {
+    bool: "Bool", uint8: "Byte", uint16: "UInt16", uint32: "UInt32",
+    int8: "SByte", int16: "Int16", int32: "Int32",
+    number: "Float64", decimal: "Decimal",
+    ascii: "String", utf8: "String", string: "String",
+    date: "DateOnly", time: "TimeOnly", datetime: "DateTime",
+    array_u16: "String", blob: "String", lookup: "Int32",
+    object: "String", array: "String"
+  };
+  function fsSetKey() {
+    if (typeof BareMetal === "undefined" || !BareMetal.Binary) {
+      document.getElementById("fs-key-status").textContent = "BareMetal.Binary not loaded";
+      return;
+    }
+    var key = document.getElementById("fs-signing-key").value;
+    if (!key) { document.getElementById("fs-key-status").textContent = "no key set"; fsState.keySet = false; return; }
+    BareMetal.Binary.setSigningKey(key).then(function () {
+      fsState.keySet = true;
+      document.getElementById("fs-key-status").textContent = "key set (kept in memory only, never persisted)";
+    }).catch(function (e) {
+      fsState.keySet = false;
+      document.getElementById("fs-key-status").textContent = "invalid key: " + e.message;
+    });
+  }
+  function fsDeriveSchema() {
+    var pack = document.getElementById("fs-schema-pack").value;
+    pwFetchSchemaModel(pack).then(function (model) {
+      fsState.richFields = model.fields;
+      fsState.schema = {
+        version: 1,
+        members: model.fields.map(function (f) {
+          return { name: f.name, wireType: FS_TYPE_TO_WIRE[f.type] || "String", isNullable: !!f.nullable };
+        })
+      };
+      document.getElementById("fs-schema-preview").textContent = JSON.stringify(fsState.schema, null, 2);
+      pwMsg("fs-msg", "derived BSO1 schema for pack " + pack + " (" + fsState.schema.members.length + " members)", false);
+    });
+  }
+  function fsValueToWire(field, value) {
+    if (value === undefined) return null;
+    switch (field.type) {
+      case "array_u16": return Array.isArray(value) ? value.join(",") : String(value || "");
+      case "object": case "array": return (typeof value === "object") ? JSON.stringify(value) : String(value || "");
+      case "blob": return (typeof value === "object") ? JSON.stringify(value) : String(value || "");
+      default: return value;
+    }
+  }
+  function fsValueFromWire(field, value) {
+    switch (field.type) {
+      case "array_u16":
+        if (value === null || value === "") return [];
+        return String(value).split(",").map(function (x) { return Number(x.trim()); });
+      case "object": case "array":
+        try { return JSON.parse(value); } catch (e) { return value; }
+      default: return value;
+    }
+  }
+  function fsHex(buffer) {
+    var bytes = new Uint8Array(buffer);
+    var out = [];
+    for (var i = 0; i < bytes.length; i++) out.push(bytes[i].toString(16).padStart(2, "0"));
+    return out.join(" ");
+  }
+  function fsShowBytes(buffer) {
+    fsState.bytes = buffer;
+    document.getElementById("fs-size").textContent = buffer.byteLength + " bytes";
+    document.getElementById("fs-hex").textContent = fsHex(buffer);
+  }
+  function fsSerialize() {
+    if (typeof BareMetal === "undefined" || !BareMetal.Binary) { pwMsg("fs-msg", "BareMetal.Binary not loaded", true); return; }
+    if (!fsState.schema) { pwMsg("fs-msg", "derive a BSO1 schema first", true); return; }
+    var doc;
+    try { doc = JSON.parse(document.getElementById("pw-card-json").value || "{}"); }
+    catch (e) { pwMsg("fs-msg", "Cards tab JSON is invalid: " + e.message, true); return; }
+    var wireObj = {};
+    fsState.richFields.forEach(function (f) { wireObj[f.name] = fsValueToWire(f, doc[f.name]); });
+    BareMetal.Binary.serialize(wireObj, fsState.schema).then(function (buf) {
+      fsShowBytes(buf);
+      pwMsg("fs-msg", "serialized " + buf.byteLength + " bytes", false);
+    }).catch(function (e) { pwMsg("fs-msg", "serialize failed: " + e.message, true); });
+  }
+  function fsDeserialize() {
+    if (typeof BareMetal === "undefined" || !BareMetal.Binary) { pwMsg("fs-msg", "BareMetal.Binary not loaded", true); return; }
+    if (!fsState.schema) { pwMsg("fs-msg", "derive a BSO1 schema first", true); return; }
+    if (!fsState.bytes) { pwMsg("fs-msg", "no bytes to deserialize -- Serialize or Load first", true); return; }
+    BareMetal.Binary.deserialize(fsState.bytes, fsState.schema).then(function (obj) {
+      var doc = {};
+      fsState.richFields.forEach(function (f) { doc[f.name] = fsValueFromWire(f, obj[f.name]); });
+      document.getElementById("pw-card-json").value = JSON.stringify(doc, null, 2);
+      pwMsg("fs-msg", "deserialized into Cards tab JSON", false);
+    }).catch(function (e) { pwMsg("fs-msg", "deserialize failed (bad signature/key or schema mismatch): " + e.message, true); });
+  }
+  function fsSave() {
+    if (!config) return;
+    if (!fsState.bytes) { pwMsg("fs-msg", "nothing serialized yet", true); return; }
+    var pack = document.getElementById("fs-pack").value, rec = document.getElementById("fs-record").value;
+    fetch(config.ide_prefix + "card/" + pack + "/" + rec, {
+      method: "PUT", credentials: "include", headers: { "X-PW-Auth": "1" }, body: fsState.bytes
+    }).then(function (r) {
+      pwMsg("fs-msg", r.ok ? ("saved BSO1 bytes (" + r.status + ") to " + config.ide_prefix + "card/" + pack + "/" + rec) : ("save failed: " + r.status), !r.ok);
+    }).catch(function (e) { pwMsg("fs-msg", e.message, true); });
+  }
+  function fsLoad() {
+    if (!config) return;
+    var pack = document.getElementById("fs-pack").value, rec = document.getElementById("fs-record").value;
+    fetch(config.ide_prefix + "card/" + pack + "/" + rec, { credentials: "include", headers: { "X-PW-Auth": "1" } })
+      .then(function (r) {
+        if (!r.ok) throw new Error("HTTP " + r.status);
+        return r.arrayBuffer();
+      }).then(function (buf) {
+        fsShowBytes(buf);
+        pwMsg("fs-msg", "loaded " + buf.byteLength + " bytes -- click Deserialize to view as JSON", false);
+      }).catch(function (e) { pwMsg("fs-msg", e.message, true); });
+  }
+
+  /* Expose handlers referenced by inline onclick="" attributes -- everything
+   * else in this IIFE uses addEventListener and stays private. */
+  window.pwFieldTypeChanged = pwFieldTypeChanged;
+  window.pwSchemaAddField = pwSchemaAddField;
+  window.pwSchemaSave = pwSchemaSave;
+  window.pwSchemaDelete = pwSchemaDelete;
+  window.pwSchemaToggleRaw = pwSchemaToggleRaw;
+  window.pwSchemaApplyRaw = pwSchemaApplyRaw;
+  window.pwPacksRefreshKnown = pwPacksRefreshKnown;
+  window.pwPackLoad = pwPackLoad;
+  window.pwPackSaveName = pwPackSaveName;
+  window.pwPackDeleteName = pwPackDeleteName;
+  window.pwCardGet = pwCardGet;
+  window.pwCardPut = pwCardPut;
+  window.pwCardDelete = pwCardDelete;
+  window.pwCardCreate = pwCardCreate;
+  window.pwCardToggleVisual = pwCardToggleVisual;
+  window.pwCardsList = pwCardsList;
+  window.pwCardsListRender = pwCardsListRender;
+  window.pwCardsListPage = pwCardsListPage;
+  window.pwCardsMget = pwCardsMget;
+  window.pwQbSyncFields = pwQbSyncFields;
+  window.pwQbAddWhere = pwQbAddWhere;
+  window.pwQbSyncDsl = pwQbSyncDsl;
+  window.pwQbAggToggle = pwQbAggToggle;
+  window.pwQueryRun = pwQueryRun;
+  window.pwPermLoad = pwPermLoad;
+  window.pwPermSave = pwPermSave;
+  window.pwPermDelete = pwPermDelete;
+  window.pwPermToggleRaw = pwPermToggleRaw;
+  window.pwPermApplyRaw = pwPermApplyRaw;
+  window.pwPermAddRole = pwPermAddRole;
+  window.pwPermAddPermission = pwPermAddPermission;
+  window.pwRowPolicyAdd = pwRowPolicyAdd;
+  window.pwAssignAdd = pwAssignAdd;
+  window.fsSetKey = fsSetKey;
+  window.fsDeriveSchema = fsDeriveSchema;
+  window.fsSerialize = fsSerialize;
+  window.fsDeserialize = fsDeserialize;
+  window.fsSave = fsSave;
+  window.fsLoad = fsLoad;
+
+  /* ---------- boot ---------- */
+  pwSchemaRenderFields();
+  pwSchemaRenderPackMeta();
+  pwFieldTypeChanged();
+  pwPermRenderRoles();
+  pwPermRenderTables();
+  pwCardSetEmptyState(true);
+
+  loadConfig().then(function () {
+    return handleOAuthRedirect().then(refreshMe);
+  }).then(function () {
+    pwPacksRefreshKnown();
+  });
+})();
+</script>
+</body>
+</html>

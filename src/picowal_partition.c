@@ -1,6 +1,7 @@
 #include "picowal_partition.h"
 
 #include <arpa/inet.h>
+#include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <netdb.h>
@@ -333,17 +334,28 @@ static const char* method_name(http_method_t m) {
  * (fan-out query/report gateway). Returns true and fills *out_status /
  * *out_body (caller frees, may be NULL if empty) / *out_body_len on a
  * successful round trip (any HTTP status code counts as success here --
- * false is reserved for transport-level failures). */
+ * false is reserved for transport-level failures).
+ *
+ * out_headers/out_headers_cap/out_headers_len are optional (pass
+ * out_headers=NULL to skip): when non-NULL, the upstream's raw response
+ * headers (status line excluded, each line still "\r\n"-terminated,
+ * truncated if they don't fit out_headers_cap) are copied out so the
+ * caller can relay them -- picowal_partition_proxy() uses this so a
+ * proxied GET (e.g. static_pack/ide card reads) preserves the owner's
+ * real Content-Type instead of silently downgrading to none/generic. */
 static bool pp_http_roundtrip(const char* node_id, const char* method_str,
                                const char* path, size_t path_len,
                                const char* body, size_t body_len,
                                const char* write_token, size_t write_token_len,
                                const char* cookie, size_t cookie_len,
                                int* out_status, char** out_body, size_t* out_body_len,
+                               char* out_headers, size_t out_headers_cap, size_t* out_headers_len,
                                char* errbuf, size_t errbuf_cap) {
     *out_status = 0;
     *out_body = NULL;
     *out_body_len = 0;
+    if (out_headers && out_headers_cap > 0) out_headers[0] = '\0';
+    if (out_headers_len) *out_headers_len = 0;
 
     char host[PICOWAL_PARTITION_NODE_ID_MAX];
     char port[16];
@@ -376,6 +388,16 @@ static bool pp_http_roundtrip(const char* node_id, const char* method_str,
     }
     if (cookie && cookie_len > 0 && off + cookie_len + 32 < sizeof(head)) {
         off += (size_t)snprintf(head + off, sizeof(head) - off, "Cookie: %.*s\r\n", (int)cookie_len, cookie);
+        /* This is a browser-authenticated request being forwarded to the
+         * true owner (not a machine-to-machine write-token call) -- the
+         * owner's api_require_pw_auth() gate requires X-PW-Auth on top of
+         * a valid cookie (CSRF-style header check), so it must be
+         * re-asserted here or every proxied cookie-authenticated
+         * mutation/read would be wrongly rejected with 403 on any node
+         * that isn't the partition owner. */
+        if (off + 24 < sizeof(head)) {
+            off += (size_t)snprintf(head + off, sizeof(head) - off, "X-PW-Auth: 1\r\n");
+        }
     }
     if (off + 4 < sizeof(head)) {
         head[off++] = '\r'; head[off++] = '\n';
@@ -421,6 +443,24 @@ static bool pp_http_roundtrip(const char* node_id, const char* method_str,
     }
     if (!hdr_end) { free(buf); snprintf(errbuf, errbuf_cap, "bad upstream response\n"); return false; }
 
+    if (out_headers && out_headers_cap > 0) {
+        /* Header block: from just after the status line's own "\r\n" up
+         * to (and including) the last header's trailing "\r\n" -- i.e.
+         * everything between the status line and the blank line that
+         * terminates the header block. */
+        const char* line1_end = NULL;
+        for (size_t i = 0; i + 1 < got; i++) {
+            if (buf[i] == '\r' && buf[i + 1] == '\n') { line1_end = buf + i + 2; break; }
+        }
+        if (line1_end && hdr_end - 2 >= line1_end) {
+            size_t hdrs_len = (size_t)((hdr_end - 2) - line1_end);
+            if (hdrs_len >= out_headers_cap) hdrs_len = out_headers_cap - 1;
+            memcpy(out_headers, line1_end, hdrs_len);
+            out_headers[hdrs_len] = '\0';
+            if (out_headers_len) *out_headers_len = hdrs_len;
+        }
+    }
+
     size_t upstream_body_len = got - (size_t)(hdr_end - buf);
     *out_status = status;
     if (upstream_body_len > 0) {
@@ -446,6 +486,7 @@ bool picowal_partition_fetch(const char* node_id,
     return pp_http_roundtrip(node_id, method_name(method), path, path_len,
                              body, body_len, write_token, write_token_len,
                              cookie, cookie_len, out_status, out_body, out_body_len,
+                             NULL, 0, NULL,
                              errbuf, sizeof(errbuf));
 }
 
@@ -461,6 +502,17 @@ int picowal_partition_all_nodes(const char* tenant, size_t tenant_len,
     return copied;
 }
 
+/* True if `line` (one "Name: value" header line, no trailing CR/LF) is
+ * the named header, case-insensitively. */
+static bool pp_header_is(const char* line, size_t line_len, const char* name) {
+    size_t name_len = strlen(name);
+    if (line_len < name_len) return false;
+    for (size_t i = 0; i < name_len; i++) {
+        if (tolower((unsigned char)line[i]) != tolower((unsigned char)name[i])) return false;
+    }
+    return true;
+}
+
 bool picowal_partition_proxy(const char* owner, uint32_t vpart,
                               http_method_t method,
                               const char* path, size_t path_len,
@@ -471,10 +523,13 @@ bool picowal_partition_proxy(const char* owner, uint32_t vpart,
     int status = 0;
     char* upstream_body = NULL;
     size_t upstream_body_len = 0;
+    char upstream_headers[API_HEAD_CAP];
+    size_t upstream_headers_len = 0;
     char errbuf[128];
     if (!pp_http_roundtrip(owner, method_name(method), path, path_len, body, body_len,
                            write_token, write_token_len, cookie, cookie_len,
                            &status, &upstream_body, &upstream_body_len,
+                           upstream_headers, sizeof(upstream_headers), &upstream_headers_len,
                            errbuf, sizeof(errbuf))) {
         fill_502(resp, errbuf);
         return false;
@@ -483,18 +538,102 @@ bool picowal_partition_proxy(const char* owner, uint32_t vpart,
     resp->status = status;
     int hn = snprintf(resp->head, sizeof(resp->head),
                       "HTTP/1.1 %d Proxied\r\n"
-                      "Server: picoweb\r\n"
                       "X-PW-Partition: %u\r\n"
-                      "X-PW-Proxied-From: %s\r\n"
-                      "Content-Length: %zu\r\n",
-                      status, (unsigned)vpart, owner, upstream_body_len);
-    resp->head_len = (hn > 0 && (size_t)hn < sizeof(resp->head)) ? (size_t)hn : 0;
+                      "X-PW-Proxied-From: %s\r\n",
+                      status, (unsigned)vpart, owner);
+    size_t head_len = (hn > 0 && (size_t)hn < sizeof(resp->head)) ? (size_t)hn : 0;
+
+    /* Relay the owner's real response headers verbatim (this is what
+     * carries e.g. Content-Type for a proxied static_pack/ide-card GET --
+     * without this, every proxied read would silently lose MIME info),
+     * except Content-Length (recomputed below from the actual relayed
+     * body) and Connection (server.c's api_finalise() appends its own
+     * Connection: keep-alive/close + blank-line terminator after head). */
+    size_t i = 0;
+    while (i < upstream_headers_len && head_len < sizeof(resp->head)) {
+        size_t line_start = i;
+        while (i < upstream_headers_len && upstream_headers[i] != '\n') i++;
+        size_t line_end = (i < upstream_headers_len) ? i + 1 : i; /* include '\n' */
+        if (i < upstream_headers_len) i++;
+        size_t line_len = line_end - line_start;
+        if (line_len == 0) continue;
+        size_t name_len = line_len;
+        if (upstream_headers[line_start + name_len - 1] == '\n') name_len--;
+        if (name_len > 0 && upstream_headers[line_start + name_len - 1] == '\r') name_len--;
+        if (pp_header_is(upstream_headers + line_start, name_len, "content-length:") ||
+            pp_header_is(upstream_headers + line_start, name_len, "connection:")) {
+            continue;
+        }
+        if (head_len + line_len < sizeof(resp->head)) {
+            memcpy(resp->head + head_len, upstream_headers + line_start, line_len);
+            head_len += line_len;
+        }
+    }
+
+    int cln = snprintf(resp->head + head_len, sizeof(resp->head) - head_len,
+                       "Content-Length: %zu\r\n", upstream_body_len);
+    if (cln > 0 && (size_t)cln < sizeof(resp->head) - head_len) head_len += (size_t)cln;
+    resp->head_len = head_len;
     if (upstream_body_len > 0 && upstream_body) {
         resp->body = upstream_body;
         resp->body_len = upstream_body_len;
         resp->body_owned = true;
     } else {
         free(upstream_body);
+    }
+    return true;
+}
+
+#define PP_REPLICATE_MAX_NODES 64
+
+/* Metadata packs (name/schema/permissions -- picowal_db_pack_key packs
+ * 1/2/3) are deliberately NOT sharded like per-record data: every node in
+ * the tenant's pool is expected to hold an identical copy, so IDE reads
+ * (GET /wal/metadata/...) can stay purely local. That means a mutation
+ * has to fan out to the whole pool instead of routing to a single owner
+ * (contrast with picowal_partition_proxy/_redirect, which target exactly
+ * one owner for sharded data). See api.c's dispatch_picowal_pack_record,
+ * the only caller. */
+bool picowal_partition_replicate_metadata(const char* tenant, size_t tenant_len,
+                                          http_method_t method,
+                                          const char* path, size_t path_len,
+                                          const char* body, size_t body_len,
+                                          const char* write_token, size_t write_token_len,
+                                          const char* cookie, size_t cookie_len,
+                                          int* out_failed, int* out_total,
+                                          char* err, size_t err_cap) {
+    if (out_failed) *out_failed = 0;
+    if (out_total) *out_total = 0;
+    if (err && err_cap) err[0] = '\0';
+    if (!picowal_partition_enabled()) return true;
+
+    char nodes[PP_REPLICATE_MAX_NODES][PICOWAL_PARTITION_NODE_ID_MAX];
+    int n_nodes = picowal_partition_all_nodes(tenant, tenant_len, nodes, PP_REPLICATE_MAX_NODES);
+    if (n_nodes <= 0) return true; /* nothing configured to replicate to */
+
+    int total = 0, failed = 0;
+    for (int i = 0; i < n_nodes; i++) {
+        if (picowal_partition_owner_is_self(nodes[i])) continue; /* already applied locally by the caller */
+        total++;
+        int status = 0;
+        char* rbody = NULL;
+        size_t rbody_len = 0;
+        bool ok = picowal_partition_fetch(nodes[i], method, path, path_len, body, body_len,
+                                          write_token, write_token_len, cookie, cookie_len,
+                                          &status, &rbody, &rbody_len);
+        free(rbody);
+        /* A DELETE that 404s on a peer means the peer already doesn't have
+         * the key -- that IS the converged/replicated state, not a
+         * failure. Any other >=400 (or an unreachable node) is a real
+         * replication failure. */
+        bool peer_ok = ok && (status < 400 || (method == M_DELETE && status == 404));
+        if (!peer_ok) failed++;
+    }
+    if (out_total) *out_total = total;
+    if (out_failed) *out_failed = failed;
+    if (failed > 0) {
+        snprintf(err, err_cap, "%d of %d peer node(s) failed to replicate metadata", failed, total);
+        return false;
     }
     return true;
 }

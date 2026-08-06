@@ -125,12 +125,13 @@ typedef enum {
     JVAL_STRING,
     JVAL_NUMBER,
     JVAL_BOOL,
-    JVAL_NULL
+    JVAL_NULL,
+    JVAL_RAW
 } jval_kind_t;
 
 typedef struct {
     jval_kind_t kind;
-    char text[256];
+    char text[PICOWAL_DATA_MAX + 1];
 } jval_t;
 
 typedef struct {
@@ -412,6 +413,16 @@ static bool json_get_field(const char* json, const char* field, jval_t* out) {
             }
             if (strncmp(p, "null", 4) == 0) {
                 out->kind = JVAL_NULL; snprintf(out->text, sizeof(out->text), "null"); return true;
+            }
+            if (*p == '[' || *p == '{') {
+                const char* end = skip_json_value(p);
+                if (!end || end <= p) return false;
+                size_t n = (size_t)(end - p);
+                if (n >= sizeof(out->text)) return false;
+                out->kind = JVAL_RAW;
+                memcpy(out->text, p, n);
+                out->text[n] = '\0';
+                return true;
             }
             out->kind = JVAL_NUMBER;
             size_t n = 0;
@@ -725,7 +736,8 @@ resolved:
             if (!first && !sb_append_ch(&out, ',')) goto oom;
             first = false;
             if (!sb_append_json_string(&out, q.select[si].label) || !sb_append_ch(&out, ':')) goto oom;
-            if (v.kind == JVAL_NUMBER || v.kind == JVAL_BOOL || v.kind == JVAL_NULL) {
+            if (v.kind == JVAL_NUMBER || v.kind == JVAL_BOOL ||
+                v.kind == JVAL_NULL || v.kind == JVAL_RAW) {
                 if (!sb_append(&out, v.text)) goto oom;
             } else {
                 if (!sb_append_json_string(&out, v.text)) goto oom;
